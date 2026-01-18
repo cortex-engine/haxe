@@ -45,7 +45,8 @@ type ctx = {
  * Determines which local variables holding newly allocated objects can be
  * stack-allocated instead of heap-allocated. A variable can be stack-allocated if:
  * 1. It's assigned directly from a TNew expression
- * 2. The object never "escapes" - i.e., it's never:
+ * 2. It has no super-class
+ * 3. The object never "escapes" - i.e., it's never:
  *    - Stored in a field of another object
  *    - Stored in an array
  *    - Passed to a function call (except for field access on 'this')
