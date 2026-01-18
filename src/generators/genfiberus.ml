@@ -4741,7 +4741,7 @@ let generate com =
 	Buffer.clear ctx.buf;
 	spr ctx "/* Entry point */\n";
 	spr ctx "#include \"fiberus_generated.h\"\n";
-	spr ctx "#include <telemetry.h>\n\n";
+	spr ctx "#include \"telemetry.h\"\n\n";
 	spr ctx "int main(int argc, char** argv) {\n";
 	spr ctx "\t(void)argc; (void)argv;\n";
 	spr ctx "\tvolatile int _gc_stack_base_marker;\n";
