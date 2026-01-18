@@ -51,6 +51,51 @@ extern class Fiber {
 	 * User data associated with this fiber.
 	 */
 	public var userData:Dynamic;
+
+	// =========================================================================
+	// Multithreading API
+	// =========================================================================
+
+	/**
+	 * Creates worker threads for parallel fiber execution.
+	 * This must be called before spawning fibers that should run in parallel.
+	 * In single-threaded mode (default), this is a no-op that returns 0.
+	 *
+	 * @param count Number of worker threads to create
+	 * @return Number of workers actually created (may be less than requested)
+	 */
+	public static function createWorkers(count:Int):Int;
+
+	/**
+	 * Returns the total number of threads (main + workers).
+	 * In single-threaded mode, returns 1.
+	 */
+	public static function getThreadCount():Int;
+
+	/**
+	 * Returns the number of worker threads (excludes main thread).
+	 * In single-threaded mode, returns 0.
+	 */
+	public static function getWorkerCount():Int;
+
+	/**
+	 * Spawns a fiber on a specific thread.
+	 * If the thread ID is invalid, spawns on the current thread.
+	 *
+	 * @param threadId Target thread ID (0 = main thread)
+	 * @param fn The function to execute
+	 * @return The newly created fiber
+	 */
+	public static function spawnOn(threadId:Int, fn:Dynamic->Void):Fiber;
+
+	/**
+	 * Spawns a fiber on the least-loaded thread.
+	 * Provides automatic load balancing across worker threads.
+	 *
+	 * @param fn The function to execute
+	 * @return The newly created fiber
+	 */
+	public static function spawnAny(fn:Dynamic->Void):Fiber;
 }
 
 /**
