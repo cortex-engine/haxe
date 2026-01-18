@@ -3987,6 +3987,13 @@ let gen_class_impl ctx c =
 				(* Cache GC context at closure entry *)
 				spr ctx "FIB_GC_CTX;";
 				newline ctx;
+				(* Add stack frame for Tracy profiling *)
+				if ctx.debug_level > 0 then begin
+					print ctx "FIB_LOCAL_STACK_FRAME(_fib_pos_%s, \"<closure>\", \"%s\", \"<closure>.%s\", \"generated\", 0);" name name name;
+					newline ctx;
+					print ctx "FIB_STACKFRAME(&_fib_pos_%s);" name;
+					newline ctx
+				end;
 				ctx.current_ret_type <- Some f.tf_type;
 				let old_gc_count = ctx.gc_local_count in
 				let old_has_gc_ctx = ctx.has_gc_ctx in
