@@ -12,4 +12,5 @@ enum abstract TestTarget(String) from String {
 	var Jvm = "jvm";
 	var Python = "python";
 	var Hl = "hl";
+	var Fiberus = "fiberus";
 }

@@ -72,5 +72,5 @@ let create_exception_context tctx =
 			is_of_type = is_of_type;
 		} in
 		Some ctx
-	| Cross | CustomTarget _ ->
+	| Cross | CustomTarget _  | Fiberus ->
 		None

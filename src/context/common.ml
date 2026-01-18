@@ -475,6 +475,7 @@ let short_platform_name = function
 	| Python -> "py"
 	| Hl -> "hl"
 	| Eval -> "evl"
+	| Fiberus -> "fib"
 	| CustomTarget n -> "c_" ^ n
 
 let stats =
@@ -716,6 +717,21 @@ let get_config com =
 				ec_avoid_wrapping = false
 			};
 			pf_supports_atomics = true;
+		}
+	| Fiberus ->
+		{
+			default_config with
+			pf_static = true;
+			pf_sys = true;
+			pf_capture_policy = CPWrapRef;
+			pf_pad_nulls = true;
+			pf_add_final_return = true;
+			pf_supports_threads = true;
+			pf_uses_utf16 = false;
+			pf_scoping = { default_config.pf_scoping with
+				vs_flags = [NoShadowing];
+				vs_scope = FunctionScope;
+			};
 		}
 
 let memory_marker = [|Unix.time()|]

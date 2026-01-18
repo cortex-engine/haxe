@@ -1,0 +1,18 @@
+compile-each.hxml
+--main Main
+--fiberus bin/fiberus
+
+--next
+compile-each.hxml
+--main TestArguments
+--fiberus bin/fiberus
+
+--next
+compile-each.hxml
+--main ExitCode
+--fiberus bin/fiberus
+
+--next
+compile-each.hxml
+--main UtilityProcess
+--fiberus bin/fiberus

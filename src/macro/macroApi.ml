@@ -444,6 +444,7 @@ and encode_platform p =
 		| Python -> 8, []
 		| Hl -> 9, []
 		| Eval -> 10, []
+		| Fiberus -> 12, []
 		| CustomTarget s -> 11, [(encode_string s)]
 	in
 	encode_enum IPlatform tag pl

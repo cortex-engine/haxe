@@ -99,6 +99,9 @@ let parse_args com =
 		("Target",["--hl"],["-hl"],Arg.String (fun file ->
 			set_platform com Hl file;
 		),"<file>","generate HashLink .hl bytecode or .c code into target file");
+		("Target",["--fiberus"],["-fiberus"],Arg.String (fun dir ->
+			set_platform com Fiberus dir;
+		),"<directory>","generate Fiberus C code into target directory");
 		("Target",["--custom-target"],["-custom"],Arg.String (fun target ->
 			let name, path = try let split = ExtString.String.split target "=" in split with _ -> target, "" in
 			set_custom_target com name path;

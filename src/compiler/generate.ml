@@ -185,6 +185,8 @@ let generate ctx tctx ext actx =
 			Genhl.generate,"hl"
 		| Eval ->
 			(fun _ -> MacroContext.interpret tctx),"eval"
+		| Fiberus ->
+			Genfiberus.generate,"fiberus"
 		| Cross
 		| CustomTarget _ ->
 			(fun _ -> ()),""

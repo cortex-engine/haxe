@@ -27,7 +27,7 @@ private class CustomNativeException extends flash.errors.Error {}
 private class CustomNativeException extends java.lang.RuntimeException {}
 #elseif python
 private class CustomNativeException extends python.Exceptions.Exception {}
-#elseif (lua || eval || neko || hl || cpp)
+#elseif (lua || eval || neko || hl || cpp || fiberus)
 private class CustomNativeException { public function new(m:String) {} }
 #end
 
