@@ -18,7 +18,7 @@ typedef GCStats = {
 	var peakHeapSize:Int;
 	/** Current number of live objects */
 	var currentObjectCount:Int;
-	/** Total number of GC cycles */
+	/** Total number of GC cycles (major collections) */
 	var collectionCount:Int;
 	/** Objects marked in last cycle */
 	var objectsMarked:Int;
@@ -36,6 +36,20 @@ typedef GCStats = {
 	var fibersScanned:Int;
 	/** Total stack bytes scanned in last cycle */
 	var stackBytesScanned:Int;
+	
+	/* Generational GC stats */
+	/** Total minor (nursery) collections */
+	var minorCollections:Int;
+	/** Objects promoted from nursery to mature space */
+	var minorObjectsEvacuated:Int;
+	/** Bytes promoted from nursery to mature space */
+	var minorBytesEvacuated:Int;
+	/** Last minor collection time in milliseconds */
+	var lastMinorTimeMs:Float;
+	/** Total time in minor collections in milliseconds */
+	var totalMinorTimeMs:Float;
+	/** Write barrier slow path invocations */
+	var writeBarriersTriggered:Int;
 }
 
 /**

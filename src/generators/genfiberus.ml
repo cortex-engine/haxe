@@ -29,6 +29,7 @@ type ctx = {
 	mutable closures : (string * tfunc * tvar list) list;  (* name, function, captured vars *)
 	mutable in_closure_impl : bool;  (* True when generating closure implementations *)
 	mutable closure_fwd_decls : Buffer.t;  (* Buffer for forward declarations during impl phase *)
+	mutable in_fiber_spawn : bool;  (* True when generating a closure for Fiber.spawn *)
 	(* GC root tracking: count of gc_push_temp_root calls in current function *)
 	mutable gc_local_count : int;
 	(* Loop depth tracking: skip yield points in deeply nested loops *)
@@ -1053,17 +1054,129 @@ and gen_call ctx e args =
 		| _ ->
 			(* Dynamic type check - fallback to runtime *)
 			spr ctx "false /* dynamic type check not supported */")
-	(* Fiber.spawn with closure -> Fiber_spawn_closure *)
+	(* Fiber.spawn with closure -> protected spawn with temp root at call site *)
 	| TField (_, FStatic ({ cl_path = ([], "Fiber") }, { cf_name = "spawn" })), [arg] ->
 		(match arg.eexpr with
 		| TFunction _ ->
-			(* Closure argument - use Fiber_spawn_closure *)
-			spr ctx "Fiber_spawn_closure(";
-			gen_value ctx arg;
-			spr ctx ")"
+			(* Closure argument - protect closure from allocation until fiber takes ownership.
+			   Use gc_mature_alloc_begin/end to prevent GC from clearing row marks. *)
+			let free_vars, closure_name = match arg.eexpr with
+				| TFunction f ->
+					let fv = collect_free_vars f.tf_args f.tf_expr in
+					let cn = Printf.sprintf "_closure_%d" ctx.closure_counter in
+					ctx.closure_counter <- ctx.closure_counter + 1;
+					if not ctx.in_closure_impl then
+						ctx.closures <- (cn, f, fv) :: ctx.closures;
+					(fv, cn)
+				| _ -> ([], "_unknown")
+			in
+			(* Closure allocation with gc_mature_alloc_begin/end protection.
+			   CRITICAL: gc_mature_alloc_end() is called AFTER scheduler_spawn() returns.
+			   This ensures the closure stays protected by gMatureAllocCount until it's
+			   safely in the work queue with fiber->gc_arg set. If GC triggers before
+			   the spawn completes, it will wait for gMatureAllocCount to reach 0. *)
+			spr ctx "({ gc_mature_alloc_begin(); FibClosure* _fc = fib_closure_create_for_fiber((void*)";
+			spr ctx closure_name;
+			print ctx ", %d); gc_push_temp_root((void**)&_fc); " (List.length free_vars);
+			List.iteri (fun i v ->
+				print ctx "_fc->captures[%d] = " i;
+				let vtype = s_type ctx v.v_type in
+				if vtype = "int32_t" then
+					print ctx "fib_dynamic_int(%s); " (ident v.v_name)
+				else if vtype = "double" then
+					print ctx "fib_dynamic_float(%s); " (ident v.v_name)
+				else if vtype = "bool" then
+					print ctx "fib_dynamic_bool(%s); " (ident v.v_name)
+				else if vtype = "FibString*" then
+					print ctx "fib_dynamic_string(%s); " (ident v.v_name)
+				else
+					print ctx "(FibDynamic){.type=FIB_TYPE_OBJECT, .data.ptrVal=%s}; " (ident v.v_name)
+			) free_vars;
+			spr ctx "Fiber* _fib = scheduler_spawn(_fib_spawn_closure_trampoline, (void*)_fc); ";
+			spr ctx "gc_mature_alloc_end(); gc_pop_temp_roots(1); _fib; })"
 		| _ ->
 			(* Regular function - use Fiber_spawn *)
 			spr ctx "Fiber_spawn(";
+			gen_value ctx arg;
+			spr ctx ")")
+	(* Fiber.spawnOn with closure -> protected spawn with temp root at call site *)
+	| TField (_, FStatic ({ cl_path = ([], "Fiber") }, { cf_name = "spawnOn" })), [thread_id; arg] ->
+		(match arg.eexpr with
+		| TFunction _ ->
+			(* Same pattern as Fiber.spawn with gc_mature_alloc_begin/end *)
+			let free_vars, closure_name = match arg.eexpr with
+				| TFunction f ->
+					let fv = collect_free_vars f.tf_args f.tf_expr in
+					let cn = Printf.sprintf "_closure_%d" ctx.closure_counter in
+					ctx.closure_counter <- ctx.closure_counter + 1;
+					if not ctx.in_closure_impl then
+						ctx.closures <- (cn, f, fv) :: ctx.closures;
+					(fv, cn)
+				| _ -> ([], "_unknown")
+			in
+			spr ctx "({ int _tid = ";
+			gen_value ctx thread_id;
+			spr ctx "; gc_mature_alloc_begin(); FibClosure* _fc = fib_closure_create_for_fiber((void*)";
+			spr ctx closure_name;
+			print ctx ", %d); gc_push_temp_root((void**)&_fc); " (List.length free_vars);
+			List.iteri (fun i v ->
+				print ctx "_fc->captures[%d] = " i;
+				let vtype = s_type ctx v.v_type in
+				if vtype = "int32_t" then
+					print ctx "fib_dynamic_int(%s); " (ident v.v_name)
+				else if vtype = "double" then
+					print ctx "fib_dynamic_float(%s); " (ident v.v_name)
+				else if vtype = "bool" then
+					print ctx "fib_dynamic_bool(%s); " (ident v.v_name)
+				else if vtype = "FibString*" then
+					print ctx "fib_dynamic_string(%s); " (ident v.v_name)
+				else
+					print ctx "(FibDynamic){.type=FIB_TYPE_OBJECT, .data.ptrVal=%s}; " (ident v.v_name)
+			) free_vars;
+			spr ctx "Fiber* _fib = scheduler_spawn_on(_tid, _fib_spawn_on_closure_trampoline, (void*)_fc); ";
+			spr ctx "gc_mature_alloc_end(); gc_pop_temp_roots(1); _fib; })"
+		| _ ->
+			spr ctx "Fiber_spawnOn(";
+			gen_value ctx thread_id;
+			spr ctx ", ";
+			gen_value ctx arg;
+			spr ctx ")")
+	(* Fiber.spawnAny with closure -> protected spawn with temp root at call site *)
+	| TField (_, FStatic ({ cl_path = ([], "Fiber") }, { cf_name = "spawnAny" })), [arg] ->
+		(match arg.eexpr with
+		| TFunction _ ->
+			(* Same pattern as Fiber.spawn with gc_mature_alloc_begin/end *)
+			let free_vars, closure_name = match arg.eexpr with
+				| TFunction f ->
+					let fv = collect_free_vars f.tf_args f.tf_expr in
+					let cn = Printf.sprintf "_closure_%d" ctx.closure_counter in
+					ctx.closure_counter <- ctx.closure_counter + 1;
+					if not ctx.in_closure_impl then
+						ctx.closures <- (cn, f, fv) :: ctx.closures;
+					(fv, cn)
+				| _ -> ([], "_unknown")
+			in
+			spr ctx "({ gc_mature_alloc_begin(); FibClosure* _fc = fib_closure_create_for_fiber((void*)";
+			spr ctx closure_name;
+			print ctx ", %d); gc_push_temp_root((void**)&_fc); " (List.length free_vars);
+			List.iteri (fun i v ->
+				print ctx "_fc->captures[%d] = " i;
+				let vtype = s_type ctx v.v_type in
+				if vtype = "int32_t" then
+					print ctx "fib_dynamic_int(%s); " (ident v.v_name)
+				else if vtype = "double" then
+					print ctx "fib_dynamic_float(%s); " (ident v.v_name)
+				else if vtype = "bool" then
+					print ctx "fib_dynamic_bool(%s); " (ident v.v_name)
+				else if vtype = "FibString*" then
+					print ctx "fib_dynamic_string(%s); " (ident v.v_name)
+				else
+					print ctx "(FibDynamic){.type=FIB_TYPE_OBJECT, .data.ptrVal=%s}; " (ident v.v_name)
+			) free_vars;
+			spr ctx "Fiber* _fib = scheduler_spawn_any(_fib_spawn_on_closure_trampoline, (void*)_fc); ";
+			spr ctx "gc_mature_alloc_end(); gc_pop_temp_roots(1); _fib; })"
+		| _ ->
+			spr ctx "Fiber_spawnAny(";
 			gen_value ctx arg;
 			spr ctx ")")
 	(* Std.int -> cast to int *)
@@ -2330,8 +2443,92 @@ and gen_value ctx e =
 					gen_binop ctx op;
 					gen_value ctx e2;
 					spr ctx ")")
+			| TField (obj_expr, field_access) ->
+				(* Field assignment - may need write barrier for generational GC *)
+				let lhs_type = s_type ctx e1.etype in
+				let rhs_type = match get_actual_c_type ctx e2 with
+					| Some t -> t
+					| None -> s_type ctx e2.etype
+				in
+				(* Check if this is an instance field (has an object to barrier) *)
+				let is_instance_field = match field_access with
+					| FInstance (_, _, _) | FAnon _ | FDynamic _ -> true
+					| FClosure (Some _, _) -> true
+					| FStatic _ | FEnum _ | FClosure (None, _) -> false
+				in
+				(* Check if RHS is an object pointer (not primitive) - needs write barrier *)
+				let needs_write_barrier = 
+					is_instance_field &&
+					(is_class_pointer_type rhs_type || 
+					rhs_type = "FibArray*" || 
+					rhs_type = "FibString*" ||
+					rhs_type = "FibObject*" ||
+					(String.length rhs_type > 0 && rhs_type.[String.length rhs_type - 1] = '*' &&
+					 rhs_type <> "char*" && rhs_type <> "void*" && rhs_type <> "int*"))
+				in
+				if needs_write_barrier then begin
+					(* Emit: (FIBRIX_WRITE_BARRIER(obj, value), obj->field = value) *)
+					spr ctx "(FIBRIX_WRITE_BARRIER(";
+					(* Generate the object expression for write barrier *)
+					gen_value ctx obj_expr;
+					spr ctx ", ";
+					(* Generate the value expression for write barrier check *)
+					if lhs_type = "FibDynamic" && rhs_type = "FibArray*" then begin
+						spr ctx "fib_dynamic_array(";
+						gen_value ctx e2;
+						spr ctx ")"
+					end else if lhs_type = "FibDynamic" && rhs_type = "FibString*" then begin
+						spr ctx "fib_string_to_dynamic(";
+						gen_value ctx e2;
+						spr ctx ")"
+					end else if lhs_type = "FibDynamic" && is_class_pointer_type rhs_type then begin
+						spr ctx "fib_dynamic_object((FibObject*)";
+						gen_value ctx e2;
+						spr ctx ")"
+					end else
+						gen_value ctx e2;
+					spr ctx "), ";
+					(* Now emit the actual assignment *)
+					gen_value ctx e1;
+					gen_binop ctx op;
+					if lhs_type = "FibDynamic" && rhs_type = "FibArray*" then begin
+						spr ctx "fib_dynamic_array(";
+						gen_value ctx e2;
+						spr ctx ")"
+					end else if lhs_type = "FibDynamic" && rhs_type = "FibString*" then begin
+						spr ctx "fib_string_to_dynamic(";
+						gen_value ctx e2;
+						spr ctx ")"
+					end else if lhs_type = "FibDynamic" && is_class_pointer_type rhs_type then begin
+						spr ctx "fib_dynamic_object((FibObject*)";
+						gen_value ctx e2;
+						spr ctx ")"
+					end else
+						gen_value ctx e2;
+					spr ctx ")"
+				end else begin
+					(* No write barrier needed for primitives *)
+					spr ctx "(";
+					gen_value ctx e1;
+					gen_binop ctx op;
+					if lhs_type = "FibDynamic" && rhs_type = "int32_t" then begin
+						spr ctx "fib_dynamic_int(";
+						gen_value ctx e2;
+						spr ctx ")"
+					end else if lhs_type = "FibDynamic" && rhs_type = "double" then begin
+						spr ctx "fib_dynamic_float(";
+						gen_value ctx e2;
+						spr ctx ")"
+					end else if lhs_type = "FibDynamic" && rhs_type = "bool" then begin
+						spr ctx "fib_dynamic_bool(";
+						gen_value ctx e2;
+						spr ctx ")"
+					end else
+						gen_value ctx e2;
+					spr ctx ")"
+				end
 			| _ ->
-				(* Regular assignment with coercion *)
+				(* Regular assignment (local variable, etc.) - no write barrier needed *)
 				let lhs_type = s_type ctx e1.etype in
 				let rhs_type = match get_actual_c_type ctx e2 with
 					| Some t -> t
@@ -2855,8 +3052,15 @@ and gen_value ctx e =
 		if not ctx.in_closure_impl then
 			ctx.closures <- (closure_name, f, free_vars) :: ctx.closures;
 		(* Always generate FibClosure* for uniformity *)
-		(* Generate: ({ FibClosure* c = fib_closure_create(fn, n); c->captures[i] = ...; c; }) *)
-		spr ctx "({ FibClosure* _c = fib_closure_create((void*)";
+		(* Generate: ({ FibClosure* c = fib_closure_create[_for_fiber](fn, n); c->captures[i] = ...; c; }) *)
+		(* NOTE: For fiber spawns (in_fiber_spawn=true), the Fiber.spawn/spawnOn/spawnAny
+		 * handlers above generate the closure inline to ensure proper temp root protection.
+		 * This branch should NOT be reached for fiber spawns, but we keep the mature alloc
+		 * logic as a safety measure. *)
+		if ctx.in_fiber_spawn then
+			spr ctx "({ FibClosure* _c = fib_closure_create_for_fiber((void*)"
+		else
+			spr ctx "({ FibClosure* _c = fib_closure_create((void*)";
 		spr ctx closure_name;
 		print ctx ", %d); " (List.length free_vars);
 		List.iteri (fun i v ->
@@ -4228,15 +4432,45 @@ let gen_header ctx com =
 	spr ctx "}\n";
 	spr ctx "/* Fiber_spawn_closure - spawns a fiber with a closure */\n";
 	spr ctx "typedef void (*FibClosureFunc)(FibClosure*, FibDynamic);\n";
+	spr ctx "/* GDB breakpoint function - called when closure corruption detected */\n";
+	spr ctx "__attribute__((noinline)) static void _fib_closure_corruption_trap(\n";
+	spr ctx "\tFibClosure* closure, void* arg, void* gc_arg,\n";
+	spr ctx "\tvoid* actual_clazz, void* expected_clazz, uint64_t actual_magic) {\n";
+	spr ctx "\tfprintf(stderr, \"\\n[FATAL] CLOSURE CORRUPTION DETECTED!\\n\");\n";
+	spr ctx "\tfprintf(stderr, \"  closure     = %p\\n\", (void*)closure);\n";
+	spr ctx "\tfprintf(stderr, \"  arg         = %p\\n\", arg);\n";
+	spr ctx "\tfprintf(stderr, \"  gc_arg      = %p\\n\", gc_arg);\n";
+	spr ctx "\tfprintf(stderr, \"  clazz       = %p (expected %p)\\n\", actual_clazz, expected_clazz);\n";
+	spr ctx "\tfprintf(stderr, \"  magic       = 0x%016lx (expected 0x%016lx)\\n\",\n";
+	spr ctx "\t\t(unsigned long)actual_magic, (unsigned long)FIB_CLOSURE_MAGIC);\n";
+	spr ctx "\tuint64_t* p = (uint64_t*)closure;\n";
+	spr ctx "\tfor (int i = 0; i < 8; i++) fprintf(stderr, \"  [%d] %p: 0x%016lx\\n\", i, (void*)&p[i], (unsigned long)p[i]);\n";
+	spr ctx "\t__builtin_trap();\n";
+	spr ctx "}\n";
 	spr ctx "static void _fib_spawn_closure_trampoline(void* arg) {\n";
-	spr ctx "\tFibClosure* closure = (FibClosure*)arg;\n";
-	spr ctx "\tif (closure && closure->fn) {\n";
-	spr ctx "\t\tFibClosureFunc fn = (FibClosureFunc)closure->fn;\n";
+	spr ctx "\t/* Get closure from fiber's gc_arg which is updated by GC if evacuated.\n";
+	spr ctx "\t * Fall back to arg if fiber_current() fails (shouldn't happen). */\n";
+	spr ctx "\tFiber* self = fiber_current();\n";
+	spr ctx "\tFibClosure* closure = (FibClosure*)(self && self->gc_arg ? self->gc_arg : arg);\n";
+	spr ctx "\t/* Validate closure before calling - check magic and clazz */\n";
+	spr ctx "\tif (closure) {\n";
+	spr ctx "\t\tvolatile FibClosure* vclosure = closure;\n";
+	spr ctx "\t\tif (vclosure->magic != FIB_CLOSURE_MAGIC || vclosure->clazz != &fib_closure_class) {\n";
+	spr ctx "\t\t\t_fib_closure_corruption_trap(closure, arg, self ? self->gc_arg : NULL,\n";
+	spr ctx "\t\t\t\t(void*)vclosure->clazz, (void*)&fib_closure_class, vclosure->magic);\n";
+	spr ctx "\t\t}\n";
+	spr ctx "\t\tFibClosureFunc fn = (FibClosureFunc)vclosure->fn;\n";
 	spr ctx "\t\tfn(closure, fib_dynamic_null());\n";
 	spr ctx "\t}\n";
 	spr ctx "}\n";
 	spr ctx "static inline Fiber* Fiber_spawn_closure(FibClosure* closure) {\n";
-	spr ctx "\treturn scheduler_spawn(_fib_spawn_closure_trampoline, (void*)closure);\n";
+	spr ctx "\t/* Push temp root to protect closure during fiber creation.\n";
+	spr ctx "\t * The closure is in a caller-saved register (rdi) at this point,\n";
+	spr ctx "\t * and GC could run during scheduler_spawn before fiber->gc_arg is set. */\n";
+	spr ctx "\tgc_push_temp_root((void**)&closure);\n";
+	spr ctx "\tFiber* fiber = scheduler_spawn(_fib_spawn_closure_trampoline, (void*)closure);\n";
+	spr ctx "\tgc_pop_temp_roots(1);\n";
+	spr ctx "\treturn fiber;\n";
 	spr ctx "}\n";
 	spr ctx "/* Fiber MT API - multithreading support */\n";
 	spr ctx "static inline int Fiber_createWorkers(int count) {\n";
@@ -4250,18 +4484,33 @@ let gen_header ctx com =
 	spr ctx "}\n";
 	spr ctx "/* Fiber_spawnOn - spawn fiber on specific thread */\n";
 	spr ctx "static void _fib_spawn_on_closure_trampoline(void* arg) {\n";
-	spr ctx "\tFibClosure* closure = (FibClosure*)arg;\n";
-	spr ctx "\tif (closure && closure->fn) {\n";
-	spr ctx "\t\tFibClosureFunc fn = (FibClosureFunc)closure->fn;\n";
+	spr ctx "\tFiber* self = fiber_current();\n";
+	spr ctx "\tFibClosure* closure = (FibClosure*)(self && self->gc_arg ? self->gc_arg : arg);\n";
+	spr ctx "\tif (closure) {\n";
+	spr ctx "\t\tvolatile FibClosure* vclosure = closure;\n";
+	spr ctx "\t\tif (vclosure->clazz != &fib_closure_class) {\n";
+	spr ctx "\t\t\tfprintf(stderr, \"[FATAL] Closure wrong class (spawnOn)! closure=%p clazz=%p expected=%p fn=%p arg=%p gc_arg=%p\\n\",\n";
+	spr ctx "\t\t\t\t(void*)closure, (void*)vclosure->clazz, (void*)&fib_closure_class, vclosure->fn, arg, self ? self->gc_arg : NULL);\n";
+	spr ctx "\t\t\t__builtin_trap();\n";
+	spr ctx "\t\t}\n";
+	spr ctx "\t\tFibClosureFunc fn = (FibClosureFunc)vclosure->fn;\n";
 	spr ctx "\t\tfn(closure, fib_dynamic_null());\n";
 	spr ctx "\t}\n";
 	spr ctx "}\n";
 	spr ctx "static inline Fiber* Fiber_spawnOn(int threadId, FibClosure* closure) {\n";
-	spr ctx "\treturn scheduler_spawn_on(threadId, _fib_spawn_on_closure_trampoline, (void*)closure);\n";
+	spr ctx "\t/* Push temp root to protect closure during fiber creation */\n";
+	spr ctx "\tgc_push_temp_root((void**)&closure);\n";
+	spr ctx "\tFiber* fiber = scheduler_spawn_on(threadId, _fib_spawn_on_closure_trampoline, (void*)closure);\n";
+	spr ctx "\tgc_pop_temp_roots(1);\n";
+	spr ctx "\treturn fiber;\n";
 	spr ctx "}\n";
 	spr ctx "/* Fiber_spawnAny - spawn fiber on least-loaded thread */\n";
 	spr ctx "static inline Fiber* Fiber_spawnAny(FibClosure* closure) {\n";
-	spr ctx "\treturn scheduler_spawn_any(_fib_spawn_on_closure_trampoline, (void*)closure);\n";
+	spr ctx "\t/* Push temp root to protect closure during fiber creation */\n";
+	spr ctx "\tgc_push_temp_root((void**)&closure);\n";
+	spr ctx "\tFiber* fiber = scheduler_spawn_any(_fib_spawn_on_closure_trampoline, (void*)closure);\n";
+	spr ctx "\tgc_pop_temp_roots(1);\n";
+	spr ctx "\treturn fiber;\n";
 	spr ctx "}\n\n";
 	spr ctx "/* Anonymous objects */\n";
 	spr ctx "static inline FibDynamic fib_anon_new(void) {\n";
@@ -4313,6 +4562,13 @@ let gen_header ctx com =
 	spr ctx "\tfib_anon_set(&obj, \"totalGcTimeMs\", fib_dynamic_float((double)s->total_gc_time_us / 1000.0));\n";
 	spr ctx "\tfib_anon_set(&obj, \"fibersScanned\", fib_dynamic_int((int)s->fibers_scanned));\n";
 	spr ctx "\tfib_anon_set(&obj, \"stackBytesScanned\", fib_dynamic_int((int)s->stack_bytes_scanned));\n";
+	spr ctx "\t/* Generational GC stats */\n";
+	spr ctx "\tfib_anon_set(&obj, \"minorCollections\", fib_dynamic_int((int)s->minor_collections));\n";
+	spr ctx "\tfib_anon_set(&obj, \"minorObjectsEvacuated\", fib_dynamic_int((int)s->minor_objects_evacuated));\n";
+	spr ctx "\tfib_anon_set(&obj, \"minorBytesEvacuated\", fib_dynamic_int((int)s->minor_bytes_evacuated));\n";
+	spr ctx "\tfib_anon_set(&obj, \"lastMinorTimeMs\", fib_dynamic_float((double)s->last_minor_time_us / 1000.0));\n";
+	spr ctx "\tfib_anon_set(&obj, \"totalMinorTimeMs\", fib_dynamic_float((double)s->total_minor_time_us / 1000.0));\n";
+	spr ctx "\tfib_anon_set(&obj, \"writeBarriersTriggered\", fib_dynamic_int((int)s->write_barriers_triggered));\n";
 	spr ctx "\treturn obj;\n";
 	spr ctx "}\n\n";
 	spr ctx "/* Stub for haxe.Exception base class */\n";
@@ -4659,6 +4915,7 @@ let generate com =
 		closures = [];
 		in_closure_impl = false;
 		closure_fwd_decls = Buffer.create 256;
+		in_fiber_spawn = false;
 		gc_local_count = 0;
 		loop_depth = 0;
 		has_gc_ctx = false;
