@@ -4174,7 +4174,7 @@ let gen_header ctx com =
 	spr ctx "\treturn gc_alloc_object_inline(size);\n";
 	spr ctx "}\n\n";
 	spr ctx "/* Context-based allocation (preferred - avoids repeated TLS access) */\n";
-	spr ctx "static inline void* fib_alloc_ctx(ImmixLocalAlloc* ctx, size_t size) {\n";
+	spr ctx "static inline void* fib_alloc_ctx(FibrixLocalAlloc* ctx, size_t size) {\n";
 	spr ctx "\treturn gc_alloc_ctx(ctx, size);\n";
 	spr ctx "}\n\n";
 	spr ctx "/* String comparison */\n";
