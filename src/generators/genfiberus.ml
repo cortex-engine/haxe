@@ -238,6 +238,31 @@ let print ctx =
 let newline ctx =
 	print ctx "\n%s" ctx.tabs
 
+let temp ctx =
+	ctx.id_counter <- ctx.id_counter + 1;
+	"_hx_tmp" ^ string_of_int ctx.id_counter
+
+(* Check if an expression ends with a return statement.
+ * Used to avoid generating redundant gc_pop_temp_roots after returns,
+ * since return statements already handle their own cleanup. *)
+let rec ends_with_return e =
+	match e.eexpr with
+	| TReturn _ -> true
+	| TBlock el when el <> [] -> ends_with_return (List.hd (List.rev el))
+	| TIf (_, then_e, Some else_e) -> ends_with_return then_e && ends_with_return else_e
+	| TSwitch sw ->
+		(* All cases must end with return, including default *)
+		let cases_return = List.for_all (fun c -> ends_with_return c.case_expr) sw.switch_cases in
+		let default_returns = match sw.switch_default with
+			| Some d -> ends_with_return d
+			| None -> false
+		in
+		cases_return && default_returns
+	| TTry (try_e, catches) ->
+		ends_with_return try_e && List.for_all (fun (_, e) -> ends_with_return e) catches
+	| TWhile (_, body, DoWhile) -> ends_with_return body  (* do-while might fall through *)
+	| _ -> false
+
 let open_block ctx =
 	let old_tabs = ctx.tabs in
 	let saved_gc_count = ctx.gc_local_count in
@@ -256,9 +281,31 @@ let open_block ctx =
 		newline ctx;
 		spr ctx "}")
 
-let temp ctx =
-	ctx.id_counter <- ctx.id_counter + 1;
-	"_hx_tmp" ^ string_of_int ctx.id_counter
+(* Open a block for an expression list, checking if it ends with return.
+ * If it ends with return, skip the gc_pop since return handles its own cleanup. *)
+let open_block_for_exprs ctx el =
+	let old_tabs = ctx.tabs in
+	let saved_gc_count = ctx.gc_local_count in
+	ctx.tabs <- ctx.tabs ^ "\t";
+	spr ctx "{";
+	newline ctx;
+	(fun () ->
+		(* Pop GC roots that were pushed in this block, but only if block doesn't end with return *)
+		let to_pop = ctx.gc_local_count - saved_gc_count in
+		let block_returns = match el with
+			| [] -> false
+			| _ -> 
+				let last_expr = List.hd (List.rev el) in
+				ends_with_return last_expr
+		in
+		if to_pop > 0 && not block_returns then begin
+			print ctx "gc_pop_temp_roots_ctx(FIB_CTX, %d);" to_pop;
+			newline ctx
+		end;
+		ctx.gc_local_count <- saved_gc_count;
+		ctx.tabs <- old_tabs;
+		newline ctx;
+		spr ctx "}")
 
 (* Get or assign a unique class ID *)
 let get_class_id ctx path =
@@ -3135,7 +3182,7 @@ and gen_value ctx e =
 				gen_coerce_with_expr ctx e.etype v.v_type (Some e) (fun () -> gen_value ctx e))
 		end
 	| TBlock el ->
-		let b = open_block ctx in
+		let b = open_block_for_exprs ctx el in
 		List.iter (fun e ->
 			gen_expr ctx e;
 			spr ctx ";";
@@ -3390,7 +3437,7 @@ and gen_expr ctx e =
 			end
 		end
 	| TBlock el ->
-		let b = open_block ctx in
+		let b = open_block_for_exprs ctx el in
 		List.iter (fun e ->
 			gen_expr ctx e;
 			spr ctx ";";
@@ -3404,13 +3451,14 @@ and gen_expr ctx e =
 		let saved_gc1 = ctx.gc_local_count in
 		gen_expr ctx e1;
 		(match e1.eexpr with TBlock _ -> () | _ -> spr ctx ";");
-		(* Pop GC roots from then-branch *)
+		(* Pop GC roots from then-branch, but only if branch doesn't end with return
+		 * (return statements handle their own cleanup) *)
 		let to_pop1 = ctx.gc_local_count - saved_gc1 in
-		if to_pop1 > 0 then begin
+		if to_pop1 > 0 && not (ends_with_return e1) then begin
 			spr ctx " gc_pop_temp_roots_ctx(FIB_CTX, ";
-			print ctx "%d);" to_pop1;
-			ctx.gc_local_count <- saved_gc1
+			print ctx "%d);" to_pop1
 		end;
+		ctx.gc_local_count <- saved_gc1;
 		spr ctx " }";
 		(match e2 with
 		| None -> ()
@@ -3419,13 +3467,13 @@ and gen_expr ctx e =
 			let saved_gc2 = ctx.gc_local_count in
 			gen_expr ctx e;
 			(match e.eexpr with TBlock _ -> () | _ -> spr ctx ";");
-			(* Pop GC roots from else-branch *)
+			(* Pop GC roots from else-branch, but only if branch doesn't end with return *)
 			let to_pop2 = ctx.gc_local_count - saved_gc2 in
-			if to_pop2 > 0 then begin
+			if to_pop2 > 0 && not (ends_with_return e) then begin
 				spr ctx " gc_pop_temp_roots_ctx(FIB_CTX, ";
-				print ctx "%d);" to_pop2;
-				ctx.gc_local_count <- saved_gc2
+				print ctx "%d);" to_pop2
 			end;
+			ctx.gc_local_count <- saved_gc2;
 			spr ctx " }")
 	| TWhile (cond, e, NormalWhile) ->
 		spr ctx "while (";
@@ -3676,6 +3724,10 @@ and gen_expr ctx e =
 					| None -> gen_value ctx e);
 					print ctx "; gc_pop_temp_roots_ctx(FIB_CTX, %d); return __ret; }" ctx.gc_local_count
 				end)
+			(* NOTE: We do NOT reset gc_local_count here because:
+			 * 1. The TIf handler properly saves/restores gc_local_count for each branch
+			 * 2. Setting it to 0 would corrupt tracking for later code paths
+			 * 3. The duplicate gc_pop issue needs a different fix *)
 		end else begin
 			(* No GC locals to pop - original code *)
 			match eo with
@@ -3746,25 +3798,6 @@ let gen_function ctx name f c is_static =
 	(* Set return type for coercion in return statements *)
 	let old_ret_type = ctx.current_ret_type in
 	ctx.current_ret_type <- Some f.tf_type;
-	(* Check if expression ends with a return statement (already handles gc_pop) *)
-	let rec ends_with_return e =
-		match e.eexpr with
-		| TReturn _ -> true
-		| TBlock el when el <> [] -> ends_with_return (List.hd (List.rev el))
-		| TIf (_, then_e, Some else_e) -> ends_with_return then_e && ends_with_return else_e
-		| TSwitch sw ->
-			(* All cases must end with return, including default *)
-			let cases_return = List.for_all (fun c -> ends_with_return c.case_expr) sw.switch_cases in
-			let default_returns = match sw.switch_default with
-				| Some d -> ends_with_return d
-				| None -> false
-			in
-			cases_return && default_returns
-		| TTry (try_e, catches) ->
-			ends_with_return try_e && List.for_all (fun (_, e) -> ends_with_return e) catches
-		| TWhile (_, body, DoWhile) -> ends_with_return body  (* do-while might fall through *)
-		| _ -> false
-	in
 	(* Generate function body - unwrap TBlock to avoid double braces *)
 	(match f.tf_expr.eexpr with
 	| TBlock el ->
@@ -5006,25 +5039,13 @@ let generate com =
 	spr ctx "/* Entry point */\n";
 	spr ctx "#include \"fiberus_generated.h\"\n";
 	spr ctx "#include \"telemetry.h\"\n\n";
-	spr ctx "int main(int argc, char** argv) {\n";
-	spr ctx "\t(void)argc; (void)argv;\n";
-	spr ctx "\tvolatile int _gc_stack_base_marker;\n";
-	spr ctx "\tgc_set_stack_base((void*)&_gc_stack_base_marker);\n";
-	spr ctx "\tscheduler_init();\n";
-	spr ctx "\tfiberus_register_gc_roots();\n\n";
-	(* Call boot functions to initialize static fields *)
-	if boot_classes <> [] then begin
-		spr ctx "\t/* Static field initialization */\n";
-		List.iter (fun class_name ->
-			print ctx "\t%s___boot();\n" class_name
-		) boot_classes;
-		spr ctx "\n"
-	end;
-	(* Add Tracy zone around main code *)
-	spr ctx "#ifdef FIBERUS_TRACY\n";
-	spr ctx "\tTracyCZoneN(_main_zone, \"main\", 1);\n";
-	spr ctx "#endif\n\n";
 
+	(* Generate the main fiber entry function - runs the Haxe main code as a fiber *)
+	spr ctx "/* Main fiber entry - runs the Haxe main code as a fiber.\n";
+	spr ctx " * This allows the main thread to participate in work-stealing\n";
+	spr ctx " * and provides a uniform execution model where all code runs in fibers. */\n";
+	spr ctx "static void _fiberus_main_entry(void* arg) {\n";
+	spr ctx "\t(void)arg;\n";
 	(match com.main.main_expr with
 	| Some e ->
 		ctx.tabs <- "\t";
@@ -5033,8 +5054,30 @@ let generate com =
 		ctx.tabs <- ""
 	| None ->
 		spr ctx "\t/* No main expression */");
+	spr ctx "\n}\n\n";
 
-	spr ctx "\n\n\t/* Run all spawned fibers until completion */\n";
+	spr ctx "int main(int argc, char** argv) {\n";
+	spr ctx "\t(void)argc; (void)argv;\n";
+	spr ctx "\tvolatile int _gc_stack_base_marker;\n";
+	spr ctx "\tgc_set_stack_base((void*)&_gc_stack_base_marker);\n";
+	spr ctx "\tscheduler_init();\n";
+	spr ctx "\tfiberus_register_gc_roots();\n\n";
+	(* Call boot functions to initialize static fields - must happen before main fiber *)
+	if boot_classes <> [] then begin
+		spr ctx "\t/* Static field initialization (before main fiber) */\n";
+		List.iter (fun class_name ->
+			print ctx "\t%s___boot();\n" class_name
+		) boot_classes;
+		spr ctx "\n"
+	end;
+	(* Spawn main as a fiber on thread 0 (main thread's queue) *)
+	spr ctx "\t/* Spawn main code as fiber on thread 0 (main thread's queue) */\n";
+	spr ctx "\tscheduler_spawn(_fiberus_main_entry, NULL);\n\n";
+	(* Tracy zone wraps scheduler_run which includes main fiber execution *)
+	spr ctx "#ifdef FIBERUS_TRACY\n";
+	spr ctx "\tTracyCZoneN(_main_zone, \"main\", 1);\n";
+	spr ctx "#endif\n\n";
+	spr ctx "\t/* Run fibers until all complete (main thread participates in work-stealing) */\n";
 	spr ctx "\tscheduler_run();\n\n";
 	spr ctx "#ifdef FIBERUS_TRACY\n";
 	spr ctx "\tTracyCZoneEnd(_main_zone);\n";
