@@ -862,6 +862,15 @@ let gen_coerce_with_expr ctx from_type to_type expr gen_inner =
 	end else if is_null_expr && to_c = "FibDynamic" then begin
 		spr ctx "fib_dynamic_null()";
 		(* Don't call gen_inner - we've already generated the value *)
+	end else if is_null_expr && to_c = "int32_t" then begin
+		(* null -> int defaults to 0 (for optional parameters) *)
+		spr ctx "0";
+	end else if is_null_expr && to_c = "double" then begin
+		(* null -> float defaults to 0.0 *)
+		spr ctx "0.0";
+	end else if is_null_expr && to_c = "bool" then begin
+		(* null -> bool defaults to false *)
+		spr ctx "false";
 	end else begin
 	(* Determine actual C type based on expression kind *)
 	let from_c = match expr with
@@ -4241,7 +4250,11 @@ let gen_class_impl ctx c =
 					newline ctx
 				end;
 				List.iteri (fun i v ->
-					let vtype = s_type ctx v.v_type in
+					(* For TFun types, use FibClosure* since all closures are FibClosure in Fiberus *)
+					let vtype = match follow v.v_type with
+						| TFun _ -> "FibClosure*"
+						| _ -> s_type ctx v.v_type
+					in
 					print ctx "%s %s = " vtype (ident v.v_name);
 					if vtype = "int32_t" then
 						print ctx "_closure->captures[%d].data.intVal;" i
@@ -4371,6 +4384,7 @@ let gen_header ctx com =
 	spr ctx "#include \"stack_macros.h\"\n";
 	spr ctx "#include \"closure.h\"\n";
 	spr ctx "#include \"scheduler.h\"\n";
+	spr ctx "#include \"counter.h\"\n";
 	spr ctx "\n";
 
 	(* Fiber yield point macro - uses runtime scheduler_should_yield from scheduler.h *)
@@ -4544,6 +4558,28 @@ let gen_header ctx com =
 	spr ctx "\tFiber* fiber = scheduler_spawn_any(_fib_spawn_on_closure_trampoline, (void*)closure);\n";
 	spr ctx "\tgc_pop_temp_roots(1);\n";
 	spr ctx "\treturn fiber;\n";
+	spr ctx "}\n\n";
+	spr ctx "/* Counter API bridge - maps Haxe Counter class to runtime functions */\n";
+	spr ctx "static inline Counter* Counter_create(int initialValue) {\n";
+	spr ctx "\treturn counter_create(initialValue);\n";
+	spr ctx "}\n";
+	spr ctx "static inline void Counter_add(Counter* c, int delta) {\n";
+	spr ctx "\tcounter_add(c, delta);\n";
+	spr ctx "}\n";
+	spr ctx "static inline int Counter_decrement(Counter* c) {\n";
+	spr ctx "\treturn counter_decrement(c);\n";
+	spr ctx "}\n";
+	spr ctx "static inline void Counter_wait(Counter* c, int target) {\n";
+	spr ctx "\tcounter_wait(c, target);\n";
+	spr ctx "}\n";
+	spr ctx "static inline void Counter_done(Counter* c) {\n";
+	spr ctx "\tcounter_done(c);\n";
+	spr ctx "}\n";
+	spr ctx "static inline void Counter_waitAndDone(Counter* c, int target) {\n";
+	spr ctx "\tcounter_wait_and_done(c, target);\n";
+	spr ctx "}\n";
+	spr ctx "static inline int Counter_getValue(Counter* c) {\n";
+	spr ctx "\treturn counter_get_value(c);\n";
 	spr ctx "}\n\n";
 	spr ctx "/* Anonymous objects */\n";
 	spr ctx "static inline FibDynamic fib_anon_new(void) {\n";
