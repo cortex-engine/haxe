@@ -155,10 +155,15 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
   | TCEInt i -> writef w "%ld" i
   | TCEInt64 i -> writef w "%LdLL" i
   | TCEFloat s -> write w s
-  | TCEString s -> writef w "fib_string_new(\"%s\")" (String.escaped s)
-  | TCERawString s -> writef w "\"%s\"" (String.escaped s)
+  | TCEString s -> writef w "fib_string_new(\"%s\")" (StringHelper.s_escape s)
+  | TCERawString s -> writef w "\"%s\"" (StringHelper.s_escape s)
   | TCEBool b -> write w (if b then "true" else "false")
-  | TCENull -> write w "NULL"
+  | TCENull ->
+      (* Null depends on type - enum structs use sentinel, others use NULL *)
+      (match t with
+       | TCFibEnum name -> writef w "(%s){ .index = -1 }" name
+       | TCFibDynamic -> write w "fib_dynamic_null()"
+       | _ -> write w "NULL")
   | TCEThis -> write w "this"
   | TCESizeOf typ -> write w "sizeof("; write_type w typ; write w ")"
   
@@ -326,6 +331,14 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
       writef w "%slength(" prefix;
       write_expr w arr;
       write w ")"
+  | TCEArrayFromValues { afv_kind; afv_c_type; afv_values } ->
+      let prefix = array_kind_prefix afv_kind in
+      writef w "%sfrom_values((%s[]){" prefix afv_c_type;
+      List.iteri (fun i v ->
+        if i > 0 then write w ", ";
+        write_expr w v
+      ) afv_values;
+      writef w "}, %d)" (List.length afv_values)
   
   (* Boxing/Unboxing *)
   | TCEBox (e, kind) ->
@@ -349,7 +362,16 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
       let func = unbox_func_name target_type in
       if func = "" then
         write_expr w e  (* Already the right type *)
-      else begin
+      else if unbox_is_enum target_type then begin
+        (* Enum unboxing with null check: 
+           (fib_dynamic_is_null(e) ? (EnumType){ .index = -1 } : (*(EnumType*)fib_dynamic_to_ptr(e))) *)
+        let enum_name = match target_type with TCFibEnum n -> n | _ -> "UNKNOWN" in
+        writef w "(fib_dynamic_is_null(";
+        write_expr w e;
+        writef w ") ? (%s){ .index = -1 } : (*(%s*)fib_dynamic_to_ptr(" enum_name enum_name;
+        write_expr w e;
+        write w ")))"
+      end else begin
         if unbox_needs_cast target_type then begin
           write w "(";
           write_type w target_type;
@@ -389,6 +411,15 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
       writef w "fib_is_instance(";
       write_expr w e;
       writef w ", &%s_class)" cls
+  | TCEAnonObject fields ->
+      (* ({ FibDynamic _anon = fib_anon_new(); fib_anon_set(&_anon, "name", value); ... _anon; }) *)
+      write w "({ FibDynamic _anon = fib_anon_new(); ";
+      List.iter (fun (name, value) ->
+        writef w "fib_anon_set(&_anon, \"%s\", " name;
+        write_expr w value;
+        write w "); "
+      ) fields;
+      write w "_anon; })"
   
   (* String operations *)
   | TCEStringConcat (lhs, rhs) ->
@@ -402,6 +433,10 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
       write_expr w lhs;
       write w ", ";
       write_expr w rhs;
+      write w ")"
+  | TCEStringLength str ->
+      write w "fib_string_length(";
+      write_expr w str;
       write w ")"
   
   (* Compound expressions *)
@@ -567,20 +602,23 @@ and write_stmt (w : writer) (s : tc_stmt) : unit =
       write w " FIB_END_TRY";
       newline w
   | TCSThrow e ->
-      write w "FIB_THROW(";
+      (* Exception throw: begin unwinding, then throw boxed FibDynamic *)
+      write w "fib_exception_begin(); fib_throw(";
       write_expr w e;
-      write w ");";
+      write w ")";
       newline w
   
   (* GC integration *)
   | TCSGCPush e ->
-      write w "gc_push_temp_root(&";
+      write w "gc_push_temp_root_ctx(FIB_CTX, (void**)&";
       write_expr w e;
       write w ");";
       newline w
-  | TCSGCPop n ->
+  | TCSGCPop n when n > 0 ->
       writef w "gc_pop_temp_roots_ctx(FIB_CTX, %d);" n;
       newline w
+  | TCSGCPop _ ->
+      () (* n=0, emit nothing *)
   | TCSGCCtx ->
       write w "FIB_GC_CTX;";
       newline w

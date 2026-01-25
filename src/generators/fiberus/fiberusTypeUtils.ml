@@ -209,6 +209,14 @@ let rec needs_gc_root = function
   | TCPointer inner -> needs_gc_root inner
   | _ -> false
 
+(* Check if type needs write barrier for GC - object pointers need barriers *)
+let needs_write_barrier_tc = function
+  | TCFibString | TCFibArray _ | TCFibClass _ | TCFibClosure 
+  | TCFibObject | TCFibIntMap | TCFibStringMap 
+  | TCFibInt64Map | TCFibObjectMap | TCFibBytesData -> true
+  | TCPointer _ -> true
+  | _ -> false
+
 (* Check if Haxe type needs GC root *)
 let haxe_type_needs_gc_root t =
   needs_gc_root (tc_type_of t)
@@ -277,6 +285,17 @@ let array_kind_prefix = function
   | TCArrUInt64 -> "fib_uint64_array_"
   | TCArrFloat32 -> "fib_float32_array_"
 
+(* Get C element type for array kind (for compound literals) *)
+let array_kind_c_elem_type = function
+  | TCArrGeneric -> "FibDynamic"
+  | TCArrInt -> "int32_t"
+  | TCArrFloat -> "double"
+  | TCArrBool -> "uint8_t"
+  | TCArrUInt8 -> "uint8_t"
+  | TCArrInt64 -> "int64_t"
+  | TCArrUInt64 -> "uint64_t"
+  | TCArrFloat32 -> "float"
+
 (* ============================================================================
  * Boxing/Unboxing Utilities
  * ============================================================================ *)
@@ -331,7 +350,13 @@ let unbox_func_name = function
   | TCFibString -> "fib_dynamic_to_string"
   | TCFibArray _ -> "fib_dynamic_to_array"
   | TCFibObject | TCFibClass _ -> "fib_dynamic_to_object"
+  | TCFibEnum _ -> "fib_dynamic_to_ptr"  (* Returns void*, needs cast and deref *)
   | _ -> ""
+
+(* Check if unboxing to this type needs special enum handling *)
+let unbox_is_enum = function
+  | TCFibEnum _ -> true
+  | _ -> false
 
 (* ============================================================================
  * Map Utilities

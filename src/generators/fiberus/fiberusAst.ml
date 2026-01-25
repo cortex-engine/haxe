@@ -179,6 +179,11 @@ and tc_expr_kind =
   | TCEArraySet of tc_array_access * tc_expr
   | TCEArrayDecl of tc_expr list * tc_type  (* Compound literal array *)
   | TCEArrayLength of tc_expr * tc_array_kind
+  | TCEArrayFromValues of {
+      afv_kind: tc_array_kind;
+      afv_c_type: string;      (* "int32_t", "double", "FibDynamic", etc. *)
+      afv_values: tc_expr list;
+    }
   
   (* Boxing/Unboxing (explicit in AST) *)
   | TCEBox of tc_expr * tc_box_kind         (* Wrap value in FibDynamic *)
@@ -193,10 +198,12 @@ and tc_expr_kind =
   (* Object operations *)
   | TCENew of string * tc_expr list         (* Class_new(args) *)
   | TCEInstanceOf of tc_expr * string       (* Std.is equivalent *)
+  | TCEAnonObject of (string * tc_expr) list  (* Anonymous object { field: value, ... } *)
   
   (* String operations *)
   | TCEStringConcat of tc_expr * tc_expr    (* fib_string_concat *)
   | TCEStringEq of tc_expr * tc_expr        (* fib_string_eq *)
+  | TCEStringLength of tc_expr              (* fib_string_length *)
   
   (* Compound expressions *)
   | TCEBlock of tc_stmt list * tc_expr option  (* ({ stmts; expr }) *)
