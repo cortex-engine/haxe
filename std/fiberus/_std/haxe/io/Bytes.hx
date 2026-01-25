@@ -127,6 +127,12 @@ class Bytes {
 	}
 
 	public static function ofData(b:BytesData):Bytes {
+		// Use direct pointer check via __fiberus__ since BytesData is native pointer
+		var isNull:Bool = untyped __fiberus__("(", b, " == NULL)");
+		if (isNull) {
+			// Return empty Bytes if BytesData is null
+			return alloc(0);
+		}
 		var len:Int = untyped __fiberus__("fib_bytes_length(", b, ")");
 		return new Bytes(len, b);
 	}

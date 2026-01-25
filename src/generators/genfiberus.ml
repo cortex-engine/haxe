@@ -9,6 +9,7 @@ open Globals
 open Ast
 open Type
 open Gctx
+open GenfiberusVtable
 
 type ctx = {
 	com : Gctx.t;
@@ -38,6 +39,11 @@ type ctx = {
 	mutable has_gc_ctx : bool;
 	(* Escape analysis: set of variable IDs that can be stack-allocated *)
 	mutable stack_alloc_vars : (int, tclass) Hashtbl.t;
+	(* Vtable context for virtual method dispatch *)
+	mutable vtable_ctx : GenfiberusVtable.vtable_context option;
+	(* Method thunks: methods that are used as values and need closure wrappers *)
+	(* Maps thunk_name -> (is_static, class_path, method_name, arg_types, ret_type) *)
+	mutable method_thunks : (string, bool * path * string * (string * Type.t) list * Type.t) Hashtbl.t;
 }
 
 (*
@@ -435,10 +441,11 @@ let rec s_type ctx t =
 	| TEnum (e, _) -> flat_path e.e_path
 	| TDynamic _ -> "FibDynamic"
 	| TFun (args, ret) ->
-		(* Generate a proper function pointer type *)
-		let ret_str = s_type ctx ret in
-		let args_str = String.concat ", " (List.map (fun (_, _, t) -> s_type ctx t) args) in
-		Printf.sprintf "%s (*)(%s)" ret_str (if args_str = "" then "void" else args_str)
+		(* Function types are always FibClosure* in Fiberus.
+		 * Raw function pointer syntax is only needed in casts (s_func_ptr_cast).
+		 * This allows passing lambdas, method references, and closures uniformly. *)
+		ignore args; ignore ret;
+		"FibClosure*"
 	| TAnon _ -> "FibDynamic"
 	| TMono r -> (match r.tm_type with None -> "FibDynamic" | Some t -> s_type ctx t)
 	| TType (td, tl) -> s_type ctx (apply_typedef td tl)
@@ -469,34 +476,21 @@ let rec s_type ctx t =
 	| TLazy f -> s_type ctx (lazy_type f)
 
 (* Generate type declaration with name - handles function pointer syntax correctly
- * For function types: "ret (*name)(args)" instead of "ret (*)(args) name"
+ * For function types: now just "FibClosure* name" since all functions are closures
  * For other types: "type name"
  *)
 and s_type_with_name ctx t name =
-	match follow t with
-	| TFun (args, ret) ->
-		let ret_str = s_type ctx ret in
-		let args_str = String.concat ", " (List.map (fun (_, _, t) -> s_type ctx t) args) in
-		Printf.sprintf "%s (*%s)(%s)" ret_str name (if args_str = "" then "void" else args_str)
-	| _ ->
-		Printf.sprintf "%s %s" (s_type ctx t) name
+	(* s_type already returns FibClosure* for TFun, so just use standard format *)
+	Printf.sprintf "%s %s" (s_type ctx t) name
 
 (* Generate a function declaration when the return type might be a function pointer
  * For normal return types: "ret func_name(args)"
- * For function pointer return types: "ret_ret (*func_name(args))(ret_args)"
- * This handles the complex C syntax for functions returning function pointers.
+ * For function pointer return types: now just "FibClosure* func_name(args)"
+ * since all function values are FibClosure* in Fiberus.
  *)
 and s_func_decl ctx ret_type func_name func_args =
-	match follow ret_type with
-	| TFun (ret_fn_args, ret_fn_ret) ->
-		(* Return type is a function pointer - use special C syntax *)
-		let ret_ret_str = s_type ctx ret_fn_ret in
-		let ret_args_str = String.concat ", " (List.map (fun (_, _, t) -> s_type ctx t) ret_fn_args) in
-		Printf.sprintf "%s (*%s(%s))(%s)" ret_ret_str func_name func_args
-			(if ret_args_str = "" then "void" else ret_args_str)
-	| _ ->
-		(* Normal return type *)
-		Printf.sprintf "%s %s(%s)" (s_type ctx ret_type) func_name func_args
+	(* s_type returns FibClosure* for TFun, so use standard format *)
+	Printf.sprintf "%s %s(%s)" (s_type ctx ret_type) func_name func_args
 
 (* Generate a function pointer CAST expression for closure calls.
  * For normal return types: "(ret_type (*)(fn_args))"
@@ -721,7 +715,10 @@ let fib_dynamic_unbox_suffix elem_type =
 
 (* Generate boxing wrapper for value to FibDynamic. gen_inner is called to generate the inner value. *)
 let gen_box_to_fib_dynamic ctx type_str gen_inner =
-	if type_str = "int32_t" then begin
+	if type_str = "FibDynamic" then begin
+		(* Already boxed, output as-is *)
+		gen_inner ()
+	end else if type_str = "int32_t" then begin
 		spr ctx "fib_dynamic_int("; gen_inner (); spr ctx ")"
 	end else if type_str = "double" then begin
 		spr ctx "fib_dynamic_float("; gen_inner (); spr ctx ")"
@@ -733,14 +730,18 @@ let gen_box_to_fib_dynamic ctx type_str gen_inner =
 		spr ctx "fib_dynamic_array("; gen_inner (); spr ctx ")"
 	end else if is_class_pointer_type type_str then begin
 		spr ctx "fib_dynamic_object((FibObject*)"; gen_inner (); spr ctx ")"
+	end else if is_enum_struct_type type_str then begin
+		(* Enum struct - box with fib_dynamic_enum.
+		   Use statement expression with temp var since we can't take address of function return. *)
+		print ctx "({ %s _enum_tmp = " type_str; gen_inner (); print ctx "; fib_dynamic_enum(&_enum_tmp, sizeof(%s)); })" type_str
 	end else
 		gen_inner ()
 
 (* Get actual C type from expression, unwrapping casts/meta *)
 let rec get_actual_c_type ctx e =
 	match e.eexpr with
-	(* Unwrap casts and meta to find actual type *)
-	| TCast (inner, _) -> get_actual_c_type ctx inner
+	(* TCast explicitly changes the type - return the cast's target type, not the inner type *)
+	| TCast (_, _) -> Some (s_type ctx e.etype)
 	| TMeta (_, inner) -> get_actual_c_type ctx inner
 	| TParenthesis inner -> get_actual_c_type ctx inner
 	| TBlock exprs when exprs <> [] ->
@@ -778,12 +779,16 @@ let rec get_actual_c_type ctx e =
 		let is_int_array = obj_c_type = "FibIntArray*" in
 		let is_float_array = obj_c_type = "FibFloatArray*" in
 		let is_bool_array = obj_c_type = "FibBoolArray*" in
+		let is_string = is_string_type obj.etype in
 		let is_int_map = c.cl_path = (["haxe"; "ds"], "IntMap") in
 		let is_string_map = c.cl_path = (["haxe"; "ds"], "StringMap") in
 		let is_int64_map = c.cl_path = (["haxe"; "ds"], "Int64Map") in
 		let is_object_map = c.cl_path = (["haxe"; "ds"], "ObjectMap") in
 		(* Methods that return the element type (not Null<T>) for specialized arrays *)
 		(match cf.cf_name with
+		(* String methods that return int in C (not FibDynamic) *)
+		| "charCodeAt" when is_string -> Some "int32_t"
+		| "indexOf" | "lastIndexOf" when is_string -> Some "int32_t"
 		| "pop" | "shift" | "__get" | "__unsafe_get" when is_int_array -> Some "int32_t"
 		| "pop" | "shift" | "__get" | "__unsafe_get" when is_float_array -> Some "double"
 		| "pop" | "shift" | "__get" | "__unsafe_get" when is_bool_array -> Some "bool"
@@ -970,6 +975,17 @@ let collect_free_vars tf_args tf_expr =
 		| TVar (v, eo) ->
 			Hashtbl.add local v.v_id ();
 			(match eo with Some e -> scan e | None -> ())
+		| TTry (try_e, catches) ->
+			(* Scan try block normally *)
+			scan try_e;
+			(* For each catch, the catch variable is local to that catch block only *)
+			List.iter (fun (v, catch_e) ->
+				(* Add catch var as local for scanning catch block *)
+				Hashtbl.add local v.v_id ();
+				scan catch_e;
+				(* Remove it after - it's not visible outside the catch *)
+				Hashtbl.remove local v.v_id
+			) catches
 		| TFunction f ->
 			(* Scan nested function bodies too - we need to capture any variables
 			   they use from our scope so we can pass them to the inner closure *)
@@ -987,6 +1003,14 @@ let collect_free_vars tf_args tf_expr =
 				| TVar (v, eo) ->
 					Hashtbl.add inner_bound v.v_id ();
 					(match eo with Some e -> scan_inner e | None -> ())
+				| TTry (try_e, catches) ->
+					(* Handle try/catch in nested functions *)
+					scan_inner try_e;
+					List.iter (fun (v, catch_e) ->
+						Hashtbl.add inner_bound v.v_id ();
+						scan_inner catch_e;
+						Hashtbl.remove inner_bound v.v_id
+					) catches
 				| TFunction f2 ->
 					(* Recurse into deeper nested functions *)
 					let inner2_bound = Hashtbl.create 10 in
@@ -1022,224 +1046,136 @@ let rec gen_call_args ctx args param_types gen_value_fn =
 	in
 	loop args param_types
 
-and gen_call ctx e args =
-	(* Helper to generate trace message as FibDynamic *)
-	let gen_trace_value msg =
-		let msg_type = s_type ctx msg.etype in
-		if msg_type = "FibString*" then begin
-			spr ctx "fib_string_to_dynamic(";
-			gen_value ctx msg;
-			spr ctx ")"
-		end else if msg_type = "int32_t" then begin
-			spr ctx "fib_dynamic_int(";
-			gen_value ctx msg;
-			spr ctx ")"
-		end else if msg_type = "double" then begin
-			spr ctx "fib_dynamic_float(";
-			gen_value ctx msg;
-			spr ctx ")"
-		end else if msg_type = "bool" then begin
-			spr ctx "fib_dynamic_bool(";
-			gen_value ctx msg;
-			spr ctx ")"
-		end else if msg_type = "FibDynamic" then begin
-			gen_value ctx msg
-		end else begin
-			(* Object or unknown type - convert to FibDynamic *)
-			spr ctx "fib_dynamic_object((FibObject*)";
-			gen_value ctx msg;
-			spr ctx ")"
-		end
-	in
+(*
+ * ===========================================================================
+ * Call Generation - Builtin Calls
+ * ===========================================================================
+ * Handles special calls: trace, __fiberus__, Std.is, Std.int, Std.string,
+ * Fiber.spawn, etc. Returns true if the call was handled.
+ *)
+
+(* Helper to generate trace message as FibDynamic *)
+and gen_trace_value ctx msg =
+	let msg_type = s_type ctx msg.etype in
+	if msg_type = "FibString*" then begin
+		spr ctx "fib_string_to_dynamic(";
+		gen_value ctx msg;
+		spr ctx ")"
+	end else if msg_type = "int32_t" then begin
+		spr ctx "fib_dynamic_int(";
+		gen_value ctx msg;
+		spr ctx ")"
+	end else if msg_type = "double" then begin
+		spr ctx "fib_dynamic_float(";
+		gen_value ctx msg;
+		spr ctx ")"
+	end else if msg_type = "bool" then begin
+		spr ctx "fib_dynamic_bool(";
+		gen_value ctx msg;
+		spr ctx ")"
+	end else if msg_type = "FibDynamic" then begin
+		gen_value ctx msg
+	end else begin
+		(* Object or unknown type - convert to FibDynamic *)
+		spr ctx "fib_dynamic_object((FibObject*)";
+		gen_value ctx msg;
+		spr ctx ")"
+	end
+
+(* Helper for Fiber.spawn closure capture - shared by spawn/spawnOn/spawnAny *)
+and gen_fiber_spawn_closure ctx free_vars closure_name =
+	List.iteri (fun i v ->
+		print ctx "_fc->captures[%d] = " i;
+		let vtype = s_type ctx v.v_type in
+		if vtype = "int32_t" then
+			print ctx "fib_dynamic_int(%s); " (ident v.v_name)
+		else if vtype = "double" then
+			print ctx "fib_dynamic_float(%s); " (ident v.v_name)
+		else if vtype = "bool" then
+			print ctx "fib_dynamic_bool(%s); " (ident v.v_name)
+		else if vtype = "FibString*" then
+			print ctx "fib_dynamic_string(%s); " (ident v.v_name)
+		else
+			print ctx "(FibDynamic){.type=FIB_TYPE_OBJECT, .data.ptrVal=%s}; " (ident v.v_name)
+	) free_vars
+
+(* Extract closure info for Fiber.spawn patterns *)
+and extract_closure_for_spawn ctx arg =
+	match arg.eexpr with
+	| TFunction f ->
+		let free_vars = collect_free_vars f.tf_args f.tf_expr in
+		let closure_name = Printf.sprintf "_closure_%d" ctx.closure_counter in
+		ctx.closure_counter <- ctx.closure_counter + 1;
+		if not ctx.in_closure_impl then
+			ctx.closures <- (closure_name, f, free_vars) :: ctx.closures;
+		Some (free_vars, closure_name)
+	| _ -> None
+
+(* Generate builtin calls - returns true if handled *)
+and gen_builtin_call ctx e args =
 	match e.eexpr, args with
 	(* trace() -> haxe_Log_trace with position info *)
 	| TIdent "__trace__", [msg; infos] ->
 		spr ctx "haxe_Log_trace(";
-		gen_trace_value msg;
+		gen_trace_value ctx msg;
 		spr ctx ", ";
 		gen_value ctx infos;
-		spr ctx ")"
+		spr ctx ")";
+		true
 	| TField (_, FStatic ({ cl_path = (["haxe"], "Log") }, { cf_name = "trace" })), [msg; infos] ->
 		spr ctx "haxe_Log_trace(";
-		gen_trace_value msg;
+		gen_trace_value ctx msg;
 		spr ctx ", ";
 		gen_value ctx infos;
-		spr ctx ")"
+		spr ctx ")";
+		true
 	(* __fiberus__("code") -> raw code emission *)
 	| TIdent "__fiberus__", code_args ->
 		List.iter (fun arg ->
 			match arg.eexpr with
 			| TConst (TString s) -> spr ctx s
 			| _ -> gen_value ctx arg
-		) code_args
+		) code_args;
+		true
 	(* __fiberus_get_exception_stack() -> native stack array for CallStack *)
 	| TIdent "__fiberus_get_exception_stack", [] ->
-		spr ctx "fib_get_exception_stack_array()"
+		spr ctx "fib_get_exception_stack_array()";
+		true
 	(* __fiberus_get_call_stack() -> native stack array for CallStack *)
 	| TIdent "__fiberus_get_call_stack", [] ->
-		spr ctx "fib_get_call_stack_array()"
+		spr ctx "fib_get_call_stack_array()";
+		true
 	(* Std.isOfType / Std.is -> instanceof check *)
 	| TField (_, FStatic ({ cl_path = ([], "Std") }, { cf_name = ("isOfType" | "is") })), [v; t] ->
-		(* Check if value is an instance of the target class *)
 		(match t.eexpr with
 		| TTypeExpr (TClassDecl c) ->
-			(* Handle built-in types specially *)
 			(match c.cl_path with
 			| ([], "String") ->
-				(* String type check *)
 				spr ctx "fib_dynamic_is_string(";
 				gen_value ctx v;
 				spr ctx ")"
 			| ([], "Array") ->
-				(* Array type check *)
 				spr ctx "fib_dynamic_is_array(";
 				gen_value ctx v;
 				spr ctx ")"
 			| ([], "Int") | ([], "Float") | ([], "Bool") ->
-				(* Primitive type checks - always false for objects *)
 				spr ctx "false"
 			| _ when not (has_class_flag c CExtern) ->
-				(* Known class type - generate direct check *)
 				let target_class = flat_path c.cl_path in
 				spr ctx "fib_object_instanceof((FibObject*)";
 				gen_value ctx v;
 				print ctx ", &%s_class)" target_class
 			| _ ->
-				(* Extern class - generate runtime check *)
 				spr ctx "false /* extern type check not supported */")
 		| _ ->
-			(* Dynamic type check - fallback to runtime *)
-			spr ctx "false /* dynamic type check not supported */")
-	(* Fiber.spawn with closure -> protected spawn with temp root at call site *)
-	| TField (_, FStatic ({ cl_path = ([], "Fiber") }, { cf_name = "spawn" })), [arg] ->
-		(match arg.eexpr with
-		| TFunction _ ->
-			(* Closure argument - protect closure from allocation until fiber takes ownership.
-			   Use gc_mature_alloc_begin/end to prevent GC from clearing row marks. *)
-			let free_vars, closure_name = match arg.eexpr with
-				| TFunction f ->
-					let fv = collect_free_vars f.tf_args f.tf_expr in
-					let cn = Printf.sprintf "_closure_%d" ctx.closure_counter in
-					ctx.closure_counter <- ctx.closure_counter + 1;
-					if not ctx.in_closure_impl then
-						ctx.closures <- (cn, f, fv) :: ctx.closures;
-					(fv, cn)
-				| _ -> ([], "_unknown")
-			in
-			(* Closure allocation with gc_mature_alloc_begin/end protection.
-			   CRITICAL: gc_mature_alloc_end() is called AFTER scheduler_spawn() returns.
-			   This ensures the closure stays protected by gMatureAllocCount until it's
-			   safely in the work queue with fiber->gc_arg set. If GC triggers before
-			   the spawn completes, it will wait for gMatureAllocCount to reach 0. *)
-			spr ctx "({ gc_mature_alloc_begin(); FibClosure* _fc = fib_closure_create_for_fiber((void*)";
-			spr ctx closure_name;
-			print ctx ", %d); gc_push_temp_root((void**)&_fc); " (List.length free_vars);
-			List.iteri (fun i v ->
-				print ctx "_fc->captures[%d] = " i;
-				let vtype = s_type ctx v.v_type in
-				if vtype = "int32_t" then
-					print ctx "fib_dynamic_int(%s); " (ident v.v_name)
-				else if vtype = "double" then
-					print ctx "fib_dynamic_float(%s); " (ident v.v_name)
-				else if vtype = "bool" then
-					print ctx "fib_dynamic_bool(%s); " (ident v.v_name)
-				else if vtype = "FibString*" then
-					print ctx "fib_dynamic_string(%s); " (ident v.v_name)
-				else
-					print ctx "(FibDynamic){.type=FIB_TYPE_OBJECT, .data.ptrVal=%s}; " (ident v.v_name)
-			) free_vars;
-			spr ctx "Fiber* _fib = scheduler_spawn(_fib_spawn_closure_trampoline, (void*)_fc); ";
-			spr ctx "gc_mature_alloc_end(); gc_pop_temp_roots(1); _fib; })"
-		| _ ->
-			(* Regular function - use Fiber_spawn *)
-			spr ctx "Fiber_spawn(";
-			gen_value ctx arg;
-			spr ctx ")")
-	(* Fiber.spawnOn with closure -> protected spawn with temp root at call site *)
-	| TField (_, FStatic ({ cl_path = ([], "Fiber") }, { cf_name = "spawnOn" })), [thread_id; arg] ->
-		(match arg.eexpr with
-		| TFunction _ ->
-			(* Same pattern as Fiber.spawn with gc_mature_alloc_begin/end *)
-			let free_vars, closure_name = match arg.eexpr with
-				| TFunction f ->
-					let fv = collect_free_vars f.tf_args f.tf_expr in
-					let cn = Printf.sprintf "_closure_%d" ctx.closure_counter in
-					ctx.closure_counter <- ctx.closure_counter + 1;
-					if not ctx.in_closure_impl then
-						ctx.closures <- (cn, f, fv) :: ctx.closures;
-					(fv, cn)
-				| _ -> ([], "_unknown")
-			in
-			spr ctx "({ int _tid = ";
-			gen_value ctx thread_id;
-			spr ctx "; gc_mature_alloc_begin(); FibClosure* _fc = fib_closure_create_for_fiber((void*)";
-			spr ctx closure_name;
-			print ctx ", %d); gc_push_temp_root((void**)&_fc); " (List.length free_vars);
-			List.iteri (fun i v ->
-				print ctx "_fc->captures[%d] = " i;
-				let vtype = s_type ctx v.v_type in
-				if vtype = "int32_t" then
-					print ctx "fib_dynamic_int(%s); " (ident v.v_name)
-				else if vtype = "double" then
-					print ctx "fib_dynamic_float(%s); " (ident v.v_name)
-				else if vtype = "bool" then
-					print ctx "fib_dynamic_bool(%s); " (ident v.v_name)
-				else if vtype = "FibString*" then
-					print ctx "fib_dynamic_string(%s); " (ident v.v_name)
-				else
-					print ctx "(FibDynamic){.type=FIB_TYPE_OBJECT, .data.ptrVal=%s}; " (ident v.v_name)
-			) free_vars;
-			spr ctx "Fiber* _fib = scheduler_spawn_on(_tid, _fib_spawn_on_closure_trampoline, (void*)_fc); ";
-			spr ctx "gc_mature_alloc_end(); gc_pop_temp_roots(1); _fib; })"
-		| _ ->
-			spr ctx "Fiber_spawnOn(";
-			gen_value ctx thread_id;
-			spr ctx ", ";
-			gen_value ctx arg;
-			spr ctx ")")
-	(* Fiber.spawnAny with closure -> protected spawn with temp root at call site *)
-	| TField (_, FStatic ({ cl_path = ([], "Fiber") }, { cf_name = "spawnAny" })), [arg] ->
-		(match arg.eexpr with
-		| TFunction _ ->
-			(* Same pattern as Fiber.spawn with gc_mature_alloc_begin/end *)
-			let free_vars, closure_name = match arg.eexpr with
-				| TFunction f ->
-					let fv = collect_free_vars f.tf_args f.tf_expr in
-					let cn = Printf.sprintf "_closure_%d" ctx.closure_counter in
-					ctx.closure_counter <- ctx.closure_counter + 1;
-					if not ctx.in_closure_impl then
-						ctx.closures <- (cn, f, fv) :: ctx.closures;
-					(fv, cn)
-				| _ -> ([], "_unknown")
-			in
-			spr ctx "({ gc_mature_alloc_begin(); FibClosure* _fc = fib_closure_create_for_fiber((void*)";
-			spr ctx closure_name;
-			print ctx ", %d); gc_push_temp_root((void**)&_fc); " (List.length free_vars);
-			List.iteri (fun i v ->
-				print ctx "_fc->captures[%d] = " i;
-				let vtype = s_type ctx v.v_type in
-				if vtype = "int32_t" then
-					print ctx "fib_dynamic_int(%s); " (ident v.v_name)
-				else if vtype = "double" then
-					print ctx "fib_dynamic_float(%s); " (ident v.v_name)
-				else if vtype = "bool" then
-					print ctx "fib_dynamic_bool(%s); " (ident v.v_name)
-				else if vtype = "FibString*" then
-					print ctx "fib_dynamic_string(%s); " (ident v.v_name)
-				else
-					print ctx "(FibDynamic){.type=FIB_TYPE_OBJECT, .data.ptrVal=%s}; " (ident v.v_name)
-			) free_vars;
-			spr ctx "Fiber* _fib = scheduler_spawn_any(_fib_spawn_on_closure_trampoline, (void*)_fc); ";
-			spr ctx "gc_mature_alloc_end(); gc_pop_temp_roots(1); _fib; })"
-		| _ ->
-			spr ctx "Fiber_spawnAny(";
-			gen_value ctx arg;
-			spr ctx ")")
+			spr ctx "false /* dynamic type check not supported */");
+		true
 	(* Std.int -> cast to int *)
 	| TField (_, FStatic ({ cl_path = ([], "Std") }, { cf_name = "int" })), [arg] ->
 		spr ctx "((int32_t)(";
 		gen_value ctx arg;
-		spr ctx "))"
+		spr ctx "))";
+		true
 	(* Std.string -> convert to string based on actual type *)
 	| TField (_, FStatic ({ cl_path = ([], "Std") }, { cf_name = "string" })), [arg] ->
 		let arg_type = match get_actual_c_type ctx arg with
@@ -1265,682 +1201,760 @@ and gen_call ctx e args =
 			gen_value ctx arg;
 			spr ctx " ? fib_string_new(\"true\") : fib_string_new(\"false\"))"
 		end else begin
-			(* FibDynamic or unknown - use dynamic conversion *)
 			spr ctx "fib_dynamic_to_string(";
 			gen_value ctx arg;
 			spr ctx ")"
-		end
+		end;
+		true
+	(* Fiber.spawn with closure *)
+	| TField (_, FStatic ({ cl_path = ([], "Fiber") }, { cf_name = "spawn" })), [arg] ->
+		(match extract_closure_for_spawn ctx arg with
+		| Some (free_vars, closure_name) ->
+			(* Fiber spawn closures are never called dynamically, so pass impl for both fn and fn_dynamic *)
+			let impl_name = closure_name ^ "_impl" in
+			spr ctx "({ gc_mature_alloc_begin(); FibClosure* _fc = fib_closure_create_for_fiber((void*)";
+			spr ctx impl_name;
+			spr ctx ", (void*)";
+			spr ctx closure_name;
+			print ctx ", %d, 0); gc_push_temp_root((void**)&_fc); " (List.length free_vars);
+			gen_fiber_spawn_closure ctx free_vars closure_name;
+			spr ctx "Fiber* _fib = scheduler_spawn(_fib_spawn_closure_trampoline, (void*)_fc); ";
+			spr ctx "gc_mature_alloc_end(); gc_pop_temp_roots(1); _fib; })"
+		| None ->
+			spr ctx "Fiber_spawn(";
+			gen_value ctx arg;
+			spr ctx ")");
+		true
+	(* Fiber.spawnOn with closure *)
+	| TField (_, FStatic ({ cl_path = ([], "Fiber") }, { cf_name = "spawnOn" })), [thread_id; arg] ->
+		(match extract_closure_for_spawn ctx arg with
+		| Some (free_vars, closure_name) ->
+			let impl_name = closure_name ^ "_impl" in
+			spr ctx "({ int _tid = ";
+			gen_value ctx thread_id;
+			spr ctx "; gc_mature_alloc_begin(); FibClosure* _fc = fib_closure_create_for_fiber((void*)";
+			spr ctx impl_name;
+			spr ctx ", (void*)";
+			spr ctx closure_name;
+			print ctx ", %d, 0); gc_push_temp_root((void**)&_fc); " (List.length free_vars);
+			gen_fiber_spawn_closure ctx free_vars closure_name;
+			spr ctx "Fiber* _fib = scheduler_spawn_on(_tid, _fib_spawn_on_closure_trampoline, (void*)_fc); ";
+			spr ctx "gc_mature_alloc_end(); gc_pop_temp_roots(1); _fib; })"
+		| None ->
+			spr ctx "Fiber_spawnOn(";
+			gen_value ctx thread_id;
+			spr ctx ", ";
+			gen_value ctx arg;
+			spr ctx ")");
+		true
+	(* Fiber.spawnAny with closure *)
+	| TField (_, FStatic ({ cl_path = ([], "Fiber") }, { cf_name = "spawnAny" })), [arg] ->
+		(match extract_closure_for_spawn ctx arg with
+		| Some (free_vars, closure_name) ->
+			let impl_name = closure_name ^ "_impl" in
+			spr ctx "({ gc_mature_alloc_begin(); FibClosure* _fc = fib_closure_create_for_fiber((void*)";
+			spr ctx impl_name;
+			spr ctx ", (void*)";
+			spr ctx closure_name;
+			print ctx ", %d, 0); gc_push_temp_root((void**)&_fc); " (List.length free_vars);
+			gen_fiber_spawn_closure ctx free_vars closure_name;
+			spr ctx "Fiber* _fib = scheduler_spawn_any(_fib_spawn_on_closure_trampoline, (void*)_fc); ";
+			spr ctx "gc_mature_alloc_end(); gc_pop_temp_roots(1); _fib; })"
+		| None ->
+			spr ctx "Fiber_spawnAny(";
+			gen_value ctx arg;
+			spr ctx ")");
+		true
 	(* Static method call: Class.method(args) -> Class_method(args) *)
 	| TField (_, FStatic (c, cf)), _ ->
 		print ctx "%s_%s(" (flat_path c.cl_path) (ident cf.cf_name);
 		gen_call_args ctx args (get_param_types cf.cf_type) gen_value;
+		spr ctx ")";
+		true
+	| _ -> false
+
+(*
+ * ===========================================================================
+ * Call Generation - Array Method Calls
+ * ===========================================================================
+ * Handles Array<T> instance method calls. Returns true if handled.
+ *)
+and gen_array_call ctx arr cf args =
+	(* Helper to generate array with coercion if needed *)
+	let gen_array_value () =
+		match get_actual_c_type ctx arr with
+		| Some "FibDynamic" ->
+			spr ctx "fib_dynamic_to_array(";
+			gen_value ctx arr;
+			spr ctx ")"
+		| _ -> gen_value ctx arr
+	in
+	(* Get the specialized array prefix if applicable *)
+	let arr_type = s_type ctx arr.etype in
+	let is_int_arr = arr_type = "FibIntArray*" in
+	let is_float_arr = arr_type = "FibFloatArray*" in
+	let is_bool_arr = arr_type = "FibBoolArray*" in
+	let is_uint8_arr = arr_type = "FibUInt8Array*" in
+	let is_int64_arr = arr_type = "FibInt64Array*" in
+	let is_uint64_arr = arr_type = "FibUInt64Array*" in
+	let is_float32_arr = arr_type = "FibFloat32Array*" in
+	let is_specialized = is_int_arr || is_float_arr || is_bool_arr ||
+		is_uint8_arr || is_int64_arr || is_uint64_arr || is_float32_arr in
+	let arr_prefix =
+		if is_int_arr then "fib_int_array_"
+		else if is_float_arr then "fib_float_array_"
+		else if is_bool_arr then "fib_bool_array_"
+		else if is_uint8_arr then "fib_uint8_array_"
+		else if is_int64_arr then "fib_int64_array_"
+		else if is_uint64_arr then "fib_uint64_array_"
+		else if is_float32_arr then "fib_float32_array_"
+		else "fib_array_"
+	in
+	match cf.cf_name with
+	| "push" ->
+		print ctx "%spush(" arr_prefix;
+		gen_array_value ();
+		spr ctx ", ";
+		(match args with
+		| [arg] ->
+			if is_specialized then
+				gen_value ctx arg
+			else begin
+				let arg_type = s_type ctx arg.etype in
+				gen_box_to_fib_dynamic ctx arg_type (fun () -> gen_value ctx arg)
+			end
+		| _ -> ());
+		spr ctx ")";
+		true
+	| "pop" ->
+		print ctx "%spop(" arr_prefix;
+		gen_array_value ();
+		spr ctx ")";
+		if not is_specialized then begin
+			let elem_type = get_array_elem_type ctx arr.etype in
+			spr ctx (fib_dynamic_unbox_suffix elem_type)
+		end;
+		true
+	| "shift" ->
+		print ctx "%sshift(" arr_prefix;
+		gen_array_value ();
+		spr ctx ")";
+		if not is_specialized then begin
+			let elem_type = get_array_elem_type ctx arr.etype in
+			spr ctx (fib_dynamic_unbox_suffix elem_type)
+		end;
+		true
+	| "unshift" ->
+		print ctx "%sunshift(" arr_prefix;
+		gen_array_value ();
+		spr ctx ", ";
+		(match args with [arg] -> gen_value ctx arg | _ -> ());
+		spr ctx ")";
+		true
+	| "insert" ->
+		print ctx "%sinsert(" arr_prefix;
+		gen_array_value ();
+		(match args with
+		| [idx; val_] ->
+			spr ctx ", ";
+			gen_value ctx idx;
+			spr ctx ", ";
+			gen_value ctx val_
+		| _ -> ());
+		spr ctx ")";
+		true
+	| "remove" ->
+		print ctx "%sremove(" arr_prefix;
+		gen_array_value ();
+		(match args with [idx] -> spr ctx ", "; gen_value ctx idx | _ -> ());
+		spr ctx ")";
+		true
+	| "indexOf" ->
+		print ctx "%sindex_of(" arr_prefix;
+		gen_array_value ();
+		spr ctx ", ";
+		(match args with
+		| [val_] -> gen_value ctx val_; spr ctx ", 0"
+		| [val_; start] -> gen_value ctx val_; spr ctx ", "; gen_value ctx start
+		| _ -> ());
+		spr ctx ")";
+		true
+	| "contains" ->
+		print ctx "%scontains(" arr_prefix;
+		gen_array_value ();
+		spr ctx ", ";
+		(match args with [val_] -> gen_value ctx val_ | _ -> ());
+		spr ctx ")";
+		true
+	| "reverse" ->
+		print ctx "%sreverse(" arr_prefix;
+		gen_array_value ();
+		spr ctx ")";
+		true
+	| "slice" ->
+		print ctx "%sslice(" arr_prefix;
+		gen_array_value ();
+		(match args with
+		| [start] -> spr ctx ", "; gen_value ctx start; spr ctx ", -1"
+		| [start; end_] -> spr ctx ", "; gen_value ctx start; spr ctx ", "; gen_value ctx end_
+		| _ -> spr ctx ", 0, -1");
+		spr ctx ")";
+		true
+	| "concat" ->
+		print ctx "%sconcat(" arr_prefix;
+		gen_array_value ();
+		spr ctx ", ";
+		(match args with [other] -> gen_value ctx other | _ -> ());
+		spr ctx ")";
+		true
+	| "join" ->
+		spr ctx "fib_array_join(";
+		gen_array_value ();
+		spr ctx ", ";
+		(match args with
+		| [sep] -> gen_value ctx sep
+		| _ -> spr ctx "fib_string_new(\",\")");
+		spr ctx ")";
+		true
+	| "iterator" ->
+		spr ctx "fib_array_iterator(";
+		gen_array_value ();
+		spr ctx ")";
+		true
+	| _ ->
+		(* Fallback to generic method call *)
+		print ctx "Array_%s(" (ident cf.cf_name);
+		gen_array_value ();
+		if args <> [] then spr ctx ", ";
+		gen_call_args ctx args (get_param_types cf.cf_type) gen_value;
+		spr ctx ")";
+		true
+
+(*
+ * ===========================================================================
+ * Call Generation - String Method Calls
+ * ===========================================================================
+ * Handles String instance method calls. Returns true if handled.
+ *)
+and gen_string_call ctx str cf args =
+	match cf.cf_name with
+	| "charAt" ->
+		spr ctx "fib_string_char_at_str(";
+		gen_value ctx str;
+		spr ctx ", ";
+		(match args with [idx] -> gen_value ctx idx | _ -> spr ctx "0");
+		spr ctx ")";
+		true
+	| "charCodeAt" ->
+		spr ctx "fib_string_char_code_at(";
+		gen_value ctx str;
+		spr ctx ", ";
+		(match args with [idx] -> gen_value ctx idx | _ -> spr ctx "0");
+		spr ctx ")";
+		true
+	| "substring" | "substr" ->
+		spr ctx "fib_string_substr(";
+		gen_value ctx str;
+		spr ctx ", ";
+		(match args with
+		| [start] -> gen_value ctx start; spr ctx ", -1"
+		| [start; len] -> gen_value ctx start; spr ctx ", "; gen_value ctx len
+		| _ -> spr ctx "0, -1");
+		spr ctx ")";
+		true
+	| "indexOf" ->
+		spr ctx "fib_string_index_of(";
+		gen_value ctx str;
+		spr ctx ", ";
+		(match args with
+		| [needle] -> gen_value ctx needle; spr ctx ", 0"
+		| [needle; start] -> gen_value ctx needle; spr ctx ", "; gen_value ctx start
+		| _ -> spr ctx "fib_string_new(\"\"), 0");
+		spr ctx ")";
+		true
+	| "lastIndexOf" ->
+		spr ctx "fib_string_last_index_of(";
+		gen_value ctx str;
+		spr ctx ", ";
+		(match args with
+		| [needle] -> gen_value ctx needle; spr ctx ", -1"
+		| [needle; start] -> gen_value ctx needle; spr ctx ", "; gen_value ctx start
+		| _ -> spr ctx "fib_string_new(\"\"), -1");
+		spr ctx ")";
+		true
+	| "split" ->
+		spr ctx "fib_string_split(";
+		gen_value ctx str;
+		spr ctx ", ";
+		(match args with [delim] -> gen_value ctx delim | _ -> spr ctx "fib_string_new(\"\")");
+		spr ctx ")";
+		true
+	| "toUpperCase" ->
+		spr ctx "fib_string_to_upper(";
+		gen_value ctx str;
+		spr ctx ")";
+		true
+	| "toLowerCase" ->
+		spr ctx "fib_string_to_lower(";
+		gen_value ctx str;
+		spr ctx ")";
+		true
+	| "trim" ->
+		spr ctx "fib_string_trim(";
+		gen_value ctx str;
+		spr ctx ")";
+		true
+	| "length" ->
+		spr ctx "fib_string_length(";
+		gen_value ctx str;
+		spr ctx ")";
+		true
+	| _ ->
+		(* Fallback to generic method call *)
+		print ctx "String_%s(" (ident cf.cf_name);
+		gen_value ctx str;
+		if args <> [] then spr ctx ", ";
+		gen_call_args ctx args (get_param_types cf.cf_type) gen_value;
+		spr ctx ")";
+		true
+
+(*
+ * ===========================================================================
+ * Call Generation - Map Method Calls (IntMap, StringMap, Int64Map, ObjectMap)
+ * ===========================================================================
+ * Handles Map instance method calls. Returns true if handled.
+ *)
+
+(* Helper to get value type suffix for map operations *)
+and get_map_value_suffix ctx arg_expr =
+	match follow arg_expr.etype with
+	| TAbstract ({ a_path = ([], "Int") }, []) -> "_int"
+	| TAbstract ({ a_path = ([], "Float") }, []) -> "_float"
+	| TInst ({ cl_path = ([], "String") }, []) -> "_string"
+	| TAbstract ({ a_path = (["fiberus"], "Int64") }, []) -> "_int64"
+	| _ -> "_dynamic"
+
+(* Generate IntMap method call *)
+and gen_int_map_call ctx map_expr cf args =
+	let get_map_value_type () =
+		match follow map_expr.etype with
+		| TInst (_, [t]) -> follow t
+		| _ -> t_dynamic
+	in
+	match cf.cf_name with
+	| "set" ->
+		(match args with
+		| [key; value] ->
+			let suffix = get_map_value_suffix ctx value in
+			print ctx "fib_int_map_set%s(" suffix;
+			gen_value ctx map_expr;
+			spr ctx ", ";
+			gen_value ctx key;
+			spr ctx ", ";
+			gen_value ctx value;
+			spr ctx ")"
+		| _ -> spr ctx "/* IntMap.set: wrong args */");
+		true
+	| "get" ->
+		(match args with
+		| [key] ->
+			let value_type = get_map_value_type () in
+			let fn_name = match value_type with
+				| TAbstract ({ a_path = ([], "Int") }, []) -> "fib_int_map_get_int"
+				| TAbstract ({ a_path = ([], "Float") }, []) -> "fib_int_map_get_float"
+				| TInst ({ cl_path = ([], "String") }, []) -> "fib_int_map_get_string"
+				| _ -> "fib_int_map_get_dynamic"
+			in
+			print ctx "%s(" fn_name;
+			gen_value ctx map_expr;
+			spr ctx ", ";
+			gen_value ctx key;
+			spr ctx ")"
+		| _ -> spr ctx "/* IntMap.get: wrong args */");
+		true
+	| "exists" ->
+		(match args with
+		| [key] ->
+			spr ctx "fib_int_map_exists(";
+			gen_value ctx map_expr;
+			spr ctx ", ";
+			gen_value ctx key;
+			spr ctx ")"
+		| _ -> spr ctx "/* IntMap.exists: wrong args */");
+		true
+	| "remove" ->
+		(match args with
+		| [key] ->
+			spr ctx "fib_int_map_remove(";
+			gen_value ctx map_expr;
+			spr ctx ", ";
+			gen_value ctx key;
+			spr ctx ")"
+		| _ -> spr ctx "/* IntMap.remove: wrong args */");
+		true
+	| "keys" -> spr ctx "fib_int_map_keys("; gen_value ctx map_expr; spr ctx ")"; true
+	| "iterator" -> spr ctx "fib_int_map_iterator("; gen_value ctx map_expr; spr ctx ")"; true
+	| "copy" -> spr ctx "fib_int_map_copy("; gen_value ctx map_expr; spr ctx ")"; true
+	| "toString" -> spr ctx "fib_int_map_to_string("; gen_value ctx map_expr; spr ctx ")"; true
+	| "clear" -> spr ctx "fib_int_map_clear("; gen_value ctx map_expr; spr ctx ")"; true
+	| "size" -> spr ctx "fib_int_map_size("; gen_value ctx map_expr; spr ctx ")"; true
+	| _ -> print ctx "/* IntMap.%s not implemented */" cf.cf_name; true
+
+(* Generate StringMap method call *)
+and gen_string_map_call ctx map_expr cf args =
+	let get_map_value_type () =
+		match follow map_expr.etype with
+		| TInst (_, [t]) -> follow t
+		| _ -> t_dynamic
+	in
+	match cf.cf_name with
+	| "set" ->
+		(match args with
+		| [key; value] ->
+			let suffix = get_map_value_suffix ctx value in
+			print ctx "fib_string_map_set%s(" suffix;
+			gen_value ctx map_expr;
+			spr ctx ", ";
+			gen_value ctx key;
+			spr ctx ", ";
+			gen_value ctx value;
+			spr ctx ")"
+		| _ -> spr ctx "/* StringMap.set: wrong args */");
+		true
+	| "get" ->
+		(match args with
+		| [key] ->
+			let value_type = get_map_value_type () in
+			let fn_name = match value_type with
+				| TAbstract ({ a_path = ([], "Int") }, []) -> "fib_string_map_get_int"
+				| TAbstract ({ a_path = ([], "Float") }, []) -> "fib_string_map_get_float"
+				| TInst ({ cl_path = ([], "String") }, []) -> "fib_string_map_get_string"
+				| _ -> "fib_string_map_get_dynamic"
+			in
+			print ctx "%s(" fn_name;
+			gen_value ctx map_expr;
+			spr ctx ", ";
+			gen_value ctx key;
+			spr ctx ")"
+		| _ -> spr ctx "/* StringMap.get: wrong args */");
+		true
+	| "exists" ->
+		(match args with
+		| [key] ->
+			spr ctx "fib_string_map_exists(";
+			gen_value ctx map_expr;
+			spr ctx ", ";
+			gen_value ctx key;
+			spr ctx ")"
+		| _ -> spr ctx "/* StringMap.exists: wrong args */");
+		true
+	| "remove" ->
+		(match args with
+		| [key] ->
+			spr ctx "fib_string_map_remove(";
+			gen_value ctx map_expr;
+			spr ctx ", ";
+			gen_value ctx key;
+			spr ctx ")"
+		| _ -> spr ctx "/* StringMap.remove: wrong args */");
+		true
+	| "keys" -> spr ctx "fib_string_map_keys("; gen_value ctx map_expr; spr ctx ")"; true
+	| "iterator" -> spr ctx "fib_string_map_iterator("; gen_value ctx map_expr; spr ctx ")"; true
+	| "copy" -> spr ctx "fib_string_map_copy("; gen_value ctx map_expr; spr ctx ")"; true
+	| "toString" -> spr ctx "fib_string_map_to_string("; gen_value ctx map_expr; spr ctx ")"; true
+	| "clear" -> spr ctx "fib_string_map_clear("; gen_value ctx map_expr; spr ctx ")"; true
+	| "size" -> spr ctx "fib_string_map_size("; gen_value ctx map_expr; spr ctx ")"; true
+	| _ -> print ctx "/* StringMap.%s not implemented */" cf.cf_name; true
+
+(* Generate Int64Map method call *)
+and gen_int64_map_call ctx map_expr cf args =
+	let get_map_value_type () =
+		match follow map_expr.etype with
+		| TInst (_, [t]) -> follow t
+		| _ -> t_dynamic
+	in
+	match cf.cf_name with
+	| "set" ->
+		(match args with
+		| [key; value] ->
+			let suffix = get_map_value_suffix ctx value in
+			print ctx "fib_int64_map_set%s(" suffix;
+			gen_value ctx map_expr;
+			spr ctx ", ";
+			gen_value ctx key;
+			spr ctx ", ";
+			gen_value ctx value;
+			spr ctx ")"
+		| _ -> spr ctx "/* Int64Map.set: wrong args */");
+		true
+	| "get" ->
+		(match args with
+		| [key] ->
+			let value_type = get_map_value_type () in
+			let fn_name = match value_type with
+				| TAbstract ({ a_path = ([], "Int") }, []) -> "fib_int64_map_get_int"
+				| TAbstract ({ a_path = ([], "Float") }, []) -> "fib_int64_map_get_float"
+				| TInst ({ cl_path = ([], "String") }, []) -> "fib_int64_map_get_string"
+				| TAbstract ({ a_path = (["fiberus"], "Int64") }, []) -> "fib_int64_map_get_int64"
+				| _ -> "fib_int64_map_get_dynamic"
+			in
+			print ctx "%s(" fn_name;
+			gen_value ctx map_expr;
+			spr ctx ", ";
+			gen_value ctx key;
+			spr ctx ")"
+		| _ -> spr ctx "/* Int64Map.get: wrong args */");
+		true
+	| "exists" ->
+		(match args with
+		| [key] ->
+			spr ctx "fib_int64_map_exists(";
+			gen_value ctx map_expr;
+			spr ctx ", ";
+			gen_value ctx key;
+			spr ctx ")"
+		| _ -> spr ctx "/* Int64Map.exists: wrong args */");
+		true
+	| "remove" ->
+		(match args with
+		| [key] ->
+			spr ctx "fib_int64_map_remove(";
+			gen_value ctx map_expr;
+			spr ctx ", ";
+			gen_value ctx key;
+			spr ctx ")"
+		| _ -> spr ctx "/* Int64Map.remove: wrong args */");
+		true
+	| "keys" -> spr ctx "fib_int64_map_keys("; gen_value ctx map_expr; spr ctx ")"; true
+	| "iterator" -> spr ctx "fib_int64_map_iterator("; gen_value ctx map_expr; spr ctx ")"; true
+	| "copy" -> spr ctx "fib_int64_map_copy("; gen_value ctx map_expr; spr ctx ")"; true
+	| "toString" -> spr ctx "fib_int64_map_to_string("; gen_value ctx map_expr; spr ctx ")"; true
+	| "clear" -> spr ctx "fib_int64_map_clear("; gen_value ctx map_expr; spr ctx ")"; true
+	| "size" -> spr ctx "fib_int64_map_size("; gen_value ctx map_expr; spr ctx ")"; true
+	| _ -> print ctx "/* Int64Map.%s not implemented */" cf.cf_name; true
+
+(* Generate ObjectMap method call *)
+and gen_object_map_call ctx map_expr cf args =
+	let get_map_value_type () =
+		match follow map_expr.etype with
+		| TInst (_, [_; t]) -> follow t  (* Second type param is value type *)
+		| _ -> t_dynamic
+	in
+	match cf.cf_name with
+	| "set" ->
+		(match args with
+		| [key; value] ->
+			let suffix = get_map_value_suffix ctx value in
+			print ctx "fib_object_map_set%s(" suffix;
+			gen_value ctx map_expr;
+			spr ctx ", (FibObject*)";
+			gen_value ctx key;
+			spr ctx ", ";
+			gen_value ctx value;
+			spr ctx ")"
+		| _ -> spr ctx "/* ObjectMap.set: wrong args */");
+		true
+	| "get" ->
+		(match args with
+		| [key] ->
+			let value_type = get_map_value_type () in
+			let fn_name = match value_type with
+				| TAbstract ({ a_path = ([], "Int") }, []) -> "fib_object_map_get_int"
+				| TAbstract ({ a_path = ([], "Float") }, []) -> "fib_object_map_get_float"
+				| TInst ({ cl_path = ([], "String") }, []) -> "fib_object_map_get_string"
+				| TAbstract ({ a_path = (["fiberus"], "Int64") }, []) -> "fib_object_map_get_int64"
+				| _ -> "fib_object_map_get_dynamic"
+			in
+			print ctx "%s(" fn_name;
+			gen_value ctx map_expr;
+			spr ctx ", (FibObject*)";
+			gen_value ctx key;
+			spr ctx ")"
+		| _ -> spr ctx "/* ObjectMap.get: wrong args */");
+		true
+	| "exists" ->
+		(match args with
+		| [key] ->
+			spr ctx "fib_object_map_exists(";
+			gen_value ctx map_expr;
+			spr ctx ", (FibObject*)";
+			gen_value ctx key;
+			spr ctx ")"
+		| _ -> spr ctx "/* ObjectMap.exists: wrong args */");
+		true
+	| "remove" ->
+		(match args with
+		| [key] ->
+			spr ctx "fib_object_map_remove(";
+			gen_value ctx map_expr;
+			spr ctx ", (FibObject*)";
+			gen_value ctx key;
+			spr ctx ")"
+		| _ -> spr ctx "/* ObjectMap.remove: wrong args */");
+		true
+	| "keys" -> spr ctx "fib_object_map_keys("; gen_value ctx map_expr; spr ctx ")"; true
+	| "iterator" -> spr ctx "fib_object_map_iterator("; gen_value ctx map_expr; spr ctx ")"; true
+	| "copy" -> spr ctx "fib_object_map_copy("; gen_value ctx map_expr; spr ctx ")"; true
+	| "toString" -> spr ctx "fib_object_map_to_string("; gen_value ctx map_expr; spr ctx ")"; true
+	| "clear" -> spr ctx "fib_object_map_clear("; gen_value ctx map_expr; spr ctx ")"; true
+	| "size" -> spr ctx "fib_object_map_size("; gen_value ctx map_expr; spr ctx ")"; true
+	| _ -> print ctx "/* ObjectMap.%s not implemented */" cf.cf_name; true
+
+(*
+ * ===========================================================================
+ * Call Generation - Instance Method Calls
+ * ===========================================================================
+ * Handles instance method calls on objects.
+ * Uses virtual dispatch via vtable when:
+ * - The receiver type is different from the declaring class (polymorphism)
+ * - The method is declared in a base class or interface
+ * - The declaring class IS an interface (interfaces have no implementation)
+ *)
+and gen_instance_call ctx obj c cf args =
+	let class_name = flat_path c.cl_path in
+	let obj_type = s_type ctx obj.etype in
+	(* Check if the declaring class is an interface *)
+	let is_interface_call = GenfiberusVtable.is_interface c in
+	(* Determine if we need virtual dispatch *)
+	let needs_vtable = match ctx.vtable_ctx with
+		| Some vctx ->
+			if is_interface_call then
+				(* Interface calls ALWAYS need vtable dispatch *)
+				true
+			else begin
+				(* Check if this is a virtual method and receiver type differs *)
+				let receiver_class = match follow obj.etype with
+					| TInst (rc, _) -> Some rc
+					| _ -> None
+				in
+				match receiver_class with
+				| Some rc when rc.cl_path <> c.cl_path ->
+					(* Receiver type differs - need virtual dispatch if method is virtual *)
+					GenfiberusVtable.needs_virtual_dispatch c cf &&
+					(match GenfiberusVtable.get_vtable_slot vctx c cf with
+					| Some _ -> true
+					| None -> false)
+				| _ -> false  (* Same type or non-class receiver - static dispatch *)
+			end
+		| None -> false
+	in
+	if needs_vtable then begin
+		(* Virtual dispatch via vtable *)
+		(* For interfaces, use interface slot; for classes, use class vtable slot *)
+		let slot_index = match ctx.vtable_ctx with
+			| Some vctx ->
+				if is_interface_call then
+					GenfiberusVtable.get_interface_slot vctx c cf
+				else
+					(match GenfiberusVtable.get_vtable_slot vctx c cf with
+					| Some info -> Some info.slot_index
+					| None -> None)
+			| None -> None
+		in
+		(* Get method signature for type cast *)
+		let (arg_types, ret_type) = GenfiberusVtable.get_method_types cf in
+		match slot_index with
+		| Some slot ->
+			(* Generate vtable call with function pointer cast *)
+			let ret_str = s_type ctx ret_type in
+			(* For interface calls, use FibObject* as this type since we don't know the concrete class *)
+			let this_type = if is_interface_call then "FibObject*" else Printf.sprintf "%s*" class_name in
+			let arg_strs = List.map (fun t -> s_type ctx t) arg_types in
+			let all_arg_types = this_type :: arg_strs in
+			let args_str = String.concat ", " all_arg_types in
+			(* Function pointer cast *)
+			print ctx "((%s (*)(%s))" ret_str args_str;
+			(* Vtable lookup - cast to FibObject* to access clazz member *)
+			spr ctx "((FibObject*)(";
+			gen_value ctx obj;
+			print ctx "))->clazz->vtable[%d])(" slot;
+			(* Object argument - for interface calls, cast to FibObject* *)
+			if is_interface_call then begin
+				spr ctx "(FibObject*)";
+				gen_value ctx obj
+			end else if obj_type <> class_name ^ "*" then begin
+				print ctx "((%s*)" class_name;
+				gen_value ctx obj;
+				spr ctx ")"
+			end else
+				gen_value ctx obj;
+			(* Method arguments *)
+			if args <> [] then spr ctx ", ";
+			gen_call_args ctx args (get_param_types cf.cf_type) gen_value;
+			spr ctx ")"
+		| None ->
+			(* Fallback to static dispatch - should not happen for interfaces *)
+			if is_interface_call then
+				print ctx "/* ERROR: Interface method %s has no vtable slot */" cf.cf_name
+			else begin
+				print ctx "%s_%s(" class_name (ident cf.cf_name);
+				if obj_type <> class_name ^ "*" then begin
+					print ctx "((%s*)" class_name;
+					gen_value ctx obj;
+					spr ctx ")"
+				end else
+					gen_value ctx obj;
+				if args <> [] then spr ctx ", ";
+				gen_call_args ctx args (get_param_types cf.cf_type) gen_value;
+				spr ctx ")"
+			end
+	end else begin
+		(* Static dispatch - direct function call *)
+		print ctx "%s_%s(" class_name (ident cf.cf_name);
+		(* Cast object to the declaring class type if different *)
+		if obj_type <> class_name ^ "*" then begin
+			print ctx "((%s*)" class_name;
+			gen_value ctx obj;
+			spr ctx ")"
+		end else
+			gen_value ctx obj;
+		if args <> [] then spr ctx ", ";
+		gen_call_args ctx args (get_param_types cf.cf_type) gen_value;
 		spr ctx ")"
+	end
+
+(*
+ * ===========================================================================
+ * Call Generation - Main Entry Point
+ * ===========================================================================
+ *)
+and gen_call ctx e args =
+	(* First try builtin calls *)
+	if gen_builtin_call ctx e args then ()
+	else match e.eexpr, args with
 	(* Array method calls -> fib_array_* functions *)
 	| TField (arr, FInstance (_, _, cf)), _ when is_array_type arr.etype ->
-		(* Helper to generate array with coercion if needed *)
-		let gen_array_value () =
-			match get_actual_c_type ctx arr with
-			| Some "FibDynamic" ->
-				spr ctx "fib_dynamic_to_array(";
-				gen_value ctx arr;
-				spr ctx ")"
-			| _ -> gen_value ctx arr
-		in
-		(* Get the specialized array prefix if applicable *)
-		let arr_type = s_type ctx arr.etype in
-		let is_int_arr = arr_type = "FibIntArray*" in
-		let is_float_arr = arr_type = "FibFloatArray*" in
-		let is_bool_arr = arr_type = "FibBoolArray*" in
-		let is_uint8_arr = arr_type = "FibUInt8Array*" in
-		let is_int64_arr = arr_type = "FibInt64Array*" in
-		let is_uint64_arr = arr_type = "FibUInt64Array*" in
-		let is_float32_arr = arr_type = "FibFloat32Array*" in
-		let is_specialized = is_int_arr || is_float_arr || is_bool_arr ||
-			is_uint8_arr || is_int64_arr || is_uint64_arr || is_float32_arr in
-		let arr_prefix =
-			if is_int_arr then "fib_int_array_"
-			else if is_float_arr then "fib_float_array_"
-			else if is_bool_arr then "fib_bool_array_"
-			else if is_uint8_arr then "fib_uint8_array_"
-			else if is_int64_arr then "fib_int64_array_"
-			else if is_uint64_arr then "fib_uint64_array_"
-			else if is_float32_arr then "fib_float32_array_"
-			else "fib_array_"
-		in
-		(match cf.cf_name with
-		| "push" ->
-			print ctx "%spush(" arr_prefix;
-			gen_array_value ();
-			spr ctx ", ";
-			(* Box value for FibDynamic storage only for generic arrays *)
-			(match args with
-			| [arg] ->
-				if is_specialized then
-					gen_value ctx arg
-				else begin
-					let arg_type = s_type ctx arg.etype in
-					gen_box_to_fib_dynamic ctx arg_type (fun () -> gen_value ctx arg)
-				end
-			| _ -> ());
-			spr ctx ")"
-		| "pop" ->
-			print ctx "%spop(" arr_prefix;
-			gen_array_value ();
-			spr ctx ")";
-			(* Unbox based on element type only for generic arrays *)
-			if not is_specialized then begin
-				let elem_type = get_array_elem_type ctx arr.etype in
-				spr ctx (fib_dynamic_unbox_suffix elem_type)
-			end
-		| "shift" ->
-			print ctx "%sshift(" arr_prefix;
-			gen_array_value ();
-			spr ctx ")";
-			(* Unbox based on element type only for generic arrays *)
-			if not is_specialized then begin
-				let elem_type = get_array_elem_type ctx arr.etype in
-				spr ctx (fib_dynamic_unbox_suffix elem_type)
-			end
-		| "unshift" ->
-			print ctx "%sunshift(" arr_prefix;
-			gen_array_value ();
-			spr ctx ", ";
-			(match args with [arg] -> gen_value ctx arg | _ -> ());
-			spr ctx ")"
-		| "insert" ->
-			print ctx "%sinsert(" arr_prefix;
-			gen_array_value ();
-			(match args with
-			| [idx; val_] ->
-				spr ctx ", ";
-				gen_value ctx idx;
-				spr ctx ", ";
-				gen_value ctx val_
-			| _ -> ());
-			spr ctx ")"
-		| "remove" ->
-			print ctx "%sremove(" arr_prefix;
-			gen_array_value ();
-			(match args with [idx] -> spr ctx ", "; gen_value ctx idx | _ -> ());
-			spr ctx ")"
-		| "indexOf" ->
-			print ctx "%sindex_of(" arr_prefix;
-			gen_array_value ();
-			spr ctx ", ";
-			(match args with
-			| [val_] -> gen_value ctx val_; spr ctx ", 0"
-			| [val_; start] -> gen_value ctx val_; spr ctx ", "; gen_value ctx start
-			| _ -> ());
-			spr ctx ")"
-		| "contains" ->
-			print ctx "%scontains(" arr_prefix;
-			gen_array_value ();
-			spr ctx ", ";
-			(match args with [val_] -> gen_value ctx val_ | _ -> ());
-			spr ctx ")"
-		| "reverse" ->
-			print ctx "%sreverse(" arr_prefix;
-			gen_array_value ();
-			spr ctx ")"
-		| "slice" ->
-			print ctx "%sslice(" arr_prefix;
-			gen_array_value ();
-			(match args with
-			| [start] -> spr ctx ", "; gen_value ctx start; spr ctx ", -1"
-			| [start; end_] -> spr ctx ", "; gen_value ctx start; spr ctx ", "; gen_value ctx end_
-			| _ -> spr ctx ", 0, -1");
-			spr ctx ")"
-		| "concat" ->
-			print ctx "%sconcat(" arr_prefix;
-			gen_array_value ();
-			spr ctx ", ";
-			(match args with [other] -> gen_value ctx other | _ -> ());
-			spr ctx ")"
-		| "join" ->
-			(* join is only available for generic arrays *)
-			spr ctx "fib_array_join(";
-			gen_array_value ();
-			spr ctx ", ";
-			(match args with
-			| [sep] -> gen_value ctx sep
-			| _ -> spr ctx "fib_string_new(\",\")");
-			spr ctx ")"
-		| "iterator" ->
-			spr ctx "fib_array_iterator(";
-			gen_array_value ();
-			spr ctx ")"
-		| _ ->
-			(* Fallback to generic method call *)
-			print ctx "Array_%s(" (ident cf.cf_name);
-			gen_array_value ();
-			if args <> [] then spr ctx ", ";
-			gen_call_args ctx args (get_param_types cf.cf_type) gen_value;
-			spr ctx ")")
+		ignore (gen_array_call ctx arr cf args)
 	(* String method calls -> fib_string_* functions *)
 	| TField (str, FInstance (_, _, cf)), _ when is_string_type str.etype ->
-		(match cf.cf_name with
-		| "charAt" ->
-			spr ctx "fib_string_char_at_str(";
-			gen_value ctx str;
-			spr ctx ", ";
-			(match args with [idx] -> gen_value ctx idx | _ -> spr ctx "0");
-			spr ctx ")"
-		| "charCodeAt" ->
-			spr ctx "fib_string_char_code_at(";
-			gen_value ctx str;
-			spr ctx ", ";
-			(match args with [idx] -> gen_value ctx idx | _ -> spr ctx "0");
-			spr ctx ")"
-		| "substring" | "substr" ->
-			spr ctx "fib_string_substr(";
-			gen_value ctx str;
-			spr ctx ", ";
-			(match args with
-			| [start] -> gen_value ctx start; spr ctx ", -1"
-			| [start; len] -> gen_value ctx start; spr ctx ", "; gen_value ctx len
-			| _ -> spr ctx "0, -1");
-			spr ctx ")"
-		| "indexOf" ->
-			spr ctx "fib_string_index_of(";
-			gen_value ctx str;
-			spr ctx ", ";
-			(match args with
-			| [needle] -> gen_value ctx needle; spr ctx ", 0"
-			| [needle; start] -> gen_value ctx needle; spr ctx ", "; gen_value ctx start
-			| _ -> spr ctx "fib_string_new(\"\"), 0");
-			spr ctx ")"
-		| "split" ->
-			spr ctx "fib_string_split(";
-			gen_value ctx str;
-			spr ctx ", ";
-			(match args with [delim] -> gen_value ctx delim | _ -> spr ctx "fib_string_new(\"\")");
-			spr ctx ")"
-		| "toUpperCase" ->
-			spr ctx "fib_string_to_upper(";
-			gen_value ctx str;
-			spr ctx ")"
-		| "toLowerCase" ->
-			spr ctx "fib_string_to_lower(";
-			gen_value ctx str;
-			spr ctx ")"
-		| "trim" ->
-			spr ctx "fib_string_trim(";
-			gen_value ctx str;
-			spr ctx ")"
-		| "length" ->
-			spr ctx "fib_string_length(";
-			gen_value ctx str;
-			spr ctx ")"
-		| _ ->
-			(* Fallback to generic method call *)
-			print ctx "String_%s(" (ident cf.cf_name);
-			gen_value ctx str;
-			if args <> [] then spr ctx ", ";
-			gen_call_args ctx args (get_param_types cf.cf_type) gen_value;
-			spr ctx ")")
-	(* IntMap method calls -> fib_int_map_* functions *)
+		ignore (gen_string_call ctx str cf args)
+	(* IntMap method calls *)
 	| TField (map_expr, FInstance (c, _, cf)), _ when c.cl_path = (["haxe"; "ds"], "IntMap") ->
-		(* Determine value type suffix for type-specialized functions *)
-		let get_value_suffix arg_expr =
-			match follow arg_expr.etype with
-			| TAbstract ({ a_path = ([], "Int") }, []) -> "_int"
-			| TAbstract ({ a_path = ([], "Float") }, []) -> "_float"
-			| TInst ({ cl_path = ([], "String") }, []) -> "_string"
-			| TAbstract ({ a_path = (["fiberus"], "Int64") }, []) -> "_int64"
-			| _ -> "_dynamic"
-		in
-		(* Get value type parameter from map type *)
-		let get_map_value_type () =
-			match follow map_expr.etype with
-			| TInst (_, [t]) -> follow t
-			| _ -> t_dynamic
-		in
-		(match cf.cf_name with
-		| "set" ->
-			(match args with
-			| [key; value] ->
-				let suffix = get_value_suffix value in
-				print ctx "fib_int_map_set%s(" suffix;
-				gen_value ctx map_expr;
-				spr ctx ", ";
-				gen_value ctx key;
-				spr ctx ", ";
-				gen_value ctx value;
-				spr ctx ")"
-			| _ -> spr ctx "/* IntMap.set: wrong args */")
-		| "get" ->
-			(match args with
-			| [key] ->
-				(* Generate type-specialized getter based on map's value type parameter *)
-				let value_type = get_map_value_type () in
-				(match value_type with
-				| TAbstract ({ a_path = ([], "Int") }, []) ->
-					spr ctx "fib_int_map_get_int(";
-					gen_value ctx map_expr;
-					spr ctx ", ";
-					gen_value ctx key;
-					spr ctx ")"
-				| TAbstract ({ a_path = ([], "Float") }, []) ->
-					spr ctx "fib_int_map_get_float(";
-					gen_value ctx map_expr;
-					spr ctx ", ";
-					gen_value ctx key;
-					spr ctx ")"
-				| TInst ({ cl_path = ([], "String") }, []) ->
-					spr ctx "fib_int_map_get_string(";
-					gen_value ctx map_expr;
-					spr ctx ", ";
-					gen_value ctx key;
-					spr ctx ")"
-				| _ ->
-					(* Return dynamic for other types *)
-					spr ctx "fib_int_map_get_dynamic(";
-					gen_value ctx map_expr;
-					spr ctx ", ";
-					gen_value ctx key;
-					spr ctx ")")
-			| _ -> spr ctx "/* IntMap.get: wrong args */")
-		| "exists" ->
-			(match args with
-			| [key] ->
-				spr ctx "fib_int_map_exists(";
-				gen_value ctx map_expr;
-				spr ctx ", ";
-				gen_value ctx key;
-				spr ctx ")"
-			| _ -> spr ctx "/* IntMap.exists: wrong args */")
-		| "remove" ->
-			(match args with
-			| [key] ->
-				spr ctx "fib_int_map_remove(";
-				gen_value ctx map_expr;
-				spr ctx ", ";
-				gen_value ctx key;
-				spr ctx ")"
-			| _ -> spr ctx "/* IntMap.remove: wrong args */")
-		| "keys" ->
-			spr ctx "fib_int_map_keys(";
-			gen_value ctx map_expr;
-			spr ctx ")"
-		| "iterator" ->
-			spr ctx "fib_int_map_iterator(";
-			gen_value ctx map_expr;
-			spr ctx ")"
-		| "copy" ->
-			spr ctx "fib_int_map_copy(";
-			gen_value ctx map_expr;
-			spr ctx ")"
-		| "toString" ->
-			spr ctx "fib_int_map_to_string(";
-			gen_value ctx map_expr;
-			spr ctx ")"
-		| "clear" ->
-			spr ctx "fib_int_map_clear(";
-			gen_value ctx map_expr;
-			spr ctx ")"
-		| "size" ->
-			spr ctx "fib_int_map_size(";
-			gen_value ctx map_expr;
-			spr ctx ")"
-		| _ ->
-			print ctx "/* IntMap.%s not implemented */" cf.cf_name)
-	(* StringMap method calls -> fib_string_map_* functions *)
+		ignore (gen_int_map_call ctx map_expr cf args)
+	(* StringMap method calls *)
 	| TField (map_expr, FInstance (c, _, cf)), _ when c.cl_path = (["haxe"; "ds"], "StringMap") ->
-		let get_value_suffix arg_expr =
-			match follow arg_expr.etype with
-			| TAbstract ({ a_path = ([], "Int") }, []) -> "_int"
-			| TAbstract ({ a_path = ([], "Float") }, []) -> "_float"
-			| TInst ({ cl_path = ([], "String") }, []) -> "_string"
-			| TAbstract ({ a_path = (["fiberus"], "Int64") }, []) -> "_int64"
-			| _ -> "_dynamic"
-		in
-		(* Get value type parameter from map type *)
-		let get_map_value_type () =
-			match follow map_expr.etype with
-			| TInst (_, [t]) -> follow t
-			| _ -> t_dynamic
-		in
-		(match cf.cf_name with
-		| "set" ->
-			(match args with
-			| [key; value] ->
-				let suffix = get_value_suffix value in
-				print ctx "fib_string_map_set%s(" suffix;
-				gen_value ctx map_expr;
-				spr ctx ", ";
-				gen_value ctx key;
-				spr ctx ", ";
-				gen_value ctx value;
-				spr ctx ")"
-			| _ -> spr ctx "/* StringMap.set: wrong args */")
-		| "get" ->
-			(match args with
-			| [key] ->
-				(* Generate type-specialized getter based on map's value type parameter *)
-				let value_type = get_map_value_type () in
-				(match value_type with
-				| TAbstract ({ a_path = ([], "Int") }, []) ->
-					spr ctx "fib_string_map_get_int(";
-					gen_value ctx map_expr;
-					spr ctx ", ";
-					gen_value ctx key;
-					spr ctx ")"
-				| TAbstract ({ a_path = ([], "Float") }, []) ->
-					spr ctx "fib_string_map_get_float(";
-					gen_value ctx map_expr;
-					spr ctx ", ";
-					gen_value ctx key;
-					spr ctx ")"
-				| TInst ({ cl_path = ([], "String") }, []) ->
-					spr ctx "fib_string_map_get_string(";
-					gen_value ctx map_expr;
-					spr ctx ", ";
-					gen_value ctx key;
-					spr ctx ")"
-				| _ ->
-					(* Return dynamic for other types *)
-					spr ctx "fib_string_map_get_dynamic(";
-					gen_value ctx map_expr;
-					spr ctx ", ";
-					gen_value ctx key;
-					spr ctx ")")
-			| _ -> spr ctx "/* StringMap.get: wrong args */")
-		| "exists" ->
-			(match args with
-			| [key] ->
-				spr ctx "fib_string_map_exists(";
-				gen_value ctx map_expr;
-				spr ctx ", ";
-				gen_value ctx key;
-				spr ctx ")"
-			| _ -> spr ctx "/* StringMap.exists: wrong args */")
-		| "remove" ->
-			(match args with
-			| [key] ->
-				spr ctx "fib_string_map_remove(";
-				gen_value ctx map_expr;
-				spr ctx ", ";
-				gen_value ctx key;
-				spr ctx ")"
-			| _ -> spr ctx "/* StringMap.remove: wrong args */")
-		| "keys" ->
-			spr ctx "fib_string_map_keys(";
-			gen_value ctx map_expr;
-			spr ctx ")"
-		| "iterator" ->
-			spr ctx "fib_string_map_iterator(";
-			gen_value ctx map_expr;
-			spr ctx ")"
-		| "copy" ->
-			spr ctx "fib_string_map_copy(";
-			gen_value ctx map_expr;
-			spr ctx ")"
-		| "toString" ->
-			spr ctx "fib_string_map_to_string(";
-			gen_value ctx map_expr;
-			spr ctx ")"
-		| "clear" ->
-			spr ctx "fib_string_map_clear(";
-			gen_value ctx map_expr;
-			spr ctx ")"
-		| "size" ->
-			spr ctx "fib_string_map_size(";
-			gen_value ctx map_expr;
-			spr ctx ")"
-		| _ ->
-			print ctx "/* StringMap.%s not implemented */" cf.cf_name)
-	(* Int64Map method calls -> fib_int64_map_* functions *)
+		ignore (gen_string_map_call ctx map_expr cf args)
+	(* Int64Map method calls *)
 	| TField (map_expr, FInstance (c, _, cf)), _ when c.cl_path = (["haxe"; "ds"], "Int64Map") ->
-		let get_value_suffix arg_expr =
-			match follow arg_expr.etype with
-			| TAbstract ({ a_path = ([], "Int") }, []) -> "_int"
-			| TAbstract ({ a_path = ([], "Float") }, []) -> "_float"
-			| TInst ({ cl_path = ([], "String") }, []) -> "_string"
-			| TAbstract ({ a_path = (["fiberus"], "Int64") }, []) -> "_int64"
-			| _ -> "_dynamic"
-		in
-		(* Get value type parameter from map type *)
-		let get_map_value_type () =
-			match follow map_expr.etype with
-			| TInst (_, [t]) -> follow t
-			| _ -> t_dynamic
-		in
-		(match cf.cf_name with
-		| "set" ->
-			(match args with
-			| [key; value] ->
-				let suffix = get_value_suffix value in
-				print ctx "fib_int64_map_set%s(" suffix;
-				gen_value ctx map_expr;
-				spr ctx ", ";
-				gen_value ctx key;
-				spr ctx ", ";
-				gen_value ctx value;
-				spr ctx ")"
-			| _ -> spr ctx "/* Int64Map.set: wrong args */")
-		| "get" ->
-			(match args with
-			| [key] ->
-				(* Generate type-specialized getter based on map's value type parameter *)
-				let value_type = get_map_value_type () in
-				(match value_type with
-				| TAbstract ({ a_path = ([], "Int") }, []) ->
-					spr ctx "fib_int64_map_get_int(";
-					gen_value ctx map_expr;
-					spr ctx ", ";
-					gen_value ctx key;
-					spr ctx ")"
-				| TAbstract ({ a_path = ([], "Float") }, []) ->
-					spr ctx "fib_int64_map_get_float(";
-					gen_value ctx map_expr;
-					spr ctx ", ";
-					gen_value ctx key;
-					spr ctx ")"
-				| TInst ({ cl_path = ([], "String") }, []) ->
-					spr ctx "fib_int64_map_get_string(";
-					gen_value ctx map_expr;
-					spr ctx ", ";
-					gen_value ctx key;
-					spr ctx ")"
-				| TAbstract ({ a_path = (["fiberus"], "Int64") }, []) ->
-					spr ctx "fib_int64_map_get_int64(";
-					gen_value ctx map_expr;
-					spr ctx ", ";
-					gen_value ctx key;
-					spr ctx ")"
-				| _ ->
-					(* Return dynamic for other types *)
-					spr ctx "fib_int64_map_get_dynamic(";
-					gen_value ctx map_expr;
-					spr ctx ", ";
-					gen_value ctx key;
-					spr ctx ")")
-			| _ -> spr ctx "/* Int64Map.get: wrong args */")
-		| "exists" ->
-			(match args with
-			| [key] ->
-				spr ctx "fib_int64_map_exists(";
-				gen_value ctx map_expr;
-				spr ctx ", ";
-				gen_value ctx key;
-				spr ctx ")"
-			| _ -> spr ctx "/* Int64Map.exists: wrong args */")
-		| "remove" ->
-			(match args with
-			| [key] ->
-				spr ctx "fib_int64_map_remove(";
-				gen_value ctx map_expr;
-				spr ctx ", ";
-				gen_value ctx key;
-				spr ctx ")"
-			| _ -> spr ctx "/* Int64Map.remove: wrong args */")
-		| "keys" ->
-			spr ctx "fib_int64_map_keys(";
-			gen_value ctx map_expr;
-			spr ctx ")"
-		| "iterator" ->
-			spr ctx "fib_int64_map_iterator(";
-			gen_value ctx map_expr;
-			spr ctx ")"
-		| "copy" ->
-			spr ctx "fib_int64_map_copy(";
-			gen_value ctx map_expr;
-			spr ctx ")"
-		| "toString" ->
-			spr ctx "fib_int64_map_to_string(";
-			gen_value ctx map_expr;
-			spr ctx ")"
-		| "clear" ->
-			spr ctx "fib_int64_map_clear(";
-			gen_value ctx map_expr;
-			spr ctx ")"
-		| "size" ->
-			spr ctx "fib_int64_map_size(";
-			gen_value ctx map_expr;
-			spr ctx ")"
-		| _ ->
-			print ctx "/* Int64Map.%s not implemented */" cf.cf_name)
-	(* ObjectMap method calls -> fib_object_map_* functions *)
+		ignore (gen_int64_map_call ctx map_expr cf args)
+	(* ObjectMap method calls *)
 	| TField (map_expr, FInstance (c, _, cf)), _ when c.cl_path = (["haxe"; "ds"], "ObjectMap") ->
-		let get_value_suffix arg_expr =
-			match follow arg_expr.etype with
-			| TAbstract ({ a_path = ([], "Int") }, []) -> "_int"
-			| TAbstract ({ a_path = ([], "Float") }, []) -> "_float"
-			| TInst ({ cl_path = ([], "String") }, []) -> "_string"
-			| TAbstract ({ a_path = (["fiberus"], "Int64") }, []) -> "_int64"
-			| _ -> "_dynamic"
+		ignore (gen_object_map_call ctx map_expr cf args)
+	(* Enum constructor call: Color.Rgb(r, g, b) -> Enum_Constructor(r, g, b) *)
+	| TField (_, FEnum (en, ef)), _ ->
+		print ctx "%s_%s(" (flat_path en.e_path) ef.ef_name;
+		let param_types = match ef.ef_type with
+			| TFun (args, _) -> List.map (fun (_, _, t) -> t) args
+			| _ -> []
 		in
-		(* Get value type parameter from map type (ObjectMap<K, V> -> V) *)
-		let get_map_value_type () =
-			match follow map_expr.etype with
-			| TInst (_, [_; t]) -> follow t  (* Second type param is value type *)
-			| _ -> t_dynamic
-		in
-		(match cf.cf_name with
-		| "set" ->
-			(match args with
-			| [key; value] ->
-				let suffix = get_value_suffix value in
-				print ctx "fib_object_map_set%s(" suffix;
-				gen_value ctx map_expr;
-				spr ctx ", (FibObject*)";
-				gen_value ctx key;
-				spr ctx ", ";
-				gen_value ctx value;
-				spr ctx ")"
-			| _ -> spr ctx "/* ObjectMap.set: wrong args */")
-		| "get" ->
-			(match args with
-			| [key] ->
-				(* Generate type-specialized getter based on map's value type parameter *)
-				let value_type = get_map_value_type () in
-				(match value_type with
-				| TAbstract ({ a_path = ([], "Int") }, []) ->
-					spr ctx "fib_object_map_get_int(";
-					gen_value ctx map_expr;
-					spr ctx ", (FibObject*)";
-					gen_value ctx key;
-					spr ctx ")"
-				| TAbstract ({ a_path = ([], "Float") }, []) ->
-					spr ctx "fib_object_map_get_float(";
-					gen_value ctx map_expr;
-					spr ctx ", (FibObject*)";
-					gen_value ctx key;
-					spr ctx ")"
-				| TInst ({ cl_path = ([], "String") }, []) ->
-					spr ctx "fib_object_map_get_string(";
-					gen_value ctx map_expr;
-					spr ctx ", (FibObject*)";
-					gen_value ctx key;
-					spr ctx ")"
-				| TAbstract ({ a_path = (["fiberus"], "Int64") }, []) ->
-					spr ctx "fib_object_map_get_int64(";
-					gen_value ctx map_expr;
-					spr ctx ", (FibObject*)";
-					gen_value ctx key;
-					spr ctx ")"
-				| _ ->
-					(* Return dynamic for other types *)
-					spr ctx "fib_object_map_get_dynamic(";
-					gen_value ctx map_expr;
-					spr ctx ", (FibObject*)";
-					gen_value ctx key;
-					spr ctx ")")
-			| _ -> spr ctx "/* ObjectMap.get: wrong args */")
-		| "exists" ->
-			(match args with
-			| [key] ->
-				spr ctx "fib_object_map_exists(";
-				gen_value ctx map_expr;
-				spr ctx ", (FibObject*)";
-				gen_value ctx key;
-				spr ctx ")"
-			| _ -> spr ctx "/* ObjectMap.exists: wrong args */")
-		| "remove" ->
-			(match args with
-			| [key] ->
-				spr ctx "fib_object_map_remove(";
-				gen_value ctx map_expr;
-				spr ctx ", (FibObject*)";
-				gen_value ctx key;
-				spr ctx ")"
-			| _ -> spr ctx "/* ObjectMap.remove: wrong args */")
-		| "keys" ->
-			spr ctx "fib_object_map_keys(";
-			gen_value ctx map_expr;
-			spr ctx ")"
-		| "iterator" ->
-			spr ctx "fib_object_map_iterator(";
-			gen_value ctx map_expr;
-			spr ctx ")"
-		| "copy" ->
-			spr ctx "fib_object_map_copy(";
-			gen_value ctx map_expr;
-			spr ctx ")"
-		| "toString" ->
-			spr ctx "fib_object_map_to_string(";
-			gen_value ctx map_expr;
-			spr ctx ")"
-		| "clear" ->
-			spr ctx "fib_object_map_clear(";
-			gen_value ctx map_expr;
-			spr ctx ")"
-		| "size" ->
-			spr ctx "fib_object_map_size(";
-			gen_value ctx map_expr;
-			spr ctx ")"
-		| _ ->
-			print ctx "/* ObjectMap.%s not implemented */" cf.cf_name)
+		gen_call_args ctx args param_types gen_value;
+		spr ctx ")"
 	(* Instance method call: obj.method(args) -> Class_method(obj, args) *)
 	| TField (obj, FInstance (c, _, cf)), _ ->
-		let class_name = flat_path c.cl_path in
-		let obj_type = s_type ctx obj.etype in
-		print ctx "%s_%s(" class_name (ident cf.cf_name);
-		(* Cast object to the declaring class type if different *)
-		if obj_type <> class_name ^ "*" then begin
-			print ctx "((%s*)" class_name;
-			gen_value ctx obj;
-			spr ctx ")"
-		end else
-			gen_value ctx obj;
-		if args <> [] then spr ctx ", ";
-		gen_call_args ctx args (get_param_types cf.cf_type) gen_value;
-		spr ctx ")"
+		gen_instance_call ctx obj c cf args
 	(* Closure call *)
 	| TField (obj, FClosure (Some (c, _), cf)), _ ->
-		let class_name = flat_path c.cl_path in
-		let obj_type = s_type ctx obj.etype in
-		print ctx "%s_%s(" class_name (ident cf.cf_name);
-		(* Cast object to the declaring class type if different *)
-		if obj_type <> class_name ^ "*" then begin
-			print ctx "((%s*)" class_name;
-			gen_value ctx obj;
-			spr ctx ")"
-		end else
-			gen_value ctx obj;
-		if args <> [] then spr ctx ", ";
-		gen_call_args ctx args (get_param_types cf.cf_type) gen_value;
-		spr ctx ")"
+		gen_instance_call ctx obj c cf args
 	(* Super constructor call: super(args) calls ParentClass_init on this *)
 	| TConst TSuper, _ ->
 		(match ctx.current_class with
@@ -1963,12 +1977,10 @@ and gen_call ctx e args =
 	| TField (obj, FAnon cf), _ ->
 		(match cf.cf_name with
 		| "toString" ->
-			(* Dynamic toString -> convert to string *)
 			spr ctx "fib_dynamic_to_string(";
 			gen_value ctx obj;
 			spr ctx ")"
 		| "push" | "pop" | "shift" | "unshift" | "slice" | "concat" | "join" | "indexOf" | "contains" | "reverse" ->
-			(* Array methods on Dynamic - convert to array first *)
 			spr ctx "fib_array_";
 			spr ctx cf.cf_name;
 			spr ctx "(fib_dynamic_to_array(";
@@ -1980,7 +1992,6 @@ and gen_call ctx e args =
 			end;
 			spr ctx ")"
 		| _ ->
-			(* Generic dynamic method call - use runtime dispatch *)
 			spr ctx "fib_call_method(";
 			gen_value ctx obj;
 			print ctx ", \"%s\"" cf.cf_name;
@@ -2012,8 +2023,6 @@ and gen_call ctx e args =
 	| TLocal v, _ ->
 		(match follow v.v_type with
 		| TFun (fun_args, ret) ->
-			(* All closures are now FibClosure pointers - generate closure call with proper cast *)
-			(* Uses s_func_ptr_cast to handle both normal and function-pointer-returning closures *)
 			let arg_types = List.map (fun (_, _, t) -> s_type ctx t) fun_args in
 			let args_str = if arg_types = [] then "" else String.concat ", " arg_types in
 			let cast_str = s_func_ptr_cast ctx ret args_str in
@@ -2021,16 +2030,77 @@ and gen_call ctx e args =
 			if args <> [] then spr ctx ", ";
 			gen_call_args ctx args (get_param_types v.v_type) gen_value;
 			spr ctx ")"
+		| TDynamic _ ->
+			(* Dynamic local variable call: use fib_closure_call_dynamic to handle optional params *)
+			let num_args = List.length args in
+			spr ctx "({ FibClosure* _dc = (FibClosure*)fib_dynamic_to_object(";
+			spr ctx (ident v.v_name);
+			spr ctx "); FibDynamic _args[";
+			print ctx "%d" (max 1 num_args);
+			spr ctx "] = {";
+			let first = ref true in
+			List.iter (fun arg ->
+				if not !first then spr ctx ", " else first := false;
+				match arg.eexpr with
+				| TConst TNull -> spr ctx "fib_dynamic_null()"
+				| _ ->
+					let arg_type = s_type ctx arg.etype in
+					if arg_type = "FibDynamic" then
+						gen_value ctx arg
+					else
+						gen_box_to_fib_dynamic ctx arg_type (fun () -> gen_value ctx arg)
+			) args;
+			if num_args = 0 then spr ctx "fib_dynamic_null()";  (* Empty initializer not allowed *)
+			print ctx "}; fib_closure_call_dynamic(_dc, _args, %d); })" num_args
 		| _ ->
 			gen_value ctx e;
 			spr ctx "(";
 			gen_call_args ctx args (get_param_types e.etype) gen_value;
 			spr ctx ")")
 	| _ ->
-		gen_value ctx e;
-		spr ctx "(";
-		gen_call_args ctx args (get_param_types e.etype) gen_value;
-		spr ctx ")"
+		(* Check if callee is a function type (TFun) - treat as closure call *)
+		(match follow e.etype with
+		| TFun (fun_args, ret) ->
+			(* Closure call: ((cast)closure->fn)(closure, args) *)
+			let arg_types = List.map (fun (_, _, t) -> s_type ctx t) fun_args in
+			let args_str = if arg_types = [] then "" else String.concat ", " arg_types in
+			let cast_str = s_func_ptr_cast ctx ret args_str in
+			spr ctx "(";
+			print ctx "%s" cast_str;
+			gen_value ctx e;
+			spr ctx "->fn)(";
+			gen_value ctx e;  (* Pass closure as first arg *)
+			if args <> [] then spr ctx ", ";
+			gen_call_args ctx args (get_param_types e.etype) gen_value;
+			spr ctx ")"
+		| TDynamic _ ->
+			(* Dynamic call: use fib_closure_call_dynamic to handle optional params *)
+			let num_args = List.length args in
+			spr ctx "({ FibClosure* _dc = (FibClosure*)fib_dynamic_to_object(";
+			gen_value ctx e;
+			spr ctx "); FibDynamic _args[";
+			print ctx "%d" (max 1 num_args);
+			spr ctx "] = {";
+			let first = ref true in
+			List.iter (fun arg ->
+				if not !first then spr ctx ", " else first := false;
+				match arg.eexpr with
+				| TConst TNull -> spr ctx "fib_dynamic_null()"
+				| _ ->
+					let arg_type = s_type ctx arg.etype in
+					if arg_type = "FibDynamic" then
+						gen_value ctx arg
+					else
+						gen_box_to_fib_dynamic ctx arg_type (fun () -> gen_value ctx arg)
+			) args;
+			if num_args = 0 then spr ctx "fib_dynamic_null()";
+			print ctx "}; fib_closure_call_dynamic(_dc, _args, %d); })" num_args
+		| _ ->
+			(* Regular call (unlikely to hit this case for well-typed code) *)
+			gen_value ctx e;
+			spr ctx "(";
+			gen_call_args ctx args (get_param_types e.etype) gen_value;
+			spr ctx ")")
 
 and gen_value ctx e =
 	match e.eexpr with
@@ -2173,6 +2243,8 @@ and gen_value ctx e =
 				| _ -> false
 		in
 		let enum_null_check = is_null_compare && (is_enum_struct_expr e1 || is_enum_struct_expr e2) in
+		(* Enum struct vs enum struct comparison (not null) - compare by .index *)
+		let enum_struct_compare = (not is_null_compare) && is_enum_struct_expr e1 && is_enum_struct_expr e2 in
 		let needs_null_func = is_null_compare && (is_fib_dynamic_expr e1 || is_fib_dynamic_expr e2) && not enum_null_check in
 		(* Generate raw FibDynamic for enum parameters (without unboxing) *)
 		let rec gen_raw_fib_dynamic e = match e.eexpr with
@@ -2183,28 +2255,42 @@ and gen_value ctx e =
 				gen_raw_fib_dynamic inner
 			| _ -> gen_value ctx e
 		in
-		(match op, is_str, enum_null_check, needs_null_func with
-		| OpEq, _, true, _ ->
+		(match op, is_str, enum_null_check, needs_null_func, enum_struct_compare with
+		| OpEq, _, true, _, _ ->
 			(* Enum struct == null -> check .index == -1 (sentinel) *)
 			spr ctx "(";
 			(match e1.eexpr with TConst TNull -> gen_value ctx e2 | _ -> gen_value ctx e1);
 			spr ctx ".index == -1)"
-		| OpNotEq, _, true, _ ->
+		| OpNotEq, _, true, _, _ ->
 			(* Enum struct != null -> check .index != -1 *)
 			spr ctx "(";
 			(match e1.eexpr with TConst TNull -> gen_value ctx e2 | _ -> gen_value ctx e1);
 			spr ctx ".index != -1)"
-		| OpEq, _, _, true ->
+		| OpEq, _, _, _, true ->
+			(* Enum struct == enum struct -> compare by .index *)
+			spr ctx "(";
+			gen_value ctx e1;
+			spr ctx ".index == ";
+			gen_value ctx e2;
+			spr ctx ".index)"
+		| OpNotEq, _, _, _, true ->
+			(* Enum struct != enum struct -> compare by .index *)
+			spr ctx "(";
+			gen_value ctx e1;
+			spr ctx ".index != ";
+			gen_value ctx e2;
+			spr ctx ".index)"
+		| OpEq, _, _, true, _ ->
 			(* FibDynamic == null -> fib_dynamic_is_null() *)
 			spr ctx "fib_dynamic_is_null(";
 			(match e1.eexpr with TConst TNull -> gen_raw_fib_dynamic e2 | _ -> gen_raw_fib_dynamic e1);
 			spr ctx ")"
-		| OpNotEq, _, _, true ->
+		| OpNotEq, _, _, true, _ ->
 			(* FibDynamic != null -> !fib_dynamic_is_null() *)
 			spr ctx "!fib_dynamic_is_null(";
 			(match e1.eexpr with TConst TNull -> gen_raw_fib_dynamic e2 | _ -> gen_raw_fib_dynamic e1);
 			spr ctx ")"
-		| OpAdd, true, _, _ ->
+		| OpAdd, true, _, _, _ ->
 			(* String concat - coerce operands to FibString* if needed *)
 			let gen_str_arg e =
 				(* First check actual C type from function call return types *)
@@ -2271,7 +2357,7 @@ and gen_value ctx e =
 			spr ctx ", ";
 			gen_str_arg e2;
 			spr ctx ")"
-		| OpAssignOp OpAdd, true, _, _ ->
+		| OpAssignOp OpAdd, true, _, _, _ ->
 			let gen_str_arg e =
 				(* First check actual C type from function call return types *)
 				let actual_type = get_actual_c_type ctx e in
@@ -2331,7 +2417,7 @@ and gen_value ctx e =
 			spr ctx ", ";
 			gen_str_arg e2;
 			spr ctx "))"
-		| OpEq, true, _, _ ->
+		| OpEq, true, _, _, _ ->
 			(* Convert FibDynamic to FibString* for string comparison *)
 			let gen_str_cmp_arg e =
 				let needs_convert = match e.eexpr with
@@ -2348,7 +2434,7 @@ and gen_value ctx e =
 			spr ctx ", ";
 			gen_str_cmp_arg e2;
 			spr ctx ")"
-		| OpNotEq, true, _, _ ->
+		| OpNotEq, true, _, _, _ ->
 			let gen_str_cmp_arg e =
 				let needs_convert = match e.eexpr with
 					| TField (_, FAnon _) | TField (_, FDynamic _) -> true
@@ -2364,7 +2450,7 @@ and gen_value ctx e =
 			spr ctx ", ";
 			gen_str_cmp_arg e2;
 			spr ctx ")"
-		| OpAssign, _, _, _ ->
+		| OpAssign, _, _, _, _ ->
 			(* Check for array element assignment: arr[i] = value *)
 			(match e1.eexpr with
 			| TArray (arr, idx) ->
@@ -2620,23 +2706,39 @@ and gen_value ctx e =
 				end else
 					gen_value ctx e2;
 				spr ctx ")")
-		| OpUShr, _, _, _ ->
+		| OpUShr, _, _, _, _ ->
 			(* Unsigned right shift: cast to uint32_t, shift, cast back to int32_t *)
+			let e1_type = match get_actual_c_type ctx e1 with Some t -> t | None -> s_type ctx e1.etype in
+			let e2_type = match get_actual_c_type ctx e2 with Some t -> t | None -> s_type ctx e2.etype in
 			spr ctx "((int32_t)((uint32_t)(";
-			gen_value ctx e1;
+			if e1_type = "FibDynamic" then begin spr ctx "fib_dynamic_to_int("; gen_value ctx e1; spr ctx ")" end
+			else gen_value ctx e1;
 			spr ctx ") >> (";
-			gen_value ctx e2;
+			if e2_type = "FibDynamic" then begin spr ctx "fib_dynamic_to_int("; gen_value ctx e2; spr ctx ")" end
+			else gen_value ctx e2;
 			spr ctx ")))"
-		| OpAssignOp OpUShr, _, _, _ ->
+		| OpAssignOp OpUShr, _, _, _, _ ->
 			(* Unsigned right shift assignment: e1 = (int32_t)((uint32_t)e1 >> e2) *)
+			let e1_type = match get_actual_c_type ctx e1 with Some t -> t | None -> s_type ctx e1.etype in
+			let e2_type = match get_actual_c_type ctx e2 with Some t -> t | None -> s_type ctx e2.etype in
 			spr ctx "(";
 			gen_value ctx e1;
-			spr ctx " = (int32_t)((uint32_t)(";
-			gen_value ctx e1;
-			spr ctx ") >> (";
-			gen_value ctx e2;
-			spr ctx ")))"
-		| OpAssignOp inner_op, _, _, _ when (match e1.eexpr with TArray _ -> true | _ -> false) ->
+			if e1_type = "FibDynamic" then begin
+				spr ctx " = fib_dynamic_int((int32_t)((uint32_t)fib_dynamic_to_int(";
+				gen_value ctx e1;
+				spr ctx ") >> (";
+				if e2_type = "FibDynamic" then begin spr ctx "fib_dynamic_to_int("; gen_value ctx e2; spr ctx ")" end
+				else gen_value ctx e2;
+				spr ctx ")))"
+			end else begin
+				spr ctx " = (int32_t)((uint32_t)(";
+				gen_value ctx e1;
+				spr ctx ") >> (";
+				if e2_type = "FibDynamic" then begin spr ctx "fib_dynamic_to_int("; gen_value ctx e2; spr ctx ")" end
+				else gen_value ctx e2;
+				spr ctx ")))"
+			end
+		| OpAssignOp inner_op, _, _, _, _ when (match e1.eexpr with TArray _ -> true | _ -> false) ->
 			(* Array compound assignment: arr[i] op= value  ->  arr_set(arr, i, arr_get(arr, i) op value) *)
 			(match e1.eexpr with
 			| TArray (arr, idx) ->
@@ -2735,7 +2837,46 @@ and gen_value ctx e =
 					spr ctx "))"
 				end
 			| _ -> assert false)
-		| _, _, _, _ ->
+		| OpAssignOp inner_op, _, _, _, _ ->
+			(* Compound assignment on FibDynamic: a op= b -> a = fib_dynamic_XXX(fib_dynamic_to_XXX(a) op b) *)
+			let lhs_type = match get_actual_c_type ctx e1 with Some t -> t | None -> s_type ctx e1.etype in
+			let rhs_type = match get_actual_c_type ctx e2 with Some t -> t | None -> s_type ctx e2.etype in
+			if lhs_type = "FibDynamic" then begin
+				(* LHS is FibDynamic - need to extract, operate, and re-box *)
+				spr ctx "(";
+				gen_value ctx e1;
+				spr ctx " = fib_dynamic_int(fib_dynamic_to_int(";
+				gen_value ctx e1;
+				spr ctx ")";
+				gen_binop ctx inner_op;
+				if rhs_type = "FibDynamic" then begin
+					spr ctx "fib_dynamic_to_int(";
+					gen_value ctx e2;
+					spr ctx ")"
+				end else
+					gen_value ctx e2;
+				spr ctx "))"
+			end else begin
+				(* LHS is not FibDynamic - regular compound assignment *)
+				spr ctx "(";
+				gen_value ctx e1;
+				gen_binop ctx (OpAssignOp inner_op);
+				if rhs_type = "FibDynamic" then begin
+					(* RHS is FibDynamic - extract it *)
+					if lhs_type = "double" then begin
+						spr ctx "fib_dynamic_to_float(";
+						gen_value ctx e2;
+						spr ctx ")"
+					end else begin
+						spr ctx "fib_dynamic_to_int(";
+						gen_value ctx e2;
+						spr ctx ")"
+					end
+				end else
+					gen_value ctx e2;
+				spr ctx ")"
+			end
+		| _, _, _, _, _ ->
 			(* Check if either operand needs FibDynamic extraction for comparisons/arithmetic *)
 			(* Use get_actual_c_type to detect dynamic field access that returns FibDynamic at runtime *)
 			let get_c_type exp =
@@ -2747,12 +2888,18 @@ and gen_value ctx e =
 			let other_type = get_c_type e2 in
 			(* Determine the extraction target type based on Haxe result type *)
 			let result_type = s_type ctx e.etype in
-			(* For arithmetic and comparison ops, we need to extract FibDynamic to primitives *)
-			let is_arithmetic = match op with
+			(* For arithmetic, comparison, bitwise, and boolean ops, we need to extract FibDynamic to primitives *)
+			let is_numeric_op = match op with
 				| OpAdd | OpSub | OpMult | OpDiv | OpMod -> true
 				| OpLt | OpLte | OpGt | OpGte -> true  (* comparison ops need extraction *)
+				| OpAnd | OpOr | OpXor | OpShl | OpShr | OpUShr -> true  (* bitwise ops need extraction *)
 				| _ -> false
 			in
+			let is_bool_op = match op with
+				| OpBoolAnd | OpBoolOr -> true
+				| _ -> false
+			in
+			let is_arithmetic = is_numeric_op || is_bool_op in
 			(* For equality ops between FibDynamic and primitive, extract the FibDynamic side *)
 			let is_equality = match op with
 				| OpEq | OpNotEq -> true
@@ -2764,10 +2911,14 @@ and gen_value ctx e =
 			(* If operand's C type is FibDynamic, we need to extract for arithmetic/equality *)
 			let e1_needs_extract = my_type = "FibDynamic" && (is_arithmetic || (is_equality && is_primitive_type other_type)) in
 			let e2_needs_extract = other_type = "FibDynamic" && (is_arithmetic || (is_equality && is_primitive_type my_type)) in
-			(* Determine target type for extraction - use the non-FibDynamic operand's type for equality *)
+			(* Determine target type for extraction - use the non-FibDynamic operand's type for equality/comparison *)
+			let is_comparison = match op with OpLt | OpLte | OpGt | OpGte -> true | _ -> false in
 			let target_type_for_extract = 
-				if is_equality then
+				if is_equality || is_comparison then
+					(* For equality/comparison, extract FibDynamic to match the other operand's type *)
 					if my_type = "FibDynamic" then other_type else my_type
+				else if is_bool_op then
+					"bool"  (* Boolean ops always need bool extraction *)
 				else 
 					result_type
 			in
@@ -2783,8 +2934,8 @@ and gen_value ctx e =
 					end else if target_type_for_extract = "int64_t" then begin
 						spr ctx "fib_dynamic_to_int64("; gen_value ctx exp; spr ctx ")"
 					end else begin
-						(* Fallback: try to use double for arithmetic if result type is not primitive *)
-						spr ctx "fib_dynamic_to_float("; gen_value ctx exp; spr ctx ")"
+						(* Fallback: try int for unknown types (safer than double for bitwise ops) *)
+						spr ctx "fib_dynamic_to_int("; gen_value ctx exp; spr ctx ")"
 					end
 				end else
 					gen_value ctx exp
@@ -3093,11 +3244,67 @@ and gen_value ctx e =
 				gen_value ctx e;
 				if flag = Postfix then gen_unop ctx op flag
 			end
+		| (Increment | Decrement), _ ->
+			(* Check if operand is FibDynamic - need special handling *)
+			let operand_type = match get_actual_c_type ctx e with Some t -> t | None -> s_type ctx e.etype in
+			if operand_type = "FibDynamic" then begin
+				(* FibDynamic increment/decrement:
+				 * Pre:  ({ e = fib_dynamic_int(fib_dynamic_to_int(e) +/- 1); fib_dynamic_to_int(e); })
+				 * Post: ({ int32_t _old = fib_dynamic_to_int(e); e = fib_dynamic_int(_old +/- 1); _old; })
+				 * Following hxcpp, the result is int32_t (or double), not FibDynamic *)
+				let delta = match op with Increment -> "+ 1" | Decrement -> "- 1" | _ -> "" in
+				if flag = Prefix then begin
+					spr ctx "({ ";
+					gen_value ctx e;
+					spr ctx " = fib_dynamic_int(fib_dynamic_to_int(";
+					gen_value ctx e;
+					spr ctx ") ";
+					spr ctx delta;
+					spr ctx "); fib_dynamic_to_int(";
+					gen_value ctx e;
+					spr ctx "); })"
+				end else begin
+					spr ctx "({ int32_t _old = fib_dynamic_to_int(";
+					gen_value ctx e;
+					spr ctx "); ";
+					gen_value ctx e;
+					spr ctx " = fib_dynamic_int(_old ";
+					spr ctx delta;
+					spr ctx "); _old; })"
+				end
+			end else begin
+				(* Standard unary operation *)
+				if flag = Prefix then gen_unop ctx op flag;
+				gen_value ctx e;
+				if flag = Postfix then gen_unop ctx op flag
+			end
 		| _ ->
-			(* Standard unary operation *)
-			if flag = Prefix then gen_unop ctx op flag;
-			gen_value ctx e;
-			if flag = Postfix then gen_unop ctx op flag)
+			(* Other unary operations (Not, Neg, NegBits) *)
+			let operand_type = match get_actual_c_type ctx e with Some t -> t | None -> s_type ctx e.etype in
+			if operand_type = "FibDynamic" then begin
+				(* FibDynamic unary ops need extraction *)
+				(match op with
+				| Not ->
+					spr ctx "!fib_dynamic_to_bool(";
+					gen_value ctx e;
+					spr ctx ")"
+				| Neg ->
+					spr ctx "-fib_dynamic_to_int(";
+					gen_value ctx e;
+					spr ctx ")"
+				| NegBits ->
+					spr ctx "~fib_dynamic_to_int(";
+					gen_value ctx e;
+					spr ctx ")"
+				| _ ->
+					if flag = Prefix then gen_unop ctx op flag;
+					gen_value ctx e;
+					if flag = Postfix then gen_unop ctx op flag)
+			end else begin
+				if flag = Prefix then gen_unop ctx op flag;
+				gen_value ctx e;
+				if flag = Postfix then gen_unop ctx op flag
+			end)
 	| TFunction f ->
 		(* Collect free variables to detect capturing closures *)
 		let free_vars = collect_free_vars f.tf_args f.tf_expr in
@@ -3113,12 +3320,16 @@ and gen_value ctx e =
 		 * handlers above generate the closure inline to ensure proper temp root protection.
 		 * This branch should NOT be reached for fiber spawns, but we keep the mature alloc
 		 * logic as a safety measure. *)
+		let arg_count = List.length f.tf_args in
+		let impl_name = closure_name ^ "_impl" in
 		if ctx.in_fiber_spawn then
 			spr ctx "({ FibClosure* _c = fib_closure_create_for_fiber((void*)"
 		else
 			spr ctx "({ FibClosure* _c = fib_closure_create((void*)";
+		spr ctx impl_name;
+		spr ctx ", (void*)";
 		spr ctx closure_name;
-		print ctx ", %d); " (List.length free_vars);
+		print ctx ", %d, %d); " (List.length free_vars) arg_count;
 		List.iteri (fun i v ->
 			print ctx "_c->captures[%d] = " i;
 			(* Box the captured value appropriately *)
@@ -3142,34 +3353,24 @@ and gen_value ctx e =
 			(* Stack allocation: declare struct on stack, then take address *)
 			let c = Hashtbl.find ctx.stack_alloc_vars v.v_id in
 			let class_name = flat_path c.cl_path in
-			(* Declare the struct on the stack *)
-			print ctx "%s _stack_%s = { ._obj.clazz = &%s_class" class_name (ident v.v_name) class_name;
-			(* Initialize fields from constructor args *)
-			(match eo with
-			| Some { eexpr = TNew (_, _, args) } ->
-				(* Match args to constructor parameters to get field assignments *)
-				(match c.cl_constructor with
-				| Some cf ->
-					(match cf.cf_expr with
-					| Some { eexpr = TFunction f } ->
-						let filtered_args = filter_void_args f.tf_args in
-						let param_field_map = extract_param_field_mapping f in
-						List.iter2 (fun (param_v, _) arg ->
-							(* Look up the field name for this parameter *)
-							let field_name = try List.assoc param_v.v_id param_field_map 
-							                 with Not_found -> param_v.v_name in
-							spr ctx ", .";
-							spr ctx (ident field_name);
-							spr ctx " = ";
-							gen_value ctx arg
-						) filtered_args args
-					| _ -> ())
-				| None -> ())
-			| _ -> ());
-			spr ctx " };";
+			(* Declare the struct on the stack with just the class pointer *)
+			print ctx "%s _stack_%s = { ._obj.clazz = &%s_class };" class_name (ident v.v_name) class_name;
 			newline ctx;
 			(* Declare the pointer variable pointing to the stack struct *)
-			print ctx "%s* %s = &_stack_%s" class_name (ident v.v_name) (ident v.v_name)
+			print ctx "%s* %s = &_stack_%s;" class_name (ident v.v_name) (ident v.v_name);
+			newline ctx;
+			(* Call init function with constructor arguments *)
+			print ctx "%s_init(%s" class_name (ident v.v_name);
+			(match eo with
+			| Some { eexpr = TNew (tc, _, args) } when List.length args > 0 ->
+				spr ctx ", ";
+				let param_types = match tc.cl_constructor with
+					| Some cf -> get_param_types cf.cf_type
+					| None -> []
+				in
+				gen_call_args ctx args param_types gen_value
+			| _ -> ());
+			spr ctx ")"
 		end else begin
 			(* Normal heap allocation path *)
 			(* Special handling for function types - use FibClosure* *)
@@ -3191,23 +3392,72 @@ and gen_value ctx e =
 				gen_coerce_with_expr ctx e.etype v.v_type (Some e) (fun () -> gen_value ctx e))
 		end
 	| TBlock el ->
-		let b = open_block_for_exprs ctx el in
-		List.iter (fun e ->
-			gen_expr ctx e;
-			spr ctx ";";
+		(* Block used as value - use GCC statement expression syntax ({...}) *)
+		let old_tabs = ctx.tabs in
+		let saved_gc_count = ctx.gc_local_count in
+		ctx.tabs <- ctx.tabs ^ "\t";
+		spr ctx "({";
+		newline ctx;
+		(* Generate all but last expression as statements, last as value *)
+		let rec gen_block_exprs = function
+			| [] -> ()
+			| [last] ->
+				(* Last expression - generate as value for the block to evaluate to *)
+				gen_value ctx last;
+				spr ctx ";";
+				newline ctx
+			| e :: rest ->
+				gen_expr ctx e;
+				spr ctx ";";
+				newline ctx;
+				gen_block_exprs rest
+		in
+		gen_block_exprs el;
+		(* Pop GC roots if needed *)
+		let to_pop = ctx.gc_local_count - saved_gc_count in
+		let block_returns = match el with
+			| [] -> false
+			| _ -> ends_with_return (List.hd (List.rev el))
+		in
+		if to_pop > 0 && not block_returns then begin
+			print ctx "gc_pop_temp_roots_ctx(FIB_CTX, %d);" to_pop;
 			newline ctx
-		) el;
-		b ()
+		end;
+		ctx.gc_local_count <- saved_gc_count;
+		ctx.tabs <- old_tabs;
+		newline ctx;
+		spr ctx "})"
 	| TIf (cond, e1, e2) ->
 		ctx.in_value <- true;
+		(* Check for type mismatch in ternary - need to coerce branches to same type *)
+		let t1 = match get_actual_c_type ctx e1 with Some t -> t | None -> s_type ctx e1.etype in
+		let t2 = match e2 with
+			| Some e -> (match get_actual_c_type ctx e with Some t -> t | None -> s_type ctx e.etype)
+			| None -> "FibDynamic"
+		in
 		spr ctx "((";
-		gen_value ctx cond;
+		(* Condition might be FibDynamic - extract to bool if needed *)
+		let cond_type = match get_actual_c_type ctx cond with Some t -> t | None -> s_type ctx cond.etype in
+		if cond_type = "FibDynamic" then begin
+			spr ctx "fib_dynamic_to_bool(";
+			gen_value ctx cond;
+			spr ctx ")"
+		end else
+			gen_value ctx cond;
 		spr ctx ") ? (";
-		gen_value ctx e1;
+		(* If one side is FibDynamic and other is primitive, box the primitive *)
+		if t2 = "FibDynamic" && t1 <> "FibDynamic" then
+			gen_box_to_fib_dynamic ctx t1 (fun () -> gen_value ctx e1)
+		else
+			gen_value ctx e1;
 		spr ctx ") : (";
 		(match e2 with
 		| None -> spr ctx "fib_dynamic_null()"
-		| Some e -> gen_value ctx e);
+		| Some e ->
+			if t1 = "FibDynamic" && t2 <> "FibDynamic" then
+				gen_box_to_fib_dynamic ctx t2 (fun () -> gen_value ctx e)
+			else
+				gen_value ctx e);
 		spr ctx "))"
 	| TWhile _ | TSwitch _ | TTry _ ->
 		spr ctx "/* complex expr */"
@@ -3218,7 +3468,7 @@ and gen_value ctx e =
 			spr ctx "return ";
 			(match ctx.current_ret_type with
 			| Some ret_type ->
-				gen_coerce ctx e.etype ret_type (fun () -> gen_value ctx e)
+				gen_coerce_with_expr ctx e.etype ret_type (Some e) (fun () -> gen_value ctx e)
 			| None ->
 				gen_value ctx e))
 	| TBreak -> spr ctx "break"
@@ -3226,7 +3476,7 @@ and gen_value ctx e =
 	| TThrow e ->
 		(* Begin exception unwinding - captures stack frames as we unwind *)
 		spr ctx "fib_exception_begin(); fib_throw(";
-		(* Box the value if it's not already a FibDynamic *)
+		(* Box the value into FibDynamic based on its type *)
 		let throw_type = s_type ctx e.etype in
 		if throw_type = "FibDynamic" then
 			gen_value ctx e
@@ -3234,6 +3484,24 @@ and gen_value ctx e =
 			spr ctx "fib_string_to_dynamic(";
 			gen_value ctx e;
 			spr ctx ")"
+		end else if throw_type = "int32_t" then begin
+			spr ctx "fib_dynamic_int(";
+			gen_value ctx e;
+			spr ctx ")"
+		end else if throw_type = "double" then begin
+			spr ctx "fib_dynamic_float(";
+			gen_value ctx e;
+			spr ctx ")"
+		end else if throw_type = "bool" then begin
+			spr ctx "fib_dynamic_bool(";
+			gen_value ctx e;
+			spr ctx ")"
+		end else if is_enum_struct_type throw_type then begin
+			(* For enum values (value types), box with fib_dynamic_enum.
+			   Need to use statement expression with temp var since we can't take address of function return. *)
+			print ctx "({ %s _enum_tmp = " throw_type;
+			gen_value ctx e;
+			print ctx "; fib_dynamic_enum(&_enum_tmp, sizeof(%s)); })" throw_type
 		end else begin
 			(* For objects/exceptions, wrap in FibDynamic *)
 			spr ctx "fib_dynamic_object((FibObject*)";
@@ -3241,8 +3509,37 @@ and gen_value ctx e =
 			spr ctx ")"
 		end;
 		spr ctx ")"
-	| TCast (e, _) ->
-		gen_value ctx e
+	| TCast (inner, _) ->
+		(* Generate type conversion if needed *)
+		let from_c = match get_actual_c_type ctx inner with
+			| Some t -> t
+			| None -> s_type ctx inner.etype
+		in
+		let to_c = s_type ctx e.etype in
+		if from_c = to_c then
+			gen_value ctx inner
+		else if from_c = "FibDynamic" && to_c = "int32_t" then begin
+			spr ctx "fib_dynamic_to_int(";
+			gen_value ctx inner;
+			spr ctx ")"
+		end else if from_c = "FibDynamic" && to_c = "double" then begin
+			spr ctx "fib_dynamic_to_float(";
+			gen_value ctx inner;
+			spr ctx ")"
+		end else if from_c = "FibDynamic" && to_c = "bool" then begin
+			spr ctx "fib_dynamic_to_bool(";
+			gen_value ctx inner;
+			spr ctx ")"
+		end else if from_c = "FibDynamic" && to_c = "FibString*" then begin
+			spr ctx "fib_dynamic_to_string(";
+			gen_value ctx inner;
+			spr ctx ")"
+		end else if from_c = "FibDynamic" && is_class_pointer_type to_c then begin
+			print ctx "((%s)fib_dynamic_to_object(" to_c;
+			gen_value ctx inner;
+			spr ctx "))"
+		end else
+			gen_value ctx inner
 	| TMeta (_, e) ->
 		gen_value ctx e
 	| TEnumParameter (enum_expr, _, i) ->
@@ -3361,9 +3658,47 @@ and gen_field_access ctx e fa =
 			end
 		end
 	| FClosure (Some (c, _), cf) ->
-		(* Static closure: reference as function pointer *)
-		print ctx "%s_%s" (flat_path c.cl_path) (ident cf.cf_name)
+		(* Method reference - wrap in FibClosure with thunk
+		 * We need to create a closure that wraps the static/instance method.
+		 * The thunk adapts the method to closure calling convention.
+		 *
+		 * For static methods: thunk ignores closure arg, calls method directly
+		 * For instance methods: thunk uses closure context as the bound 'this' *)
+		let class_name = flat_path c.cl_path in
+		let method_name = ident cf.cf_name in
+		let thunk_name = Printf.sprintf "__%s_%s_thunk" class_name method_name in
+		(* Determine if this is a static method by checking cl_statics *)
+		let is_static = List.exists (fun scf -> scf.cf_name = cf.cf_name) c.cl_ordered_statics in
+		(* Get argument types and return type *)
+		let arg_types, ret_type = match follow cf.cf_type with
+			| TFun (args, ret) -> (List.map (fun (n, _, t) -> (n, t)) args, ret)
+			| _ -> ([], t_dynamic)
+		in
+		(* Register the thunk for generation: (is_static, class_path, method_name, arg_types, ret_type) *)
+		Hashtbl.replace ctx.method_thunks thunk_name (is_static, c.cl_path, cf.cf_name, arg_types, ret_type);
+		let method_arg_count = List.length arg_types in
+		let dyn_thunk_name = thunk_name ^ "_dyn" in
+		(* Generate closure creation using GCC statement expression *)
+		if is_static then begin
+			(* Static method - no captures needed *)
+			spr ctx "({ FibClosure* _c = fib_closure_create((void*)";
+			spr ctx thunk_name;
+			spr ctx ", (void*)";
+			spr ctx dyn_thunk_name;
+			print ctx ", 0, %d); _c; })" method_arg_count
+		end else begin
+			(* Instance method - store 'this' in captures[0] *)
+			spr ctx "({ FibClosure* _c = fib_closure_create((void*)";
+			spr ctx thunk_name;
+			spr ctx ", (void*)";
+			spr ctx dyn_thunk_name;
+			print ctx ", 1, %d); _c->captures[0] = fib_dynamic_object((FibObject*)" method_arg_count;
+			gen_value ctx e;
+			spr ctx "); _c; })"
+		end
 	| FClosure (None, cf) ->
+		(* Instance method reference on dynamic object - complex case *)
+		(* For now, just access the field - may need more work for full support *)
 		gen_value ctx e;
 		print ctx "->%s" (ident cf.cf_name)
 	| FAnon cf ->
@@ -3393,34 +3728,24 @@ and gen_expr ctx e =
 			(* Stack allocation: declare struct on stack, then take address *)
 			let c = Hashtbl.find ctx.stack_alloc_vars v.v_id in
 			let class_name = flat_path c.cl_path in
-			(* Declare the struct on the stack *)
-			print ctx "%s _stack_%s = { ._obj.clazz = &%s_class" class_name (ident v.v_name) class_name;
-			(* Initialize fields from constructor args *)
-			(match eo with
-			| Some { eexpr = TNew (_, _, args) } ->
-				(* Match args to constructor parameters to get field assignments *)
-				(match c.cl_constructor with
-				| Some cf ->
-					(match cf.cf_expr with
-					| Some { eexpr = TFunction f } ->
-						let filtered_args = filter_void_args f.tf_args in
-						let param_field_map = extract_param_field_mapping f in
-						List.iter2 (fun (param_v, _) arg ->
-							(* Look up the field name for this parameter *)
-							let field_name = try List.assoc param_v.v_id param_field_map 
-							                 with Not_found -> param_v.v_name in
-							spr ctx ", .";
-							spr ctx (ident field_name);
-							spr ctx " = ";
-							gen_value ctx arg
-						) filtered_args args
-					| _ -> ())
-				| None -> ())
-			| _ -> ());
-			spr ctx " };";
+			(* Declare the struct on the stack with just the class pointer *)
+			print ctx "%s _stack_%s = { ._obj.clazz = &%s_class };" class_name (ident v.v_name) class_name;
 			newline ctx;
 			(* Declare the pointer variable pointing to the stack struct *)
-			print ctx "%s* %s = &_stack_%s" class_name (ident v.v_name) (ident v.v_name)
+			print ctx "%s* %s = &_stack_%s;" class_name (ident v.v_name) (ident v.v_name);
+			newline ctx;
+			(* Call init function with constructor arguments *)
+			print ctx "%s_init(%s" class_name (ident v.v_name);
+			(match eo with
+			| Some { eexpr = TNew (tc, _, args) } when List.length args > 0 ->
+				spr ctx ", ";
+				let param_types = match tc.cl_constructor with
+					| Some cf -> get_param_types cf.cf_type
+					| None -> []
+				in
+				gen_call_args ctx args param_types gen_value
+			| _ -> ());
+			spr ctx ")"
 			(* Stack-allocated objects don't need gc_push_temp_root - they're on the stack *)
 		end else begin
 			(* Normal heap allocation path *)
@@ -3640,10 +3965,18 @@ and gen_expr ctx e =
 		(* Generate try-catch using setjmp/longjmp *)
 		let jmp = temp ctx in
 		let exc = temp ctx in
+		let gc_save = temp ctx in
+		let stack_save = temp ctx in
 		spr ctx "{";
 		newline ctx;
 		ctx.tabs <- ctx.tabs ^ "\t";
 		print ctx "jmp_buf %s;" jmp;
+		newline ctx;
+		(* Save GC root count before try - will restore on exception *)
+		print ctx "size_t %s = FIB_CTX ? FIB_CTX->mTempRootCount : 0;" gc_save;
+		newline ctx;
+		(* Save stack frame count - longjmp bypasses cleanup handlers *)
+		print ctx "int %s = fib_current_fiber() ? fib_current_fiber()->stackFrameCount : 0;" stack_save;
 		newline ctx;
 		print ctx "fib_exc_push(&%s);" jmp;
 		newline ctx;
@@ -3658,36 +3991,69 @@ and gen_expr ctx e =
 		spr ctx "} else {";
 		newline ctx;
 		ctx.tabs <- ctx.tabs ^ "\t";
+		(* Restore GC roots to pre-try level - longjmp skipped cleanup code *)
+		print ctx "if (FIB_CTX && FIB_CTX->mTempRootCount > %s) FIB_CTX->mTempRootCount = %s;" gc_save gc_save;
+		newline ctx;
+		(* Restore stack frame count - longjmp bypassed cleanup handlers *)
+		print ctx "if (fib_current_fiber()) fib_current_fiber()->stackFrameCount = %s;" stack_save;
+		newline ctx;
 		print ctx "FibDynamic %s = fib_current_exception();" exc;
 		newline ctx;
 		(* Stop exception unwinding - exception stack is now complete *)
 		spr ctx "fib_exception_catch();";
 		newline ctx;
-		(* Generate catch clauses *)
+		(* Generate catch clauses with proper type checking *)
 		let first = ref true in
 		List.iter (fun (v, catch_e) ->
 			let catch_type = s_type ctx v.v_type in
+			(* Generate type check condition *)
+			let gen_type_check () =
+				if catch_type = "FibDynamic" then
+					(* Dynamic catches everything - no condition needed *)
+					spr ctx "1"
+				else if catch_type = "int32_t" then
+					print ctx "%s.type == FIB_TYPE_INT" exc
+				else if catch_type = "double" then
+					print ctx "%s.type == FIB_TYPE_FLOAT" exc
+				else if catch_type = "bool" then
+					print ctx "%s.type == FIB_TYPE_BOOL" exc
+				else if catch_type = "FibString*" then
+					print ctx "%s.type == FIB_TYPE_STRING" exc
+				else begin
+					(* Object type - check FIB_TYPE_OBJECT and instanceof *)
+					let class_name = String.sub catch_type 0 (String.length catch_type - 1) in (* Remove * *)
+					print ctx "(%s.type == FIB_TYPE_OBJECT && fib_object_instanceof(%s.data.objectVal, &%s_class))"
+						exc exc class_name
+				end
+			in
 			if !first then begin
 				first := false;
-				(* For Dynamic or first catch, just catch all *)
-				print ctx "/* catch %s:%s */" (ident v.v_name) catch_type
+				print ctx "if (";
+				gen_type_check ();
+				spr ctx ")"
 			end else begin
-				spr ctx " else ";
-				print ctx "/* catch %s:%s */" (ident v.v_name) catch_type
+				spr ctx " else if (";
+				gen_type_check ();
+				spr ctx ")"
 			end;
 			newline ctx;
 			spr ctx "{";
 			newline ctx;
 			ctx.tabs <- ctx.tabs ^ "\t";
-			(* Assign exception to catch variable *)
+			(* Assign exception to catch variable with proper extraction *)
 			print ctx "%s %s = " catch_type (ident v.v_name);
-			(* Coerce exception to catch type *)
 			if catch_type = "FibDynamic" then
 				print ctx "%s" exc
+			else if catch_type = "int32_t" then
+				print ctx "fib_dynamic_to_int(%s)" exc
+			else if catch_type = "double" then
+				print ctx "fib_dynamic_to_float(%s)" exc
+			else if catch_type = "bool" then
+				print ctx "%s.data.boolVal" exc
 			else if catch_type = "FibString*" then
 				print ctx "fib_dynamic_to_string(%s)" exc
 			else
-				print ctx "(%s)fib_dynamic_to_object(%s)" catch_type exc;
+				print ctx "(%s)%s.data.objectVal" catch_type exc;
 			spr ctx ";";
 			newline ctx;
 			gen_expr ctx catch_e;
@@ -3722,14 +4088,14 @@ and gen_expr ctx e =
 				if is_simple then begin
 					print ctx "gc_pop_temp_roots_ctx(FIB_CTX, %d); return " ctx.gc_local_count;
 					(match ctx.current_ret_type with
-					| Some ret_type -> gen_coerce ctx e.etype ret_type (fun () -> gen_value ctx e)
+					| Some ret_type -> gen_coerce_with_expr ctx e.etype ret_type (Some e) (fun () -> gen_value ctx e)
 					| None -> gen_value ctx e)
 				end else begin
 					(* Evaluate into temp, then pop, then return *)
 					spr ctx "{ ";
 					print ctx "%s __ret = " ret_type;
 					(match ctx.current_ret_type with
-					| Some ret_type -> gen_coerce ctx e.etype ret_type (fun () -> gen_value ctx e)
+					| Some ret_type -> gen_coerce_with_expr ctx e.etype ret_type (Some e) (fun () -> gen_value ctx e)
 					| None -> gen_value ctx e);
 					print ctx "; gc_pop_temp_roots_ctx(FIB_CTX, %d); return __ret; }" ctx.gc_local_count
 				end)
@@ -3745,7 +4111,7 @@ and gen_expr ctx e =
 				spr ctx "return ";
 				(match ctx.current_ret_type with
 				| Some ret_type ->
-					gen_coerce ctx e.etype ret_type (fun () -> gen_value ctx e)
+					gen_coerce_with_expr ctx e.etype ret_type (Some e) (fun () -> gen_value ctx e)
 				| None ->
 					gen_value ctx e)
 		end
@@ -3754,7 +4120,7 @@ and gen_expr ctx e =
 	| TThrow e ->
 		(* Begin exception unwinding - captures stack frames as we unwind *)
 		spr ctx "fib_exception_begin(); fib_throw(";
-		(* Box the value if it's not already a FibDynamic *)
+		(* Box the value into FibDynamic based on its type *)
 		let throw_type = s_type ctx e.etype in
 		if throw_type = "FibDynamic" then
 			gen_value ctx e
@@ -3762,6 +4128,24 @@ and gen_expr ctx e =
 			spr ctx "fib_string_to_dynamic(";
 			gen_value ctx e;
 			spr ctx ")"
+		end else if throw_type = "int32_t" then begin
+			spr ctx "fib_dynamic_int(";
+			gen_value ctx e;
+			spr ctx ")"
+		end else if throw_type = "double" then begin
+			spr ctx "fib_dynamic_float(";
+			gen_value ctx e;
+			spr ctx ")"
+		end else if throw_type = "bool" then begin
+			spr ctx "fib_dynamic_bool(";
+			gen_value ctx e;
+			spr ctx ")"
+		end else if is_enum_struct_type throw_type then begin
+			(* For enum values (value types), box with fib_dynamic_enum.
+			   Need to use statement expression with temp var since we can't take address of function return. *)
+			print ctx "({ %s _enum_tmp = " throw_type;
+			gen_value ctx e;
+			print ctx "; fib_dynamic_enum(&_enum_tmp, sizeof(%s)); })" throw_type
 		end else begin
 			(* For objects/exceptions, wrap in FibDynamic *)
 			spr ctx "fib_dynamic_object((FibObject*)";
@@ -3771,20 +4155,21 @@ and gen_expr ctx e =
 		spr ctx ")"
 
 let gen_function ctx name f c is_static =
-	let ret_type = s_type ctx f.tf_type in
 	let class_name = flat_path c.cl_path in
 	(* Filter out void-typed parameters *)
 	let filtered_args = filter_void_args f.tf_args in
 	let args = List.map (fun (v, _) ->
 		s_type_with_name ctx v.v_type (ident v.v_name)
 	) filtered_args in
-	let args_str = if args = [] then "void" else String.concat ", " args in
-	if is_static then
-		print ctx "%s %s_%s(%s)" ret_type class_name name args_str
-	else
-		print ctx "%s %s_%s(%s* this%s)" ret_type class_name name
-			class_name
-			(if args = [] then "" else ", " ^ String.concat ", " args);
+	let func_name = Printf.sprintf "%s_%s" class_name name in
+	let args_str =
+		if is_static then
+			if args = [] then "void" else String.concat ", " args
+		else
+			let this_arg = Printf.sprintf "%s* this" class_name in
+			if args = [] then this_arg else this_arg ^ ", " ^ String.concat ", " args
+	in
+	spr ctx (s_func_decl ctx f.tf_type func_name args_str);
 	spr ctx " {";
 	newline ctx;
 	ctx.tabs <- ctx.tabs ^ "\t";
@@ -3995,6 +4380,177 @@ let gen_constructor ctx c =
 			end
 		| _ -> ())
 
+(* Generate method thunks - wrapper functions that adapt methods to closure calling convention.
+ * A thunk like __Calculator_staticAdd_thunk(FibClosure* _c, int a, int b) calls
+ * Calculator_staticAdd(a, b), allowing the method to be used as a FibClosure*.
+ *
+ * Also generates dynamic thunks (_dyn suffix) that take FibDynamic params for dynamic calls.
+ *)
+let gen_method_thunks ctx =
+	if Hashtbl.length ctx.method_thunks = 0 then () else begin
+		newline ctx;
+		spr ctx "/* Method thunks for closure wrapping */";
+		newline ctx;
+		Hashtbl.iter (fun thunk_name (is_static, class_path, method_name, arg_types, ret_type) ->
+			let class_name = flat_path class_path in
+			(* Generate return type - use FibClosure* for function returns *)
+			let ret_str = match follow ret_type with
+				| TFun _ -> "FibClosure*"
+				| _ -> s_type ctx ret_type
+			in
+			(* Generate parameter list: FibClosure* _c, then the actual params *)
+			let param_strs = List.mapi (fun i (name, t) ->
+				let param_name = if name = "" then Printf.sprintf "_arg%d" i else ident name in
+				s_type_with_name ctx t param_name
+			) arg_types in
+			let all_params = "FibClosure* _c" :: param_strs in
+			print ctx "static %s %s(%s) {" ret_str thunk_name (String.concat ", " all_params);
+			newline ctx;
+			ctx.tabs <- "\t";
+			(* Generate the call to the actual method *)
+			if ret_str <> "void" then spr ctx "return ";
+			print ctx "%s_%s(" class_name (ident method_name);
+			(* For instance methods, extract 'this' from captures[0] *)
+			if not is_static then begin
+				(* Instance method - extract 'this' pointer from captures[0] *)
+				print ctx "(%s*)fib_dynamic_to_object(_c->captures[0])" class_name;
+				if arg_types <> [] then spr ctx ", "
+			end;
+			let arg_names = List.mapi (fun i (name, _) ->
+				if name = "" then Printf.sprintf "_arg%d" i else ident name
+			) arg_types in
+			spr ctx (String.concat ", " arg_names);
+			spr ctx ");";
+			newline ctx;
+			ctx.tabs <- "";
+			spr ctx "}";
+			newline ctx;
+			
+			(* Generate dynamic thunk that takes FibDynamic params *)
+			let dyn_thunk_name = thunk_name ^ "_dyn" in
+			let dyn_param_strs = List.mapi (fun i _ -> Printf.sprintf "FibDynamic _arg%d" i) arg_types in
+			let all_dyn_params = "FibClosure* _c" :: dyn_param_strs in
+			print ctx "static FibDynamic %s(%s) {" dyn_thunk_name (String.concat ", " all_dyn_params);
+			newline ctx;
+			ctx.tabs <- "\t";
+			(* Convert FibDynamic args to typed args *)
+			List.iteri (fun i (_, t) ->
+				let vtype = match follow t with
+					| TFun _ -> "FibClosure*"
+					| _ -> s_type ctx t
+				in
+				let conv = 
+					if vtype = "int32_t" then Printf.sprintf "fib_dynamic_to_int(_arg%d)" i
+					else if vtype = "double" then Printf.sprintf "fib_dynamic_to_float(_arg%d)" i
+					else if vtype = "bool" then Printf.sprintf "fib_dynamic_to_bool(_arg%d)" i
+					else if vtype = "FibString*" then Printf.sprintf "fib_dynamic_to_string(_arg%d)" i
+					else if vtype = "int64_t" then Printf.sprintf "fib_dynamic_to_int64(_arg%d)" i
+					else if vtype = "FibClosure*" then Printf.sprintf "(FibClosure*)fib_dynamic_to_object(_arg%d)" i
+					else if vtype = "FibDynamic" then Printf.sprintf "_arg%d" i
+					else Printf.sprintf "(%s)fib_dynamic_to_object(_arg%d)" vtype i
+				in
+				print ctx "%s _typed%d = %s;" vtype i conv;
+				newline ctx
+			) arg_types;
+			(* Call the typed thunk *)
+			let typed_call_args = List.mapi (fun i _ -> Printf.sprintf "_typed%d" i) arg_types in
+			let call_args_str = String.concat ", " ("_c" :: typed_call_args) in
+			if ret_str = "void" then begin
+				print ctx "%s(%s);" thunk_name call_args_str;
+				newline ctx;
+				spr ctx "return fib_dynamic_null();";
+				newline ctx
+			end else begin
+				let ret_conv = 
+					if ret_str = "int32_t" then Printf.sprintf "fib_dynamic_int(%s(%s))" thunk_name call_args_str
+					else if ret_str = "double" then Printf.sprintf "fib_dynamic_float(%s(%s))" thunk_name call_args_str
+					else if ret_str = "bool" then Printf.sprintf "fib_dynamic_bool(%s(%s))" thunk_name call_args_str
+					else if ret_str = "FibString*" then Printf.sprintf "fib_dynamic_string(%s(%s))" thunk_name call_args_str
+					else if ret_str = "int64_t" then Printf.sprintf "fib_dynamic_int64(%s(%s))" thunk_name call_args_str
+					else if ret_str = "FibClosure*" then Printf.sprintf "fib_dynamic_object((FibObject*)%s(%s))" thunk_name call_args_str
+					else if ret_str = "FibDynamic" then Printf.sprintf "%s(%s)" thunk_name call_args_str
+					else Printf.sprintf "fib_dynamic_object((FibObject*)%s(%s))" thunk_name call_args_str
+				in
+				print ctx "return %s;" ret_conv;
+				newline ctx
+			end;
+			ctx.tabs <- "";
+			spr ctx "}";
+			newline ctx
+		) ctx.method_thunks;
+		newline ctx;
+		(* Clear the thunks table for the next class *)
+		Hashtbl.clear ctx.method_thunks
+	end
+
+(* Pre-scan a class to find method references that need thunks *)
+let prescan_class_for_thunks ctx c =
+	let rec scan_expr e =
+		match e.eexpr with
+		| TField (e, fa) ->
+			scan_expr e;
+			(match fa with
+			| FClosure (Some (cls, _), cf) ->
+				let class_name = flat_path cls.cl_path in
+				let method_name = ident cf.cf_name in
+				let thunk_name = Printf.sprintf "__%s_%s_thunk" class_name method_name in
+				let is_static = List.exists (fun scf -> scf.cf_name = cf.cf_name) cls.cl_ordered_statics in
+				let arg_types, ret_type = match follow cf.cf_type with
+					| TFun (args, ret) -> (List.map (fun (n, _, t) -> (n, t)) args, ret)
+					| _ -> ([], t_dynamic)
+				in
+				Hashtbl.replace ctx.method_thunks thunk_name (is_static, cls.cl_path, cf.cf_name, arg_types, ret_type)
+			| _ -> ())
+		| TBlock el -> List.iter scan_expr el
+		| TFunction f -> scan_expr f.tf_expr
+		| TIf (econd, eif, eelse) ->
+			scan_expr econd; scan_expr eif;
+			(match eelse with Some e -> scan_expr e | None -> ())
+		| TWhile (econd, ebody, _) -> scan_expr econd; scan_expr ebody
+		| TSwitch sw ->
+			scan_expr sw.switch_subject;
+			List.iter (fun case -> List.iter scan_expr case.case_patterns; scan_expr case.case_expr) sw.switch_cases;
+			(match sw.switch_default with Some e -> scan_expr e | None -> ())
+		| TTry (e, catches) ->
+			scan_expr e;
+			List.iter (fun (_, e) -> scan_expr e) catches
+		| TReturn (Some e) -> scan_expr e
+		| TVar (_, Some e) -> scan_expr e
+		| TBinop (_, e1, e2) -> scan_expr e1; scan_expr e2
+		| TUnop (_, _, e) -> scan_expr e
+		| TCall (e, args) -> scan_expr e; List.iter scan_expr args
+		| TParenthesis e -> scan_expr e
+		| TArray (e1, e2) -> scan_expr e1; scan_expr e2
+		| TArrayDecl el -> List.iter scan_expr el
+		| TObjectDecl fields -> List.iter (fun ((_, _, _), e) -> scan_expr e) fields
+		| TCast (e, _) -> scan_expr e
+		| TMeta (_, e) -> scan_expr e
+		| TEnumParameter (e, _, _) -> scan_expr e
+		| TEnumIndex e -> scan_expr e
+		| TNew (_, _, args) -> List.iter scan_expr args
+		| TThrow e -> scan_expr e
+		| _ -> ()
+	in
+	(* Scan constructor *)
+	(match c.cl_constructor with
+	| Some cf ->
+		(match cf.cf_expr with
+		| Some e -> scan_expr e
+		| None -> ())
+	| None -> ());
+	(* Scan static methods *)
+	List.iter (fun cf ->
+		match cf.cf_kind, cf.cf_expr with
+		| Method _, Some e -> scan_expr e
+		| _ -> ()
+	) c.cl_ordered_statics;
+	(* Scan instance methods *)
+	List.iter (fun cf ->
+		match cf.cf_kind, cf.cf_expr with
+		| Method _, Some e -> scan_expr e
+		| _ -> ()
+	) c.cl_ordered_fields
+
 (* Generate a single class to its own .c file - returns the class implementation as string *)
 let gen_class_impl ctx c =
 	if has_class_flag c CExtern then "" else begin
@@ -4003,8 +4559,35 @@ let gen_class_impl ctx c =
 		let class_name = flat_path c.cl_path in
 		let class_id = get_class_id ctx c.cl_path in
 
+		(* Pre-scan to collect method thunks needed *)
+		prescan_class_for_thunks ctx c;
+
 		Buffer.clear ctx.buf;
 		ctx.tabs <- "";
+
+		(* Generate method thunk forward declarations at the top *)
+		if Hashtbl.length ctx.method_thunks > 0 then begin
+			spr ctx "/* Method thunk forward declarations */\n";
+			Hashtbl.iter (fun thunk_name (_, _, _, arg_types, ret_type) ->
+				let ret_str = match follow ret_type with
+					| TFun _ -> "FibClosure*"
+					| _ -> s_type ctx ret_type
+				in
+				(* Typed thunk forward declaration *)
+				let param_strs = List.mapi (fun i (name, t) ->
+					let param_name = if name = "" then Printf.sprintf "_arg%d" i else ident name in
+					s_type_with_name ctx t param_name
+				) arg_types in
+				let all_params = "FibClosure* _c" :: param_strs in
+				print ctx "static %s %s(%s);\n" ret_str thunk_name (String.concat ", " all_params);
+				(* Dynamic thunk forward declaration *)
+				let dyn_thunk_name = thunk_name ^ "_dyn" in
+				let dyn_param_strs = List.mapi (fun i _ -> Printf.sprintf "FibDynamic _arg%d" i) arg_types in
+				let all_dyn_params = "FibClosure* _c" :: dyn_param_strs in
+				print ctx "static FibDynamic %s(%s);\n" dyn_thunk_name (String.concat ", " all_dyn_params)
+			) ctx.method_thunks;
+			spr ctx "\n"
+		end;
 
 		(* Collect instance fields that need GC marking *)
 		let gc_fields = List.filter (fun cf ->
@@ -4028,6 +4611,56 @@ let gen_class_impl ctx c =
 				newline ctx
 			) gc_fields;
 			spr ctx "}";
+			newline ctx;
+			newline ctx
+		end;
+
+		(* Generate vtable array if class has virtual methods *)
+		let vtable_methods = match ctx.vtable_ctx with
+			| Some vctx -> GenfiberusVtable.get_vtable_methods vctx c
+			| None -> []
+		in
+		(* Vtable size is max_slot + 1, not count of methods *)
+		let vtable_size = match vtable_methods with
+			| [] -> 0
+			| _ -> 
+				let max_slot = List.fold_left (fun acc (slot, _, _) -> max acc slot) 0 vtable_methods in
+				max_slot + 1
+		in
+		if vtable_size > 0 then begin
+			print ctx "static void* %s_vtable[%d] = {" class_name vtable_size;
+			newline ctx;
+			(* Create a slot-indexed array for proper placement *)
+			let slot_array = Array.make vtable_size None in
+			List.iter (fun (slot, method_name, _cf) ->
+				(* Find which class actually implements this method *)
+				let impl_class = 
+					let rec find_impl c =
+						if List.exists (fun cf2 -> cf2.cf_name = method_name && GenfiberusVtable.is_instance_method cf2) c.cl_ordered_fields then
+							c
+						else match c.cl_super with
+							| Some (parent, _) -> find_impl parent
+							| None -> c (* fallback to current class *)
+					in
+					find_impl c
+				in
+				slot_array.(slot) <- Some (impl_class, method_name)
+			) vtable_methods;
+			(* Generate entries in slot order *)
+			for i = 0 to vtable_size - 1 do
+				ctx.tabs <- "\t";
+				(match slot_array.(i) with
+				| Some (impl_class, method_name) ->
+					let impl_class_name = flat_path impl_class.cl_path in
+					print ctx "(void*)%s_%s" impl_class_name (ident method_name)
+				| None ->
+					spr ctx "NULL");
+				if i < vtable_size - 1 then spr ctx ",";
+				print ctx " /* slot %d */" i;
+				newline ctx
+			done;
+			ctx.tabs <- "";
+			spr ctx "};";
 			newline ctx;
 			newline ctx
 		end;
@@ -4061,7 +4694,15 @@ let gen_class_impl ctx c =
 		newline ctx;
 		spr ctx ".fieldNames = NULL,";
 		newline ctx;
-		spr ctx ".fieldCount = 0";
+		spr ctx ".fieldCount = 0,";
+		newline ctx;
+		(* Vtable fields *)
+		if vtable_size > 0 then
+			print ctx ".vtable = %s_vtable," class_name
+		else
+			spr ctx ".vtable = NULL,";
+		newline ctx;
+		print ctx ".vtableSize = %d" vtable_size;
 		newline ctx;
 		ctx.tabs <- "";
 		spr ctx "};";
@@ -4164,7 +4805,21 @@ let gen_class_impl ctx c =
 				| TUnop (_, _, e) -> scan_expr e
 				| TCall (e, args) -> scan_expr e; List.iter scan_expr args
 				| TParenthesis e -> scan_expr e
-				| TField (e, _) -> scan_expr e
+				| TField (e, fa) ->
+				scan_expr e;
+				(* Check for method references that need thunks *)
+				(match fa with
+				| FClosure (Some (c, _), cf) ->
+					let class_name = flat_path c.cl_path in
+					let method_name = ident cf.cf_name in
+					let thunk_name = Printf.sprintf "__%s_%s_thunk" class_name method_name in
+					let is_static = List.exists (fun scf -> scf.cf_name = cf.cf_name) c.cl_ordered_statics in
+					let arg_types, ret_type = match follow cf.cf_type with
+						| TFun (args, ret) -> (List.map (fun (n, _, t) -> (n, t)) args, ret)
+						| _ -> ([], t_dynamic)
+					in
+					Hashtbl.replace ctx.method_thunks thunk_name (is_static, c.cl_path, cf.cf_name, arg_types, ret_type)
+				| _ -> ())
 				| TArray (e1, e2) -> scan_expr e1; scan_expr e2
 				| TArrayDecl el -> List.iter scan_expr el
 				| TObjectDecl fields -> List.iter (fun (_, e) -> scan_expr e) fields
@@ -4187,21 +4842,27 @@ let gen_class_impl ctx c =
 			) initial_closures;
 
 			(* Forward declarations for ALL closures (including nested ones) *)
+			(* Note: The thunks always take FibDynamic params and return FibDynamic *)
 			spr ctx "/* Closure forward declarations */\n";
 			List.iter (fun (name, f, _captured) ->
-				(* Determine return type - if TFun, use FibClosure* since closures return closures *)
 				let ret_type = match follow f.tf_type with
 					| TFun _ -> "FibClosure*"
 					| _ -> s_type ctx f.tf_type
 				in
 				let filtered_args = filter_void_args f.tf_args in
-				let args = List.map (fun (v, _) ->
+				(* Forward declaration for typed impl function *)
+				let impl_name = name ^ "_impl" in
+				let typed_args = List.map (fun (v, _) ->
 					s_type_with_name ctx v.v_type (ident v.v_name)
 				) filtered_args in
-				(* All closures take FibClosure* as first parameter *)
-				let all_args = "FibClosure* _closure" :: args in
-				let args_str = String.concat ", " all_args in
-				print ctx "static %s %s(%s);\n" ret_type name args_str
+				let all_typed_args = "FibClosure* _closure" :: typed_args in
+				let typed_args_str = String.concat ", " all_typed_args in
+				print ctx "static %s %s(%s);\n" ret_type impl_name typed_args_str;
+				(* Forward declaration for dynamic thunk *)
+				let dyn_args = List.mapi (fun i _ -> Printf.sprintf "FibDynamic _arg%d" i) filtered_args in
+				let all_dyn_args = "FibClosure* _closure" :: dyn_args in
+				let dyn_args_str = String.concat ", " all_dyn_args in
+				print ctx "static FibDynamic %s(%s);\n" name dyn_args_str
 			) (List.rev ctx.closures);
 			spr ctx "\n";
 
@@ -4227,7 +4888,9 @@ let gen_class_impl ctx c =
 				) filtered_args in
 				let all_args = "FibClosure* _closure" :: args in
 				let args_str = String.concat ", " all_args in
-				print ctx "static %s %s(%s) {" ret_type name args_str;
+				(* Generate the typed implementation function as _closure_N_impl *)
+				let impl_name = name ^ "_impl" in
+				print ctx "static %s %s(%s) {" ret_type impl_name args_str;
 				newline ctx;
 				ctx.tabs <- "\t";
 				(* Cache GC context at closure entry *)
@@ -4235,9 +4898,9 @@ let gen_class_impl ctx c =
 				newline ctx;
 				(* Add stack frame for Tracy profiling *)
 				if ctx.debug_level > 0 then begin
-					print ctx "FIB_LOCAL_STACK_FRAME(_fib_pos_%s, \"<closure>\", \"%s\", \"<closure>.%s\", \"generated\", 0);" name name name;
+					print ctx "FIB_LOCAL_STACK_FRAME(_fib_pos_%s, \"<closure>\", \"%s\", \"<closure>.%s\", \"generated\", 0);" impl_name name name;
 					newline ctx;
-					print ctx "FIB_STACKFRAME(&_fib_pos_%s);" name;
+					print ctx "FIB_STACKFRAME(&_fib_pos_%s);" impl_name;
 					newline ctx
 				end;
 				ctx.current_ret_type <- Some f.tf_type;
@@ -4289,11 +4952,71 @@ let gen_class_impl ctx c =
 				ctx.tabs <- "";
 				spr ctx "}";
 				newline ctx;
+				newline ctx;
+				
+				(* Generate the dynamic thunk that takes FibDynamic params and calls the impl *)
+				(* This thunk is what gets stored in the FibClosure and called via fib_closure_call_dynamic *)
+				let num_args = List.length filtered_args in
+				let dyn_args = List.mapi (fun i _ -> Printf.sprintf "FibDynamic _arg%d" i) filtered_args in
+				let all_dyn_args = "FibClosure* _closure" :: dyn_args in
+				let dyn_args_str = String.concat ", " all_dyn_args in
+				let dyn_ret = if ret_type = "void" then "FibDynamic" else "FibDynamic" in
+				print ctx "static %s %s(%s) {" dyn_ret name dyn_args_str;
+				newline ctx;
+				ctx.tabs <- "\t";
+				(* Convert each FibDynamic arg to the typed parameter *)
+				List.iteri (fun i (v, _) ->
+					let vtype = match follow v.v_type with
+						| TFun _ -> "FibClosure*"
+						| _ -> s_type ctx v.v_type
+					in
+					let conv = 
+						if vtype = "int32_t" then Printf.sprintf "fib_dynamic_to_int(_arg%d)" i
+						else if vtype = "double" then Printf.sprintf "fib_dynamic_to_float(_arg%d)" i
+						else if vtype = "bool" then Printf.sprintf "fib_dynamic_to_bool(_arg%d)" i
+						else if vtype = "FibString*" then Printf.sprintf "fib_dynamic_to_string(_arg%d)" i
+						else if vtype = "int64_t" then Printf.sprintf "fib_dynamic_to_int64(_arg%d)" i
+						else if vtype = "FibClosure*" then Printf.sprintf "(FibClosure*)fib_dynamic_to_object(_arg%d)" i
+						else if vtype = "FibDynamic" then Printf.sprintf "_arg%d" i  (* Pass through unchanged *)
+						else Printf.sprintf "(%s)fib_dynamic_to_object(_arg%d)" vtype i
+					in
+					print ctx "%s _typed%d = %s;" vtype i conv;
+					newline ctx
+				) filtered_args;
+				(* Call the impl function *)
+				let typed_call_args = List.mapi (fun i _ -> Printf.sprintf "_typed%d" i) filtered_args in
+				let call_args_str = String.concat ", " ("_closure" :: typed_call_args) in
+				if ret_type = "void" then begin
+					print ctx "%s(%s);" impl_name call_args_str;
+					newline ctx;
+					spr ctx "return fib_dynamic_null();";
+					newline ctx
+				end else begin
+					(* Convert return value to FibDynamic *)
+					let ret_conv = 
+						if ret_type = "int32_t" then Printf.sprintf "fib_dynamic_int(%s(%s))" impl_name call_args_str
+						else if ret_type = "double" then Printf.sprintf "fib_dynamic_float(%s(%s))" impl_name call_args_str
+						else if ret_type = "bool" then Printf.sprintf "fib_dynamic_bool(%s(%s))" impl_name call_args_str
+						else if ret_type = "FibString*" then Printf.sprintf "fib_dynamic_string(%s(%s))" impl_name call_args_str
+						else if ret_type = "int64_t" then Printf.sprintf "fib_dynamic_int64(%s(%s))" impl_name call_args_str
+						else if ret_type = "FibClosure*" then Printf.sprintf "fib_dynamic_object((FibObject*)%s(%s))" impl_name call_args_str
+						else if ret_type = "FibDynamic" then Printf.sprintf "%s(%s)" impl_name call_args_str
+						else Printf.sprintf "fib_dynamic_object((FibObject*)%s(%s))" impl_name call_args_str
+					in
+					print ctx "return %s;" ret_conv;
+					newline ctx
+				end;
+				ctx.tabs <- "";
+				spr ctx "}";
+				newline ctx;
 				newline ctx
 			) (List.rev ctx.closures);
 			ctx.in_closure_impl <- false;
 			ctx.closures <- []
 		end;
+
+		(* Generate method thunks for any methods used as values *)
+		gen_method_thunks ctx;
 
 		(* Clear current class *)
 		ctx.current_class <- None;
@@ -4385,6 +5108,7 @@ let gen_header ctx com =
 	spr ctx "#include \"closure.h\"\n";
 	spr ctx "#include \"scheduler.h\"\n";
 	spr ctx "#include \"counter.h\"\n";
+	spr ctx "#include \"iouring.h\"\n";
 	spr ctx "\n";
 
 	(* Fiber yield point macro - uses runtime scheduler_should_yield from scheduler.h *)
@@ -4653,19 +5377,32 @@ let gen_header ctx com =
 	spr ctx "void haxe_Exception_init(haxe_Exception* this, FibString* message, haxe_Exception* previous, FibDynamic native);\n";
 	spr ctx "haxe_Exception* haxe_Exception_new(FibString* message, haxe_Exception* previous, FibDynamic native);\n\n";
 
-	(* Exception handling using setjmp/longjmp *)
-	spr ctx "/* Exception handling */\n";
-	spr ctx "#define FIB_EXC_STACK_SIZE 64\n";
-	spr ctx "extern jmp_buf* _fib_exc_stack[FIB_EXC_STACK_SIZE];\n";
-	spr ctx "extern int _fib_exc_stack_top;\n";
-	spr ctx "extern FibDynamic _fib_current_exception;\n\n";
+	(* Exception handling using setjmp/longjmp - per-fiber exception stack with thread-local fallback *)
+	spr ctx "/* Exception handling - per-fiber stacks with thread-local fallback */\n";
+	spr ctx "#define FIB_TLS_EXC_STACK_SIZE 64\n";
+	spr ctx "extern __thread jmp_buf* _fib_tls_exc_stack[FIB_TLS_EXC_STACK_SIZE];\n";
+	spr ctx "extern __thread int _fib_tls_exc_stack_top;\n";
+	spr ctx "extern __thread FibDynamic _fib_current_exception;\n\n";
 	spr ctx "static inline void fib_exc_push(jmp_buf* buf) {\n";
-	spr ctx "\tif (_fib_exc_stack_top < FIB_EXC_STACK_SIZE) {\n";
-	spr ctx "\t\t_fib_exc_stack[_fib_exc_stack_top++] = buf;\n";
+	spr ctx "\tFiber* f = fiber_current();\n";
+	spr ctx "\tif (f) {\n";
+	spr ctx "\t\tif (f->exc_stack_top < FIBER_EXC_STACK_SIZE) {\n";
+	spr ctx "\t\t\tf->exc_stack[f->exc_stack_top++] = buf;\n";
+	spr ctx "\t\t}\n";
+	spr ctx "\t} else {\n";
+	spr ctx "\t\t/* No fiber context - use thread-local fallback */\n";
+	spr ctx "\t\tif (_fib_tls_exc_stack_top < FIB_TLS_EXC_STACK_SIZE) {\n";
+	spr ctx "\t\t\t_fib_tls_exc_stack[_fib_tls_exc_stack_top++] = buf;\n";
+	spr ctx "\t\t}\n";
 	spr ctx "\t}\n";
 	spr ctx "}\n\n";
 	spr ctx "static inline void fib_exc_pop(void) {\n";
-	spr ctx "\tif (_fib_exc_stack_top > 0) _fib_exc_stack_top--;\n";
+	spr ctx "\tFiber* f = fiber_current();\n";
+	spr ctx "\tif (f) {\n";
+	spr ctx "\t\tif (f->exc_stack_top > 0) f->exc_stack_top--;\n";
+	spr ctx "\t} else {\n";
+	spr ctx "\t\tif (_fib_tls_exc_stack_top > 0) _fib_tls_exc_stack_top--;\n";
+	spr ctx "\t}\n";
 	spr ctx "}\n\n";
 	spr ctx "static inline FibDynamic fib_current_exception(void) {\n";
 	spr ctx "\treturn _fib_current_exception;\n";
@@ -4849,13 +5586,14 @@ let gen_header ctx com =
 			List.iter (fun cf ->
 				match cf.cf_expr with
 				| Some { eexpr = TFunction f } ->
-					let ret_type = s_type ctx f.tf_type in
 					let filtered_args = filter_void_args f.tf_args in
 					let args = List.map (fun (v, _) ->
 						s_type_with_name ctx v.v_type (ident v.v_name)
 					) filtered_args in
 					let args_str = if args = [] then "void" else String.concat ", " args in
-					print ctx "%s %s_%s(%s);" ret_type (flat_path c.cl_path) cf.cf_name args_str;
+					let func_name = Printf.sprintf "%s_%s" (flat_path c.cl_path) cf.cf_name in
+					spr ctx (s_func_decl ctx f.tf_type func_name args_str);
+					spr ctx ";";
 					newline ctx
 				| _ -> ()
 			) c.cl_ordered_statics;
@@ -4863,15 +5601,15 @@ let gen_header ctx com =
 			List.iter (fun cf ->
 				match cf.cf_expr with
 				| Some { eexpr = TFunction f } ->
-					let ret_type = s_type ctx f.tf_type in
 					let filtered_args = filter_void_args f.tf_args in
 					let args = List.map (fun (v, _) ->
 						s_type_with_name ctx v.v_type (ident v.v_name)
 					) filtered_args in
-					let args_str = String.concat ", " args in
-					print ctx "%s %s_%s(%s* this%s);" ret_type (flat_path c.cl_path) cf.cf_name
-						(flat_path c.cl_path)
-						(if args_str = "" then "" else ", " ^ args_str);
+					let this_arg = Printf.sprintf "%s* this" (flat_path c.cl_path) in
+					let args_str = if args = [] then this_arg else this_arg ^ ", " ^ String.concat ", " args in
+					let func_name = Printf.sprintf "%s_%s" (flat_path c.cl_path) cf.cf_name in
+					spr ctx (s_func_decl ctx f.tf_type func_name args_str);
+					spr ctx ";";
 					newline ctx
 				| _ -> ()
 			) c.cl_ordered_fields
@@ -4907,14 +5645,18 @@ let gen_runtime_globals gc_roots =
 	let buf = Buffer.create 1024 in
 	Buffer.add_string buf "/* Runtime globals */\n";
 	Buffer.add_string buf "#include \"fiberus_generated.h\"\n\n";
-	Buffer.add_string buf "/* Exception handling globals */\n";
-	Buffer.add_string buf "jmp_buf* _fib_exc_stack[FIB_EXC_STACK_SIZE];\n";
-	Buffer.add_string buf "int _fib_exc_stack_top = 0;\n";
-	Buffer.add_string buf "FibDynamic _fib_current_exception = {0};\n\n";
+	Buffer.add_string buf "/* Exception handling - thread-local fallback stack and current exception */\n";
+	Buffer.add_string buf "__thread jmp_buf* _fib_tls_exc_stack[FIB_TLS_EXC_STACK_SIZE];\n";
+	Buffer.add_string buf "__thread int _fib_tls_exc_stack_top = 0;\n";
+	Buffer.add_string buf "__thread FibDynamic _fib_current_exception = {0};\n\n";
 	Buffer.add_string buf "void fib_throw(FibDynamic exc) {\n";
 	Buffer.add_string buf "\t_fib_current_exception = exc;\n";
-	Buffer.add_string buf "\tif (_fib_exc_stack_top > 0) {\n";
-	Buffer.add_string buf "\t\tlongjmp(*_fib_exc_stack[--_fib_exc_stack_top], 1);\n";
+	Buffer.add_string buf "\tFiber* f = fiber_current();\n";
+	Buffer.add_string buf "\tif (f && f->exc_stack_top > 0) {\n";
+	Buffer.add_string buf "\t\tlongjmp(*(jmp_buf*)f->exc_stack[--f->exc_stack_top], 1);\n";
+	Buffer.add_string buf "\t} else if (_fib_tls_exc_stack_top > 0) {\n";
+	Buffer.add_string buf "\t\t/* Fallback to thread-local stack when no fiber context */\n";
+	Buffer.add_string buf "\t\tlongjmp(*_fib_tls_exc_stack[--_fib_tls_exc_stack_top], 1);\n";
 	Buffer.add_string buf "\t} else {\n";
 	Buffer.add_string buf "\t\tfprintf(stderr, \"Uncaught exception\\n\");\n";
 	Buffer.add_string buf "\t\texit(1);\n";
@@ -4989,7 +5731,12 @@ let generate com =
 		loop_depth = 0;
 		has_gc_ctx = false;
 		stack_alloc_vars = Hashtbl.create 0;
+		vtable_ctx = None;
+		method_thunks = Hashtbl.create 16;
 	} in
+
+	(* Build vtables for all classes - enables virtual method dispatch *)
+	ctx.vtable_ctx <- Some (GenfiberusVtable.build_all_vtables com.types);
 
 	(* Create output directory and src subdirectory *)
 	let dir = com.file in
@@ -5133,6 +5880,8 @@ let generate com =
 	let tracy_enabled = Gctx.raw_defined com "FIBERUS_TRACY" in
 	let tracy_no_exit = Gctx.raw_defined com "TRACY_NO_EXIT" in
 	let tracy_on_demand = Gctx.raw_defined com "TRACY_ON_DEMAND" in
+	(* Check for io_uring define *)
+	let iouring_enabled = Gctx.raw_defined com "iouring" in
 
 	(* Generate Build.xml *)
 	let build_xml = Buffer.create 1024 in
@@ -5145,6 +5894,8 @@ let generate com =
 		Buffer.add_string build_xml "<set name=\"TRACY_NO_EXIT\" value=\"1\" />\n";
 	if tracy_on_demand then
 		Buffer.add_string build_xml "<set name=\"TRACY_ON_DEMAND\" value=\"1\" />\n";
+	if iouring_enabled then
+		Buffer.add_string build_xml "<set name=\"iouring\" value=\"1\" />\n";
 	Buffer.add_string build_xml "<include name=\"${FIBERUS}/build-tool/BuildCommon.xml\"/>\n\n";
 	Buffer.add_string build_xml "<!-- Generated Haxe code -->\n";
 	Buffer.add_string build_xml "<files id=\"haxe\" dir=\"src\" tags=\"fiberus\">\n";
@@ -5161,6 +5912,8 @@ let generate com =
 		Buffer.add_string build_xml "  <files id=\"tracy\"/>\n";
 	Buffer.add_string build_xml "  <lib name=\"-lpthread\" if=\"linux\"/>\n";
 	Buffer.add_string build_xml "  <lib name=\"-ldl\" if=\"linux\"/>\n";
+	if iouring_enabled then
+		Buffer.add_string build_xml "  <lib name=\"-luring\" if=\"linux\"/>\n";
 	Buffer.add_string build_xml "  <outdir name=\"./\"/>\n";
 	Buffer.add_string build_xml "</target>\n\n";
 	Buffer.add_string build_xml "</xml>\n";
