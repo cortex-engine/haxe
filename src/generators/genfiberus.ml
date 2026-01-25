@@ -302,21 +302,35 @@ let get_array_elem_type ctx t =
 	| TInst ({ cl_path = ([], "Array") }, [elem_t]) -> s_type ctx elem_t
 	| _ -> "FibDynamic"
 
-(* Check if a type is a class pointer type - ends with asterisk *)
-let is_class_pointer_type s =
-	String.length s > 1 && s.[String.length s - 1] = '*' &&
-	s <> "FibString*" && s <> "FibArray*" && s <> "FibDynamic*"
+(* tc_type-based predicates *)
 
-(* Check if a type string represents a GC-managed pointer that needs marking *)
-let needs_gc_marking type_str =
-	let len = String.length type_str in
-	len > 0 && type_str.[len - 1] = '*'
+(* Check if type is a "class pointer" - pointer types excluding FibString*, FibArray*, FibDynamic* *)
+let is_class_pointer_tc = function
+	| TCFibClass _ -> true
+	| TCFibArray TCArrGeneric -> false  (* FibArray* excluded *)
+	| TCFibArray _ -> true  (* Specialized arrays included *)
+	| TCFibIntMap | TCFibStringMap | TCFibInt64Map | TCFibObjectMap -> true
+	| TCFibBytesData -> true
+	| _ -> false
 
-(* Check if a type is an enum struct type (not a pointer, not a primitive) *)
-let is_enum_struct_type s =
-	s <> "int32_t" && s <> "double" && s <> "bool" && s <> "void" &&
-	s <> "FibDynamic" && s <> "FibString*" && s <> "FibArray*" &&
-	(String.length s = 0 || s.[String.length s - 1] <> '*')
+(* Check if type is an enum struct *)
+let is_enum_struct_tc = function
+	| TCFibEnum _ -> true
+	| _ -> false
+
+(* Check if type ends with '*' (is a pointer that needs GC marking) *)
+let needs_gc_marking_tc = function
+	| TCFibString | TCFibArray _ | TCFibClass _ | TCFibClosure 
+	| TCFibObject | TCFibIntMap | TCFibStringMap 
+	| TCFibInt64Map | TCFibObjectMap | TCFibBytesData -> true
+	| TCPointer _ -> true
+	(* Note: FibDynamic is NOT a pointer (struct), so excluded *)
+	| _ -> false
+
+(* String-based wrappers for compatibility *)
+let is_class_pointer_type s = is_class_pointer_tc (tc_type_of_string s)
+let is_enum_struct_type s = is_enum_struct_tc (tc_type_of_string s)
+let needs_gc_marking type_str = needs_gc_marking_tc (tc_type_of_string type_str)
 
 (* Generate FibDynamic field access suffix for unboxing based on tc_type *)
 let fib_dynamic_unbox_suffix_tc = function
@@ -349,97 +363,87 @@ let gen_box_to_fib_dynamic_tc ctx tc_type gen_inner =
 let gen_box_to_fib_dynamic ctx type_str gen_inner =
 	gen_box_to_fib_dynamic_tc ctx (tc_type_of_string type_str) gen_inner
 
-(* Get actual C type from expression, unwrapping casts/meta *)
-let rec get_actual_c_type ctx e =
+(* Get actual tc_type from expression, unwrapping casts/meta.
+   Returns the most specific type we can determine for the expression. *)
+let rec get_actual_tc_type e =
 	match e.eexpr with
-	(* TCast explicitly changes the type - return the cast's target type, not the inner type *)
-	| TCast (_, _) -> Some (s_type ctx e.etype)
-	| TMeta (_, inner) -> get_actual_c_type ctx inner
-	| TParenthesis inner -> get_actual_c_type ctx inner
+	(* TCast explicitly changes the type - return the cast's target type *)
+	| TCast (_, _) -> Some (tc_type_of e.etype)
+	| TMeta (_, inner) -> get_actual_tc_type inner
+	| TParenthesis inner -> get_actual_tc_type inner
 	| TBlock exprs when exprs <> [] ->
 		(* Block expressions evaluate to the last expression *)
-		get_actual_c_type ctx (List.hd (List.rev exprs))
+		get_actual_tc_type (List.hd (List.rev exprs))
 	(* Local variable - use the variable's type directly *)
-	| TLocal v -> Some (s_type ctx v.v_type)
+	| TLocal v -> Some (tc_type_of v.v_type)
 	(* Dynamic/anonymous field access returns FibDynamic *)
-	| TField (_, FAnon _) | TField (_, FDynamic _) -> Some "FibDynamic"
+	| TField (_, FAnon _) | TField (_, FDynamic _) -> Some TCFibDynamic
 	(* Static field: use actual field type *)
-	| TField (_, FStatic (_, cf)) -> Some (s_type ctx cf.cf_type)
+	| TField (_, FStatic (_, cf)) -> Some (tc_type_of cf.cf_type)
 	(* Instance field: use actual field type *)
-	| TField (_, FInstance (_, _, cf)) -> Some (s_type ctx cf.cf_type)
+	| TField (_, FInstance (_, _, cf)) -> Some (tc_type_of cf.cf_type)
 	(* Closure: use actual field type *)
-	| TField (_, FClosure (_, cf)) -> Some (s_type ctx cf.cf_type)
+	| TField (_, FClosure (_, cf)) -> Some (tc_type_of cf.cf_type)
 	(* Array literals produce specialized type based on expression type *)
-	| TArrayDecl _ -> Some (s_type ctx e.etype)
+	| TArrayDecl _ -> Some (tc_type_of e.etype)
 	(* Array element access returns the element type for typed arrays *)
-	| TArray (e1, _) ->
-		let elem_type = get_array_elem_type ctx e1.etype in
-		Some elem_type
-	(* Dynamic method calls - toString returns FibString* *)
-	| TCall ({ eexpr = TField (_, FAnon cf) }, _) when cf.cf_name = "toString" -> Some "FibString*"
-	| TCall ({ eexpr = TField (_, FDynamic "toString") }, _) -> Some "FibString*"
+	| TArray (e1, _) -> Some (FiberusTypeUtils.get_array_elem_type e1.etype)
+	(* Dynamic method calls - toString returns FibString *)
+	| TCall ({ eexpr = TField (_, FAnon cf) }, _) when cf.cf_name = "toString" -> Some TCFibString
+	| TCall ({ eexpr = TField (_, FDynamic "toString") }, _) -> Some TCFibString
 	(* Static method calls - use the method's return type *)
 	| TCall ({ eexpr = TField (_, FStatic (_, cf)) }, _) ->
 		(match follow cf.cf_type with
-		| TFun (_, ret) -> Some (s_type ctx ret)
+		| TFun (_, ret) -> Some (tc_type_of ret)
 		| _ -> None)
 	(* Instance method calls - use the method's return type *)
 	(* Special case: specialized array methods return primitive types, not Null<T> *)
 	| TCall ({ eexpr = TField (obj, FInstance (c, _, cf)) }, _) ->
 		(* Check if this is a specialized array method that returns a primitive *)
-		let obj_c_type = s_type ctx obj.etype in
-		let is_int_array = obj_c_type = "FibIntArray*" in
-		let is_float_array = obj_c_type = "FibFloatArray*" in
-		let is_bool_array = obj_c_type = "FibBoolArray*" in
+		let obj_tc = tc_type_of obj.etype in
+		let is_int_array = obj_tc = TCFibArray TCArrInt in
+		let is_float_array = obj_tc = TCFibArray TCArrFloat in
+		let is_bool_array = obj_tc = TCFibArray TCArrBool in
 		let is_string = is_string_type obj.etype in
-		let is_int_map = c.cl_path = (["haxe"; "ds"], "IntMap") in
-		let is_string_map = c.cl_path = (["haxe"; "ds"], "StringMap") in
-		let is_int64_map = c.cl_path = (["haxe"; "ds"], "Int64Map") in
-		let is_object_map = c.cl_path = (["haxe"; "ds"], "ObjectMap") in
+		let map_kind = FiberusBuiltins.map_kind_of_type obj.etype in
 		(* Methods that return the element type (not Null<T>) for specialized arrays *)
 		(match cf.cf_name with
 		(* String methods that return int in C (not FibDynamic) *)
-		| "charCodeAt" when is_string -> Some "int32_t"
-		| "indexOf" | "lastIndexOf" when is_string -> Some "int32_t"
-		| "pop" | "shift" | "__get" | "__unsafe_get" when is_int_array -> Some "int32_t"
-		| "pop" | "shift" | "__get" | "__unsafe_get" when is_float_array -> Some "double"
-		| "pop" | "shift" | "__get" | "__unsafe_get" when is_bool_array -> Some "bool"
+		| "charCodeAt" when is_string -> Some TCInt32
+		| "indexOf" | "lastIndexOf" when is_string -> Some TCInt32
+		| "pop" | "shift" | "__get" | "__unsafe_get" when is_int_array -> Some TCInt32
+		| "pop" | "shift" | "__get" | "__unsafe_get" when is_float_array -> Some TCFloat64
+		| "pop" | "shift" | "__get" | "__unsafe_get" when is_bool_array -> Some TCBool
 		(* Map get methods return type-specialized values *)
-		| "get" when is_int_map || is_string_map || is_int64_map ->
+		| "get" when map_kind <> None && c.cl_path <> (["haxe"; "ds"], "ObjectMap") ->
 			(* Get the value type parameter from the map type *)
 			(match follow obj.etype with
-			| TInst (_, [t]) ->
-				(match follow t with
-				| TAbstract ({ a_path = ([], "Int") }, []) -> Some "int32_t"
-				| TAbstract ({ a_path = ([], "Float") }, []) -> Some "double"
-				| TInst ({ cl_path = ([], "String") }, []) -> Some "FibString*"
-				| TAbstract ({ a_path = (["fiberus"], "Int64") }, []) -> Some "int64_t"
-				| _ -> Some "FibDynamic")
-			| _ -> Some "FibDynamic")
+			| TInst (_, [t]) -> Some (tc_type_of t)
+			| _ -> Some TCFibDynamic)
 		(* ObjectMap.get returns type-specialized values based on second type parameter *)
-		| "get" when is_object_map ->
+		| "get" when c.cl_path = (["haxe"; "ds"], "ObjectMap") ->
 			(match follow obj.etype with
-			| TInst (_, [_; t]) ->  (* ObjectMap<K, V> has two type params, V is second *)
-				(match follow t with
-				| TAbstract ({ a_path = ([], "Int") }, []) -> Some "int32_t"
-				| TAbstract ({ a_path = ([], "Float") }, []) -> Some "double"
-				| TInst ({ cl_path = ([], "String") }, []) -> Some "FibString*"
-				| TAbstract ({ a_path = (["fiberus"], "Int64") }, []) -> Some "int64_t"
-				| _ -> Some "FibDynamic")
-			| _ -> Some "FibDynamic")
+			| TInst (_, [_; t]) -> Some (tc_type_of t)
+			| _ -> Some TCFibDynamic)
 		| _ ->
 			(match follow cf.cf_type with
-			| TFun (_, ret) -> Some (s_type ctx ret)
+			| TFun (_, ret) -> Some (tc_type_of ret)
 			| _ -> None))
 	(* __fiberus__ calls return the expression's declared type (from inline function) *)
 	| TCall ({ eexpr = TIdent "__fiberus__" }, _) ->
-		Some (s_type ctx e.etype)
+		Some (tc_type_of e.etype)
 	(* Any function call - try to get return type from callee's type *)
 	| TCall (callee, _) ->
 		(match follow callee.etype with
-		| TFun (_, ret) -> Some (s_type ctx ret)
+		| TFun (_, ret) -> Some (tc_type_of ret)
 		| _ -> None)
 	| _ -> None
+
+(* String-based wrapper for backward compatibility with existing code *)
+let get_actual_c_type _ctx e =
+	match get_actual_tc_type e with
+	| Some tc -> Some (tc_type_to_string tc)
+	| None -> None
 
 (* is_enum_type now imported from FiberusTypeUtils *)
 
@@ -481,8 +485,8 @@ let gen_coerce_with_expr ctx from_type to_type expr gen_inner =
 	else begin
 		(* Determine actual C type based on expression kind *)
 		let from_tc = match expr with
-			| Some e -> (match get_actual_c_type ctx e with
-				| Some t -> tc_type_of_string t
+			| Some e -> (match get_actual_tc_type e with
+				| Some t -> t
 				| None -> from_tc)
 			| None -> from_tc
 		in
@@ -492,8 +496,11 @@ let gen_coerce_with_expr ctx from_type to_type expr gen_inner =
 		(* FibDynamic -> other types (unboxing) *)
 		| TCFibDynamic, TCFibString ->
 			spr ctx "fib_dynamic_to_string("; gen_inner (); spr ctx ")"
-		| TCFibDynamic, TCFibArray _ ->
+		| TCFibDynamic, TCFibArray TCArrGeneric ->
 			spr ctx "fib_dynamic_to_array("; gen_inner (); spr ctx ")"
+		| TCFibDynamic, TCFibArray kind ->
+			(* Specialized arrays need cast from FibArray* *)
+			print ctx "((%s)fib_dynamic_to_array(" (tc_type_to_string (TCFibArray kind)); gen_inner (); spr ctx "))"
 		| TCFibDynamic, TCFibClass name ->
 			print ctx "((%s*)fib_dynamic_to_object(" name; gen_inner (); spr ctx "))"
 		| TCFibDynamic, TCFloat64 ->
@@ -505,8 +512,11 @@ let gen_coerce_with_expr ctx from_type to_type expr gen_inner =
 		(* Other types -> FibDynamic (boxing) *)
 		| TCFibString, TCFibDynamic ->
 			spr ctx "fib_string_to_dynamic("; gen_inner (); spr ctx ")"
-		| TCFibArray _, TCFibDynamic ->
+		| TCFibArray TCArrGeneric, TCFibDynamic ->
 			spr ctx "fib_dynamic_array("; gen_inner (); spr ctx ")"
+		| TCFibArray _, TCFibDynamic ->
+			(* Specialized arrays need cast to FibArray* first *)
+			spr ctx "fib_dynamic_array((FibArray*)"; gen_inner (); spr ctx ")"
 		| TCInt32, TCFibDynamic ->
 			spr ctx "fib_dynamic_int("; gen_inner (); spr ctx ")"
 		| TCFloat64, TCFibDynamic ->
@@ -559,47 +569,31 @@ let rec gen_call_args ctx args param_types gen_value_fn =
 
 (* Helper to generate trace message as FibDynamic *)
 and gen_trace_value ctx msg =
-	let msg_type = s_type ctx msg.etype in
-	if msg_type = "FibString*" then begin
-		spr ctx "fib_string_to_dynamic(";
-		gen_value ctx msg;
-		spr ctx ")"
-	end else if msg_type = "int32_t" then begin
-		spr ctx "fib_dynamic_int(";
-		gen_value ctx msg;
-		spr ctx ")"
-	end else if msg_type = "double" then begin
-		spr ctx "fib_dynamic_float(";
-		gen_value ctx msg;
-		spr ctx ")"
-	end else if msg_type = "bool" then begin
-		spr ctx "fib_dynamic_bool(";
-		gen_value ctx msg;
-		spr ctx ")"
-	end else if msg_type = "FibDynamic" then begin
+	match tc_type_of msg.etype with
+	| TCFibString ->
+		spr ctx "fib_string_to_dynamic("; gen_value ctx msg; spr ctx ")"
+	| TCInt32 ->
+		spr ctx "fib_dynamic_int("; gen_value ctx msg; spr ctx ")"
+	| TCFloat64 ->
+		spr ctx "fib_dynamic_float("; gen_value ctx msg; spr ctx ")"
+	| TCBool ->
+		spr ctx "fib_dynamic_bool("; gen_value ctx msg; spr ctx ")"
+	| TCFibDynamic ->
 		gen_value ctx msg
-	end else begin
+	| _ ->
 		(* Object or unknown type - convert to FibDynamic *)
-		spr ctx "fib_dynamic_object((FibObject*)";
-		gen_value ctx msg;
-		spr ctx ")"
-	end
+		spr ctx "fib_dynamic_object((FibObject*)"; gen_value ctx msg; spr ctx ")"
 
 (* Helper for Fiber.spawn closure capture - shared by spawn/spawnOn/spawnAny *)
-and gen_fiber_spawn_closure ctx free_vars closure_name =
+and gen_fiber_spawn_closure ctx free_vars _closure_name =
 	List.iteri (fun i v ->
 		print ctx "_fc->captures[%d] = " i;
-		let vtype = s_type ctx v.v_type in
-		if vtype = "int32_t" then
-			print ctx "fib_dynamic_int(%s); " (ident v.v_name)
-		else if vtype = "double" then
-			print ctx "fib_dynamic_float(%s); " (ident v.v_name)
-		else if vtype = "bool" then
-			print ctx "fib_dynamic_bool(%s); " (ident v.v_name)
-		else if vtype = "FibString*" then
-			print ctx "fib_dynamic_string(%s); " (ident v.v_name)
-		else
+		let box_func = FiberusClosure.box_to_dynamic_func v.v_type in
+		if box_func = "" then
+			(* Already dynamic or needs raw object boxing *)
 			print ctx "(FibDynamic){.type=FIB_TYPE_OBJECT, .data.ptrVal=%s}; " (ident v.v_name)
+		else
+			print ctx "%s(%s); " box_func (ident v.v_name)
 	) free_vars
 
 (* Extract closure info for Fiber.spawn patterns *)
@@ -1028,8 +1022,8 @@ and gen_string_call ctx str cf args =
  * Handles Map instance method calls. Returns true if handled.
  *)
 
-(* Helper to get value type suffix for map operations *)
-and get_map_value_suffix ctx arg_expr =
+(* Helper to get value type suffix for map set operations *)
+and get_map_value_suffix _ctx arg_expr =
 	match follow arg_expr.etype with
 	| TAbstract ({ a_path = ([], "Int") }, []) -> "_int"
 	| TAbstract ({ a_path = ([], "Float") }, []) -> "_float"
@@ -1037,271 +1031,70 @@ and get_map_value_suffix ctx arg_expr =
 	| TAbstract ({ a_path = (["fiberus"], "Int64") }, []) -> "_int64"
 	| _ -> "_dynamic"
 
-(* Generate IntMap method call *)
-and gen_int_map_call ctx map_expr cf args =
-	let get_map_value_type () =
-		match follow map_expr.etype with
-		| TInst (_, [t]) -> follow t
-		| _ -> t_dynamic
-	in
-	match cf.cf_name with
-	| "set" ->
-		(match args with
-		| [key; value] ->
-			let suffix = get_map_value_suffix ctx value in
-			print ctx "fib_int_map_set%s(" suffix;
-			gen_value ctx map_expr;
-			spr ctx ", ";
-			gen_value ctx key;
-			spr ctx ", ";
-			gen_value ctx value;
-			spr ctx ")"
-		| _ -> spr ctx "/* IntMap.set: wrong args */");
-		true
-	| "get" ->
-		(match args with
-		| [key] ->
-			let value_type = get_map_value_type () in
-			let fn_name = match value_type with
-				| TAbstract ({ a_path = ([], "Int") }, []) -> "fib_int_map_get_int"
-				| TAbstract ({ a_path = ([], "Float") }, []) -> "fib_int_map_get_float"
-				| TInst ({ cl_path = ([], "String") }, []) -> "fib_int_map_get_string"
-				| _ -> "fib_int_map_get_dynamic"
-			in
-			print ctx "%s(" fn_name;
-			gen_value ctx map_expr;
-			spr ctx ", ";
-			gen_value ctx key;
-			spr ctx ")"
-		| _ -> spr ctx "/* IntMap.get: wrong args */");
-		true
-	| "exists" ->
-		(match args with
-		| [key] ->
-			spr ctx "fib_int_map_exists(";
-			gen_value ctx map_expr;
-			spr ctx ", ";
-			gen_value ctx key;
-			spr ctx ")"
-		| _ -> spr ctx "/* IntMap.exists: wrong args */");
-		true
-	| "remove" ->
-		(match args with
-		| [key] ->
-			spr ctx "fib_int_map_remove(";
-			gen_value ctx map_expr;
-			spr ctx ", ";
-			gen_value ctx key;
-			spr ctx ")"
-		| _ -> spr ctx "/* IntMap.remove: wrong args */");
-		true
-	| "keys" -> spr ctx "fib_int_map_keys("; gen_value ctx map_expr; spr ctx ")"; true
-	| "iterator" -> spr ctx "fib_int_map_iterator("; gen_value ctx map_expr; spr ctx ")"; true
-	| "copy" -> spr ctx "fib_int_map_copy("; gen_value ctx map_expr; spr ctx ")"; true
-	| "toString" -> spr ctx "fib_int_map_to_string("; gen_value ctx map_expr; spr ctx ")"; true
-	| "clear" -> spr ctx "fib_int_map_clear("; gen_value ctx map_expr; spr ctx ")"; true
-	| "size" -> spr ctx "fib_int_map_size("; gen_value ctx map_expr; spr ctx ")"; true
-	| _ -> print ctx "/* IntMap.%s not implemented */" cf.cf_name; true
+(* Helper to get value type suffix for map get operations *)
+and get_map_get_suffix kind value_type =
+	let prefix = map_kind_prefix kind in
+	match value_type with
+	| TAbstract ({ a_path = ([], "Int") }, []) -> prefix ^ "get_int"
+	| TAbstract ({ a_path = ([], "Float") }, []) -> prefix ^ "get_float"
+	| TInst ({ cl_path = ([], "String") }, []) -> prefix ^ "get_string"
+	| TAbstract ({ a_path = (["fiberus"], "Int64") }, []) when kind = MapInt64 || kind = MapObject ->
+		prefix ^ "get_int64"
+	| _ -> prefix ^ "get_dynamic"
 
-(* Generate StringMap method call *)
-and gen_string_map_call ctx map_expr cf args =
-	let get_map_value_type () =
+(* Unified map method call generator - handles IntMap, StringMap, Int64Map, ObjectMap *)
+and gen_map_call ctx kind map_expr cf args =
+	let prefix = map_kind_prefix kind in
+	let map_name = match kind with
+		| MapInt -> "IntMap" | MapString -> "StringMap"
+		| MapInt64 -> "Int64Map" | MapObject -> "ObjectMap"
+	in
+	(* Get value type from map's type parameters *)
+	let get_value_type () =
 		match follow map_expr.etype with
-		| TInst (_, [t]) -> follow t
+		| TInst (_, [_; t]) when kind = MapObject -> follow t  (* ObjectMap<K,V> *)
+		| TInst (_, [t]) -> follow t  (* Other maps: Map<V> *)
 		| _ -> t_dynamic
+	in
+	(* ObjectMap needs key cast to FibObject* *)
+	let gen_key key = match kind with
+		| MapObject -> spr ctx "(FibObject*)"; gen_value ctx key
+		| _ -> gen_value ctx key
 	in
 	match cf.cf_name with
 	| "set" ->
 		(match args with
 		| [key; value] ->
 			let suffix = get_map_value_suffix ctx value in
-			print ctx "fib_string_map_set%s(" suffix;
-			gen_value ctx map_expr;
-			spr ctx ", ";
-			gen_value ctx key;
-			spr ctx ", ";
-			gen_value ctx value;
-			spr ctx ")"
-		| _ -> spr ctx "/* StringMap.set: wrong args */");
-		true
+			print ctx "%sset%s(" prefix suffix;
+			gen_value ctx map_expr; spr ctx ", "; gen_key key; spr ctx ", "; gen_value ctx value; spr ctx ")"
+		| _ -> print ctx "/* %s.set: wrong args */" map_name); true
 	| "get" ->
 		(match args with
 		| [key] ->
-			let value_type = get_map_value_type () in
-			let fn_name = match value_type with
-				| TAbstract ({ a_path = ([], "Int") }, []) -> "fib_string_map_get_int"
-				| TAbstract ({ a_path = ([], "Float") }, []) -> "fib_string_map_get_float"
-				| TInst ({ cl_path = ([], "String") }, []) -> "fib_string_map_get_string"
-				| _ -> "fib_string_map_get_dynamic"
-			in
+			let fn_name = get_map_get_suffix kind (get_value_type ()) in
 			print ctx "%s(" fn_name;
-			gen_value ctx map_expr;
-			spr ctx ", ";
-			gen_value ctx key;
-			spr ctx ")"
-		| _ -> spr ctx "/* StringMap.get: wrong args */");
-		true
+			gen_value ctx map_expr; spr ctx ", "; gen_key key; spr ctx ")"
+		| _ -> print ctx "/* %s.get: wrong args */" map_name); true
 	| "exists" ->
 		(match args with
 		| [key] ->
-			spr ctx "fib_string_map_exists(";
-			gen_value ctx map_expr;
-			spr ctx ", ";
-			gen_value ctx key;
-			spr ctx ")"
-		| _ -> spr ctx "/* StringMap.exists: wrong args */");
-		true
+			print ctx "%sexists(" prefix;
+			gen_value ctx map_expr; spr ctx ", "; gen_key key; spr ctx ")"
+		| _ -> print ctx "/* %s.exists: wrong args */" map_name); true
 	| "remove" ->
 		(match args with
 		| [key] ->
-			spr ctx "fib_string_map_remove(";
-			gen_value ctx map_expr;
-			spr ctx ", ";
-			gen_value ctx key;
-			spr ctx ")"
-		| _ -> spr ctx "/* StringMap.remove: wrong args */");
-		true
-	| "keys" -> spr ctx "fib_string_map_keys("; gen_value ctx map_expr; spr ctx ")"; true
-	| "iterator" -> spr ctx "fib_string_map_iterator("; gen_value ctx map_expr; spr ctx ")"; true
-	| "copy" -> spr ctx "fib_string_map_copy("; gen_value ctx map_expr; spr ctx ")"; true
-	| "toString" -> spr ctx "fib_string_map_to_string("; gen_value ctx map_expr; spr ctx ")"; true
-	| "clear" -> spr ctx "fib_string_map_clear("; gen_value ctx map_expr; spr ctx ")"; true
-	| "size" -> spr ctx "fib_string_map_size("; gen_value ctx map_expr; spr ctx ")"; true
-	| _ -> print ctx "/* StringMap.%s not implemented */" cf.cf_name; true
-
-(* Generate Int64Map method call *)
-and gen_int64_map_call ctx map_expr cf args =
-	let get_map_value_type () =
-		match follow map_expr.etype with
-		| TInst (_, [t]) -> follow t
-		| _ -> t_dynamic
-	in
-	match cf.cf_name with
-	| "set" ->
-		(match args with
-		| [key; value] ->
-			let suffix = get_map_value_suffix ctx value in
-			print ctx "fib_int64_map_set%s(" suffix;
-			gen_value ctx map_expr;
-			spr ctx ", ";
-			gen_value ctx key;
-			spr ctx ", ";
-			gen_value ctx value;
-			spr ctx ")"
-		| _ -> spr ctx "/* Int64Map.set: wrong args */");
-		true
-	| "get" ->
-		(match args with
-		| [key] ->
-			let value_type = get_map_value_type () in
-			let fn_name = match value_type with
-				| TAbstract ({ a_path = ([], "Int") }, []) -> "fib_int64_map_get_int"
-				| TAbstract ({ a_path = ([], "Float") }, []) -> "fib_int64_map_get_float"
-				| TInst ({ cl_path = ([], "String") }, []) -> "fib_int64_map_get_string"
-				| TAbstract ({ a_path = (["fiberus"], "Int64") }, []) -> "fib_int64_map_get_int64"
-				| _ -> "fib_int64_map_get_dynamic"
-			in
-			print ctx "%s(" fn_name;
-			gen_value ctx map_expr;
-			spr ctx ", ";
-			gen_value ctx key;
-			spr ctx ")"
-		| _ -> spr ctx "/* Int64Map.get: wrong args */");
-		true
-	| "exists" ->
-		(match args with
-		| [key] ->
-			spr ctx "fib_int64_map_exists(";
-			gen_value ctx map_expr;
-			spr ctx ", ";
-			gen_value ctx key;
-			spr ctx ")"
-		| _ -> spr ctx "/* Int64Map.exists: wrong args */");
-		true
-	| "remove" ->
-		(match args with
-		| [key] ->
-			spr ctx "fib_int64_map_remove(";
-			gen_value ctx map_expr;
-			spr ctx ", ";
-			gen_value ctx key;
-			spr ctx ")"
-		| _ -> spr ctx "/* Int64Map.remove: wrong args */");
-		true
-	| "keys" -> spr ctx "fib_int64_map_keys("; gen_value ctx map_expr; spr ctx ")"; true
-	| "iterator" -> spr ctx "fib_int64_map_iterator("; gen_value ctx map_expr; spr ctx ")"; true
-	| "copy" -> spr ctx "fib_int64_map_copy("; gen_value ctx map_expr; spr ctx ")"; true
-	| "toString" -> spr ctx "fib_int64_map_to_string("; gen_value ctx map_expr; spr ctx ")"; true
-	| "clear" -> spr ctx "fib_int64_map_clear("; gen_value ctx map_expr; spr ctx ")"; true
-	| "size" -> spr ctx "fib_int64_map_size("; gen_value ctx map_expr; spr ctx ")"; true
-	| _ -> print ctx "/* Int64Map.%s not implemented */" cf.cf_name; true
-
-(* Generate ObjectMap method call *)
-and gen_object_map_call ctx map_expr cf args =
-	let get_map_value_type () =
-		match follow map_expr.etype with
-		| TInst (_, [_; t]) -> follow t  (* Second type param is value type *)
-		| _ -> t_dynamic
-	in
-	match cf.cf_name with
-	| "set" ->
-		(match args with
-		| [key; value] ->
-			let suffix = get_map_value_suffix ctx value in
-			print ctx "fib_object_map_set%s(" suffix;
-			gen_value ctx map_expr;
-			spr ctx ", (FibObject*)";
-			gen_value ctx key;
-			spr ctx ", ";
-			gen_value ctx value;
-			spr ctx ")"
-		| _ -> spr ctx "/* ObjectMap.set: wrong args */");
-		true
-	| "get" ->
-		(match args with
-		| [key] ->
-			let value_type = get_map_value_type () in
-			let fn_name = match value_type with
-				| TAbstract ({ a_path = ([], "Int") }, []) -> "fib_object_map_get_int"
-				| TAbstract ({ a_path = ([], "Float") }, []) -> "fib_object_map_get_float"
-				| TInst ({ cl_path = ([], "String") }, []) -> "fib_object_map_get_string"
-				| TAbstract ({ a_path = (["fiberus"], "Int64") }, []) -> "fib_object_map_get_int64"
-				| _ -> "fib_object_map_get_dynamic"
-			in
-			print ctx "%s(" fn_name;
-			gen_value ctx map_expr;
-			spr ctx ", (FibObject*)";
-			gen_value ctx key;
-			spr ctx ")"
-		| _ -> spr ctx "/* ObjectMap.get: wrong args */");
-		true
-	| "exists" ->
-		(match args with
-		| [key] ->
-			spr ctx "fib_object_map_exists(";
-			gen_value ctx map_expr;
-			spr ctx ", (FibObject*)";
-			gen_value ctx key;
-			spr ctx ")"
-		| _ -> spr ctx "/* ObjectMap.exists: wrong args */");
-		true
-	| "remove" ->
-		(match args with
-		| [key] ->
-			spr ctx "fib_object_map_remove(";
-			gen_value ctx map_expr;
-			spr ctx ", (FibObject*)";
-			gen_value ctx key;
-			spr ctx ")"
-		| _ -> spr ctx "/* ObjectMap.remove: wrong args */");
-		true
-	| "keys" -> spr ctx "fib_object_map_keys("; gen_value ctx map_expr; spr ctx ")"; true
-	| "iterator" -> spr ctx "fib_object_map_iterator("; gen_value ctx map_expr; spr ctx ")"; true
-	| "copy" -> spr ctx "fib_object_map_copy("; gen_value ctx map_expr; spr ctx ")"; true
-	| "toString" -> spr ctx "fib_object_map_to_string("; gen_value ctx map_expr; spr ctx ")"; true
-	| "clear" -> spr ctx "fib_object_map_clear("; gen_value ctx map_expr; spr ctx ")"; true
-	| "size" -> spr ctx "fib_object_map_size("; gen_value ctx map_expr; spr ctx ")"; true
-	| _ -> print ctx "/* ObjectMap.%s not implemented */" cf.cf_name; true
+			print ctx "%sremove(" prefix;
+			gen_value ctx map_expr; spr ctx ", "; gen_key key; spr ctx ")"
+		| _ -> print ctx "/* %s.remove: wrong args */" map_name); true
+	| "keys" -> print ctx "%skeys(" prefix; gen_value ctx map_expr; spr ctx ")"; true
+	| "iterator" -> print ctx "%siterator(" prefix; gen_value ctx map_expr; spr ctx ")"; true
+	| "copy" -> print ctx "%scopy(" prefix; gen_value ctx map_expr; spr ctx ")"; true
+	| "toString" -> print ctx "%sto_string(" prefix; gen_value ctx map_expr; spr ctx ")"; true
+	| "clear" -> print ctx "%sclear(" prefix; gen_value ctx map_expr; spr ctx ")"; true
+	| "size" -> print ctx "%ssize(" prefix; gen_value ctx map_expr; spr ctx ")"; true
+	| _ -> print ctx "/* %s.%s not implemented */" map_name cf.cf_name; true
 
 (*
  * ===========================================================================
@@ -1431,18 +1224,10 @@ and gen_call ctx e args =
 	(* String method calls -> fib_string_* functions *)
 	| TField (str, FInstance (_, _, cf)), _ when is_string_type str.etype ->
 		ignore (gen_string_call ctx str cf args)
-	(* IntMap method calls *)
-	| TField (map_expr, FInstance (c, _, cf)), _ when c.cl_path = (["haxe"; "ds"], "IntMap") ->
-		ignore (gen_int_map_call ctx map_expr cf args)
-	(* StringMap method calls *)
-	| TField (map_expr, FInstance (c, _, cf)), _ when c.cl_path = (["haxe"; "ds"], "StringMap") ->
-		ignore (gen_string_map_call ctx map_expr cf args)
-	(* Int64Map method calls *)
-	| TField (map_expr, FInstance (c, _, cf)), _ when c.cl_path = (["haxe"; "ds"], "Int64Map") ->
-		ignore (gen_int64_map_call ctx map_expr cf args)
-	(* ObjectMap method calls *)
-	| TField (map_expr, FInstance (c, _, cf)), _ when c.cl_path = (["haxe"; "ds"], "ObjectMap") ->
-		ignore (gen_object_map_call ctx map_expr cf args)
+	(* Map method calls (IntMap, StringMap, Int64Map, ObjectMap) *)
+	| TField (map_expr, FInstance (_, _, cf)), _ when map_kind_of_type map_expr.etype <> None ->
+		let kind = match map_kind_of_type map_expr.etype with Some k -> k | None -> MapInt in
+		ignore (gen_map_call ctx kind map_expr cf args)
 	(* Enum constructor call: Color.Rgb(r, g, b) -> Enum_Constructor(r, g, b) *)
 	| TField (_, FEnum (en, ef)), _ ->
 		print ctx "%s_%s(" (flat_path en.e_path) ef.ef_name;
@@ -3725,20 +3510,12 @@ let gen_function ctx name f c is_static =
 	newline ctx
 
 (* Generate a static variable declaration *)
-(* Check if an expression is a compile-time constant (can be used in static initializer) *)
-let rec is_const_expr e =
-	match e.eexpr with
-	| TConst _ -> true
-	| TField (_, FEnum _) -> true  (* Enum constants *)
-	| TParenthesis e -> is_const_expr e
-	| TCast (e, _) -> is_const_expr e
-	| TMeta (_, e) -> is_const_expr e
-	| _ -> false
+(* is_compile_time_constant now imported from FiberusGenClass *)
 
 (* Check if a static field needs runtime initialization (non-constant initializer) *)
 let needs_runtime_init cf =
 	match cf.cf_kind, cf.cf_expr with
-	| Var _, Some e when not (is_const_expr e) ->
+	| Var _, Some e when not (is_compile_time_constant e) ->
 		(match e.eexpr with
 		| TFunction _ -> false  (* Functions don't need runtime init *)
 		| _ -> true)
@@ -3760,7 +3537,7 @@ let gen_static_var ctx c cf =
 		print ctx "%s %s_%s" var_type class_name (ident cf.cf_name);
 	(* Only use initializer if it's a compile-time constant *)
 	(match cf.cf_expr with
-	| Some e when is_const_expr e ->
+	| Some e when is_compile_time_constant e ->
 		spr ctx " = ";
 		gen_value ctx e
 	| _ ->

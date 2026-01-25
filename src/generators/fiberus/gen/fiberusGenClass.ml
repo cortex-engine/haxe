@@ -84,10 +84,12 @@ let rec is_compile_time_constant (e : texpr) : bool =
   | TConst (TString _) -> false  (* Strings need runtime alloc *)
   | TConst TThis -> false
   | TConst TSuper -> false
+  | TField (_, FEnum _) -> true  (* Enum constants are compile-time *)
   | TParenthesis e -> is_compile_time_constant e
   | TUnop (_, _, e) -> is_compile_time_constant e
   | TBinop (_, e1, e2) -> is_compile_time_constant e1 && is_compile_time_constant e2
   | TCast (e, _) -> is_compile_time_constant e
+  | TMeta (_, e) -> is_compile_time_constant e  (* Unwrap metadata *)
   | _ -> false
 
 (* Get static fields for a class *)
