@@ -1,5 +1,5 @@
 (*
- * GenfiberusVtable - Virtual method dispatch for Fiberus
+ * FiberusVtable - Virtual method dispatch for Fiberus
  *
  * This module handles vtable (virtual method table) generation for
  * polymorphic method dispatch. When a method is called through a base

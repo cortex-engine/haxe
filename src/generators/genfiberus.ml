@@ -9,7 +9,7 @@ open Globals
 open Ast
 open Type
 open Gctx
-open GenfiberusVtable
+open FiberusVtable
 
 type ctx = {
 	com : Gctx.t;
@@ -40,7 +40,7 @@ type ctx = {
 	(* Escape analysis: set of variable IDs that can be stack-allocated *)
 	mutable stack_alloc_vars : (int, tclass) Hashtbl.t;
 	(* Vtable context for virtual method dispatch *)
-	mutable vtable_ctx : GenfiberusVtable.vtable_context option;
+	mutable vtable_ctx : FiberusVtable.vtable_context option;
 	(* Method thunks: methods that are used as values and need closure wrappers *)
 	(* Maps thunk_name -> (is_static, class_path, method_name, arg_types, ret_type) *)
 	mutable method_thunks : (string, bool * path * string * (string * Type.t) list * Type.t) Hashtbl.t;
@@ -1814,7 +1814,7 @@ and gen_instance_call ctx obj c cf args =
 	let class_name = flat_path c.cl_path in
 	let obj_type = s_type ctx obj.etype in
 	(* Check if the declaring class is an interface *)
-	let is_interface_call = GenfiberusVtable.is_interface c in
+	let is_interface_call = FiberusVtable.is_interface c in
 	(* Determine if we need virtual dispatch *)
 	let needs_vtable = match ctx.vtable_ctx with
 		| Some vctx ->
@@ -1830,8 +1830,8 @@ and gen_instance_call ctx obj c cf args =
 				match receiver_class with
 				| Some rc when rc.cl_path <> c.cl_path ->
 					(* Receiver type differs - need virtual dispatch if method is virtual *)
-					GenfiberusVtable.needs_virtual_dispatch c cf &&
-					(match GenfiberusVtable.get_vtable_slot vctx c cf with
+					FiberusVtable.needs_virtual_dispatch c cf &&
+					(match FiberusVtable.get_vtable_slot vctx c cf with
 					| Some _ -> true
 					| None -> false)
 				| _ -> false  (* Same type or non-class receiver - static dispatch *)
@@ -1844,15 +1844,15 @@ and gen_instance_call ctx obj c cf args =
 		let slot_index = match ctx.vtable_ctx with
 			| Some vctx ->
 				if is_interface_call then
-					GenfiberusVtable.get_interface_slot vctx c cf
+					FiberusVtable.get_interface_slot vctx c cf
 				else
-					(match GenfiberusVtable.get_vtable_slot vctx c cf with
+					(match FiberusVtable.get_vtable_slot vctx c cf with
 					| Some info -> Some info.slot_index
 					| None -> None)
 			| None -> None
 		in
 		(* Get method signature for type cast *)
-		let (arg_types, ret_type) = GenfiberusVtable.get_method_types cf in
+		let (arg_types, ret_type) = FiberusVtable.get_method_types cf in
 		match slot_index with
 		| Some slot ->
 			(* Generate vtable call with function pointer cast *)
@@ -4617,7 +4617,7 @@ let gen_class_impl ctx c =
 
 		(* Generate vtable array if class has virtual methods *)
 		let vtable_methods = match ctx.vtable_ctx with
-			| Some vctx -> GenfiberusVtable.get_vtable_methods vctx c
+			| Some vctx -> FiberusVtable.get_vtable_methods vctx c
 			| None -> []
 		in
 		(* Vtable size is max_slot + 1, not count of methods *)
@@ -4636,7 +4636,7 @@ let gen_class_impl ctx c =
 				(* Find which class actually implements this method *)
 				let impl_class = 
 					let rec find_impl c =
-						if List.exists (fun cf2 -> cf2.cf_name = method_name && GenfiberusVtable.is_instance_method cf2) c.cl_ordered_fields then
+						if List.exists (fun cf2 -> cf2.cf_name = method_name && FiberusVtable.is_instance_method cf2) c.cl_ordered_fields then
 							c
 						else match c.cl_super with
 							| Some (parent, _) -> find_impl parent
@@ -5736,7 +5736,7 @@ let generate com =
 	} in
 
 	(* Build vtables for all classes - enables virtual method dispatch *)
-	ctx.vtable_ctx <- Some (GenfiberusVtable.build_all_vtables com.types);
+	ctx.vtable_ctx <- Some (FiberusVtable.build_all_vtables com.types);
 
 	(* Create output directory and src subdirectory *)
 	let dir = com.file in
