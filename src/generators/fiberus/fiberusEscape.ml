@@ -197,3 +197,28 @@ let analyze_function (f : tfunc) : escape_result =
     stack_allocatable = analyze_escapes f;
     param_field_map = extract_param_field_mapping f;
   }
+
+(* ============================================================================
+ * Control Flow Analysis
+ * ============================================================================ *)
+
+(* Check if an expression ends with a return statement.
+ * Used to avoid generating redundant cleanup code after returns,
+ * since return statements already handle their own cleanup. *)
+let rec ends_with_return e =
+  match e.eexpr with
+  | TReturn _ -> true
+  | TBlock el when el <> [] -> ends_with_return (List.hd (List.rev el))
+  | TIf (_, then_e, Some else_e) -> ends_with_return then_e && ends_with_return else_e
+  | TSwitch sw ->
+      (* All cases must end with return, including default *)
+      let cases_return = List.for_all (fun c -> ends_with_return c.case_expr) sw.switch_cases in
+      let default_returns = match sw.switch_default with
+        | Some d -> ends_with_return d
+        | None -> false
+      in
+      cases_return && default_returns
+  | TTry (try_e, catches) ->
+      ends_with_return try_e && List.for_all (fun (_, e) -> ends_with_return e) catches
+  | TWhile (_, body, DoWhile) -> ends_with_return body  (* do-while might fall through *)
+  | _ -> false

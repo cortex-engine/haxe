@@ -248,6 +248,8 @@ let is_dynamic_type (t : Type.t) : bool =
   | TDynamic _ -> true
   | TAnon _ -> true
   | TMono { tm_type = None } -> true
+  | TAbstract ({ a_path = ([], "Dynamic") }, _) -> true
+  | TType ({ t_path = ([], "Dynamic") }, _) -> true
   | _ -> false
 
 (* ============================================================================

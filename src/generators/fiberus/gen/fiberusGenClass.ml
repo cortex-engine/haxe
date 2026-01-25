@@ -135,7 +135,8 @@ let is_simple_constructor (f : tfunc) : bool =
   (* A simple constructor:
      1. Has no complex expressions (calls, allocations, etc.)
      2. Only does field assignments from parameters or constants
-     3. Has no control flow *)
+     3. Has no control flow
+     4. All arguments are primitive types (no GC roots needed) *)
   let dominated_by_simple_assigns = ref true in
   let rec check_expr e =
     match e.eexpr with
@@ -158,7 +159,12 @@ let is_simple_constructor (f : tfunc) : bool =
     | _ -> dominated_by_simple_assigns := false
   in
   check_expr f.tf_expr;
-  !dominated_by_simple_assigns
+  (* Check all arguments are primitive types (no GC roots needed) *)
+  let all_args_primitive = List.for_all (fun (v, _) ->
+    let tc_t = tc_type_of v.v_type in
+    not (needs_gc_root tc_t)
+  ) f.tf_args in
+  all_args_primitive && !dominated_by_simple_assigns
 
 (* Extract parameter-to-field mapping from constructor *)
 let get_constructor_field_mapping (f : tfunc) : (string * string) list =

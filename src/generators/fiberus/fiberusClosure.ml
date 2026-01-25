@@ -39,41 +39,70 @@ type closure_context = {
 (* Find free variables in a function (variables used but not defined locally).
    These are the variables that need to be captured by the closure. *)
 let find_free_vars (f : tfunc) : tvar list =
-  let free = Hashtbl.create 16 in
+  (* Variables defined as function parameters *)
   let bound = Hashtbl.create 16 in
+  List.iter (fun (v, _) -> Hashtbl.add bound v.v_id ()) f.tf_args;
+  (* Track locally defined variables *)
+  let local = Hashtbl.create 16 in
+  (* Free variables found *)
+  let free = ref [] in
   
-  (* Mark function parameters as bound *)
-  List.iter (fun (v, _) -> Hashtbl.replace bound v.v_id v) f.tf_args;
-  
-  (* Recursively scan expression for variable uses *)
   let rec scan e =
     match e.eexpr with
     | TLocal v ->
-        if not (Hashtbl.mem bound v.v_id) then
-          Hashtbl.replace free v.v_id v
-    | TVar (v, init) ->
-        (* Variable declaration - bind it, then scan initializer *)
-        Hashtbl.replace bound v.v_id v;
-        (match init with Some e -> scan e | None -> ())
-    | TFunction inner_f ->
-        (* Nested function - bind its parameters, scan its body *)
-        List.iter (fun (v, _) -> Hashtbl.replace bound v.v_id v) inner_f.tf_args;
-        scan inner_f.tf_expr
-    | TTry (body, catches) ->
-        scan body;
-        List.iter (fun (v, e) ->
-          Hashtbl.replace bound v.v_id v;
-          scan e
+        if not (Hashtbl.mem bound v.v_id) && not (Hashtbl.mem local v.v_id) then begin
+          if not (List.exists (fun v2 -> v2.v_id = v.v_id) !free) then
+            free := v :: !free
+        end
+    | TVar (v, eo) ->
+        Hashtbl.add local v.v_id ();
+        (match eo with Some e -> scan e | None -> ())
+    | TTry (try_e, catches) ->
+        (* Scan try block normally *)
+        scan try_e;
+        (* For each catch, the catch variable is local to that catch block only *)
+        List.iter (fun (v, catch_e) ->
+          Hashtbl.add local v.v_id ();
+          scan catch_e;
+          Hashtbl.remove local v.v_id
         ) catches
+    | TFunction inner_f ->
+        (* Scan nested function bodies too - we need to capture any variables
+           they use from our scope so we can pass them to the inner closure *)
+        let inner_bound = Hashtbl.create 16 in
+        List.iter (fun (v, _) -> Hashtbl.add inner_bound v.v_id ()) inner_f.tf_args;
+        let rec scan_inner e =
+          match e.eexpr with
+          | TLocal v ->
+              (* Check if this var is free relative to outer function *)
+              if not (Hashtbl.mem bound v.v_id) && not (Hashtbl.mem local v.v_id)
+                 && not (Hashtbl.mem inner_bound v.v_id) then begin
+                if not (List.exists (fun v2 -> v2.v_id = v.v_id) !free) then
+                  free := v :: !free
+              end
+          | TVar (v, eo) ->
+              Hashtbl.add inner_bound v.v_id ();
+              (match eo with Some e -> scan_inner e | None -> ())
+          | TTry (try_e, catches) ->
+              scan_inner try_e;
+              List.iter (fun (v, catch_e) ->
+                Hashtbl.add inner_bound v.v_id ();
+                scan_inner catch_e;
+                Hashtbl.remove inner_bound v.v_id
+              ) catches
+          | TFunction f2 ->
+              (* Recurse into deeper nested functions *)
+              List.iter (fun (v, _) -> Hashtbl.add inner_bound v.v_id ()) f2.tf_args;
+              Type.iter scan_inner f2.tf_expr
+          | _ ->
+              Type.iter scan_inner e
+        in
+        scan_inner inner_f.tf_expr
     | _ ->
         Type.iter scan e
   in
-  
   scan f.tf_expr;
-  
-  (* Return list of free variables, sorted by id for deterministic output *)
-  let vars = Hashtbl.fold (fun _ v acc -> v :: acc) free [] in
-  List.sort (fun v1 v2 -> compare v1.v_id v2.v_id) vars
+  !free
 
 (* ============================================================================
  * Closure Context Management

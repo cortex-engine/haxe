@@ -235,6 +235,12 @@ let is_array_type t =
   | TInst ({ cl_path = ([], "Array") }, _) -> true
   | _ -> false
 
+(* Check if type is an enum *)
+let is_enum_type t =
+  match follow t with
+  | TEnum _ -> true
+  | _ -> false
+
 (* ============================================================================
  * Array Utilities
  * ============================================================================ *)
@@ -392,3 +398,13 @@ let is_class_pointer_string s =
   is_c_pointer_string s &&
   s <> "FibString*" && s <> "FibArray*" && s <> "FibDynamic*" &&
   s <> "FibClosure*" && s <> "FibObject*"
+
+(* ============================================================================
+ * Function Type Utilities
+ * ============================================================================ *)
+
+(* Get parameter types from a function type *)
+let get_param_types t =
+  match follow t with
+  | TFun (args, _) -> List.map (fun (_, _, t) -> t) args
+  | _ -> []
