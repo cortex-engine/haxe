@@ -327,10 +327,7 @@ let needs_gc_marking_tc = function
 	(* Note: FibDynamic is NOT a pointer (struct), so excluded *)
 	| _ -> false
 
-(* String-based wrappers for compatibility *)
-let is_class_pointer_type s = is_class_pointer_tc (tc_type_of_string s)
-let is_enum_struct_type s = is_enum_struct_tc (tc_type_of_string s)
-let needs_gc_marking type_str = needs_gc_marking_tc (tc_type_of_string type_str)
+(* String-based wrappers removed - all callers now use tc_type versions *)
 
 (* Generate FibDynamic field access suffix for unboxing based on tc_type *)
 let fib_dynamic_unbox_suffix_tc = function
@@ -444,6 +441,20 @@ let get_actual_c_type _ctx e =
 	match get_actual_tc_type e with
 	| Some tc -> Some (tc_type_to_string tc)
 	| None -> None
+
+(* Get tc_type from expression, falling back to haxe type *)
+let get_expr_tc_type e =
+	match get_actual_tc_type e with
+	| Some tc -> tc
+	| None -> tc_type_of e.etype
+
+(* Check if tc_type is a GC-managed pointer that needs write barrier *)
+let needs_write_barrier_tc = function
+	| TCFibString | TCFibArray _ | TCFibClass _ | TCFibClosure
+	| TCFibObject | TCFibIntMap | TCFibStringMap
+	| TCFibInt64Map | TCFibObjectMap | TCFibBytesData -> true
+	| TCPointer _ -> true
+	| _ -> false
 
 (* is_enum_type now imported from FiberusTypeUtils *)
 
@@ -675,33 +686,19 @@ and gen_builtin_call ctx e args =
 		true
 	(* Std.string -> convert to string based on actual type *)
 	| TField (_, FStatic ({ cl_path = ([], "Std") }, { cf_name = "string" })), [arg] ->
-		let arg_type = match get_actual_c_type ctx arg with
-			| Some t -> t
-			| None -> s_type ctx arg.etype
-		in
-		if arg_type = "FibString*" || is_string_type arg.etype then
-			gen_value ctx arg
-		else if arg_type = "int32_t" then begin
-			spr ctx "fib_string_from_int(";
-			gen_value ctx arg;
-			spr ctx ")"
-		end else if arg_type = "double" || arg_type = "float" then begin
-			spr ctx "fib_string_from_float(";
-			gen_value ctx arg;
-			spr ctx ")"
-		end else if arg_type = "int64_t" then begin
-			spr ctx "fib_string_from_int64(";
-			gen_value ctx arg;
-			spr ctx ")"
-		end else if arg_type = "bool" then begin
-			spr ctx "(";
-			gen_value ctx arg;
-			spr ctx " ? fib_string_new(\"true\") : fib_string_new(\"false\"))"
-		end else begin
-			spr ctx "fib_dynamic_to_string(";
-			gen_value ctx arg;
-			spr ctx ")"
-		end;
+		let arg_tc = get_expr_tc_type arg in
+		(match arg_tc with
+		| TCFibString -> gen_value ctx arg
+		| TCInt32 ->
+			spr ctx "fib_string_from_int("; gen_value ctx arg; spr ctx ")"
+		| TCFloat64 | TCFloat32 ->
+			spr ctx "fib_string_from_float("; gen_value ctx arg; spr ctx ")"
+		| TCInt64 ->
+			spr ctx "fib_string_from_int64("; gen_value ctx arg; spr ctx ")"
+		| TCBool ->
+			spr ctx "("; gen_value ctx arg; spr ctx " ? fib_string_new(\"true\") : fib_string_new(\"false\"))"
+		| _ ->
+			spr ctx "fib_dynamic_to_string("; gen_value ctx arg; spr ctx ")");
 		true
 	(* Fiber.spawn with closure *)
 	| TField (_, FStatic ({ cl_path = ([], "Fiber") }, { cf_name = "spawn" })), [arg] ->
@@ -778,34 +775,18 @@ and gen_builtin_call ctx e args =
  *)
 and gen_array_call ctx arr cf args =
 	(* Helper to generate array with coercion if needed *)
+	let arr_tc = get_expr_tc_type arr in
 	let gen_array_value () =
-		match get_actual_c_type ctx arr with
-		| Some "FibDynamic" ->
+		if arr_tc = TCFibDynamic then begin
 			spr ctx "fib_dynamic_to_array(";
 			gen_value ctx arr;
 			spr ctx ")"
-		| _ -> gen_value ctx arr
+		end else gen_value ctx arr
 	in
 	(* Get the specialized array prefix if applicable *)
-	let arr_type = s_type ctx arr.etype in
-	let is_int_arr = arr_type = "FibIntArray*" in
-	let is_float_arr = arr_type = "FibFloatArray*" in
-	let is_bool_arr = arr_type = "FibBoolArray*" in
-	let is_uint8_arr = arr_type = "FibUInt8Array*" in
-	let is_int64_arr = arr_type = "FibInt64Array*" in
-	let is_uint64_arr = arr_type = "FibUInt64Array*" in
-	let is_float32_arr = arr_type = "FibFloat32Array*" in
-	let is_specialized = is_int_arr || is_float_arr || is_bool_arr ||
-		is_uint8_arr || is_int64_arr || is_uint64_arr || is_float32_arr in
-	let arr_prefix =
-		if is_int_arr then "fib_int_array_"
-		else if is_float_arr then "fib_float_array_"
-		else if is_bool_arr then "fib_bool_array_"
-		else if is_uint8_arr then "fib_uint8_array_"
-		else if is_int64_arr then "fib_int64_array_"
-		else if is_uint64_arr then "fib_uint64_array_"
-		else if is_float32_arr then "fib_float32_array_"
-		else "fib_array_"
+	let is_specialized, arr_prefix = match arr_tc with
+		| TCFibArray kind when kind <> TCArrGeneric -> true, array_kind_prefix kind
+		| _ -> false, "fib_array_"
 	in
 	match cf.cf_name with
 	| "push" ->
@@ -1398,14 +1379,11 @@ and gen_value ctx e =
 		spr ctx (ident v.v_name)
 	| TArray (e1, e2) ->
 		(* Unbox array element based on expected type *)
-		let elem_type = s_type ctx e.etype in
+		let elem_tc = tc_type_of e.etype in
 		(* Check if array expr is Dynamic/FibDynamic and needs conversion *)
-		let arr_type = match get_actual_c_type ctx e1 with
-			| Some t -> t
-			| None -> s_type ctx e1.etype
-		in
+		let arr_tc = get_expr_tc_type e1 in
 		let gen_arr () =
-			if arr_type = "FibDynamic" then begin
+			if arr_tc = TCFibDynamic then begin
 				spr ctx "fib_dynamic_to_array(";
 				gen_value ctx e1;
 				spr ctx ")"
@@ -1413,74 +1391,36 @@ and gen_value ctx e =
 				gen_value ctx e1
 		in
 		(* Check for specialized array types *)
-		if arr_type = "FibIntArray*" then begin
-			(* Specialized int array - direct access *)
-			spr ctx "fib_int_array_get(";
+		(match arr_tc with
+		| TCFibArray kind when kind <> TCArrGeneric ->
+			(* Specialized array - direct access with prefix_get *)
+			let prefix = array_kind_prefix kind in
+			print ctx "%sget(" prefix;
 			gen_value ctx e1;
 			spr ctx ", ";
 			gen_value ctx e2;
 			spr ctx ")"
-		end else if arr_type = "FibFloatArray*" then begin
-			(* Specialized float array - direct access *)
-			spr ctx "fib_float_array_get(";
-			gen_value ctx e1;
-			spr ctx ", ";
-			gen_value ctx e2;
-			spr ctx ")"
-		end else if arr_type = "FibBoolArray*" then begin
-			(* Specialized bool array - direct access *)
-			spr ctx "fib_bool_array_get(";
-			gen_value ctx e1;
-			spr ctx ", ";
-			gen_value ctx e2;
-			spr ctx ")"
-		end else if arr_type = "FibUInt8Array*" then begin
-			(* Specialized uint8 array - direct access *)
-			spr ctx "fib_uint8_array_get(";
-			gen_value ctx e1;
-			spr ctx ", ";
-			gen_value ctx e2;
-			spr ctx ")"
-		end else if arr_type = "FibInt64Array*" then begin
-			(* Specialized int64 array - direct access *)
-			spr ctx "fib_int64_array_get(";
-			gen_value ctx e1;
-			spr ctx ", ";
-			gen_value ctx e2;
-			spr ctx ")"
-		end else if arr_type = "FibUInt64Array*" then begin
-			(* Specialized uint64 array - direct access *)
-			spr ctx "fib_uint64_array_get(";
-			gen_value ctx e1;
-			spr ctx ", ";
-			gen_value ctx e2;
-			spr ctx ")"
-		end else if arr_type = "FibFloat32Array*" then begin
-			(* Specialized float32 array - direct access *)
-			spr ctx "fib_float32_array_get(";
-			gen_value ctx e1;
-			spr ctx ", ";
-			gen_value ctx e2;
-			spr ctx ")"
-		end else if is_class_pointer_type elem_type then begin
-			(* Object types - unwrap and cast to expected type *)
-			(* Extra parens ensure cast binds correctly for subsequent field access *)
-			spr ctx "((";
-			spr ctx elem_type;
-			spr ctx ")fib_array_get(";
-			gen_arr ();
-			spr ctx ", ";
-			gen_value ctx e2;
-			spr ctx ").data.objectVal)"
-		end else begin
-			(* Generic array access - unbox based on element type *)
-			spr ctx "fib_array_get(";
-			gen_arr ();
-			spr ctx ", ";
-			gen_value ctx e2;
-			spr ctx ")";
-			spr ctx (fib_dynamic_unbox_suffix elem_type)
-		end
+		| _ ->
+			(* Generic array or FibDynamic *)
+			if is_class_pointer_tc elem_tc then begin
+				(* Object types - unwrap and cast to expected type *)
+				let elem_type = tc_type_to_string elem_tc in
+				spr ctx "((";
+				spr ctx elem_type;
+				spr ctx ")fib_array_get(";
+				gen_arr ();
+				spr ctx ", ";
+				gen_value ctx e2;
+				spr ctx ").data.objectVal)"
+			end else begin
+				(* Generic array access - unbox based on element type *)
+				spr ctx "fib_array_get(";
+				gen_arr ();
+				spr ctx ", ";
+				gen_value ctx e2;
+				spr ctx ")";
+				spr ctx (fib_dynamic_unbox_suffix_tc elem_tc)
+			end)
 	| TBinop (op, e1, e2) ->
 		(* Handle string concatenation specially *)
 		let is_str = is_string_type e.etype || is_string_type e1.etype || is_string_type e2.etype in
@@ -1875,11 +1815,8 @@ and gen_value ctx e =
 					spr ctx ")")
 			| TField (obj_expr, field_access) ->
 				(* Field assignment - may need write barrier for generational GC *)
-				let lhs_type = s_type ctx e1.etype in
-				let rhs_type = match get_actual_c_type ctx e2 with
-					| Some t -> t
-					| None -> s_type ctx e2.etype
-				in
+				let lhs_tc = tc_type_of e1.etype in
+				let rhs_tc = get_expr_tc_type e2 in
 				(* Check if this is an instance field (has an object to barrier) *)
 				let is_instance_field = match field_access with
 					| FInstance (_, _, _) | FAnon _ | FDynamic _ -> true
@@ -1887,169 +1824,95 @@ and gen_value ctx e =
 					| FStatic _ | FEnum _ | FClosure (None, _) -> false
 				in
 				(* Check if RHS is an object pointer (not primitive) - needs write barrier *)
-				let needs_write_barrier = 
-					is_instance_field &&
-					(is_class_pointer_type rhs_type || 
-					rhs_type = "FibArray*" || 
-					rhs_type = "FibString*" ||
-					rhs_type = "FibObject*" ||
-					(String.length rhs_type > 0 && rhs_type.[String.length rhs_type - 1] = '*' &&
-					 rhs_type <> "char*" && rhs_type <> "void*" && rhs_type <> "int*"))
+				let needs_write_barrier = is_instance_field && needs_write_barrier_tc rhs_tc in
+				(* Helper to generate RHS with boxing if needed *)
+				let gen_rhs () =
+					if lhs_tc = TCFibDynamic && rhs_tc <> TCFibDynamic then
+						gen_box_to_fib_dynamic_tc ctx rhs_tc (fun () -> gen_value ctx e2)
+					else
+						gen_value ctx e2
 				in
 				if needs_write_barrier then begin
 					(* Emit: (FIBRIX_WRITE_BARRIER(obj, value), obj->field = value) *)
 					spr ctx "(FIBRIX_WRITE_BARRIER(";
-					(* Generate the object expression for write barrier *)
 					gen_value ctx obj_expr;
 					spr ctx ", ";
-					(* Generate the value expression for write barrier check *)
-					if lhs_type = "FibDynamic" && rhs_type = "FibArray*" then begin
-						spr ctx "fib_dynamic_array(";
-						gen_value ctx e2;
-						spr ctx ")"
-					end else if lhs_type = "FibDynamic" && rhs_type = "FibString*" then begin
-						spr ctx "fib_string_to_dynamic(";
-						gen_value ctx e2;
-						spr ctx ")"
-					end else if lhs_type = "FibDynamic" && is_class_pointer_type rhs_type then begin
-						spr ctx "fib_dynamic_object((FibObject*)";
-						gen_value ctx e2;
-						spr ctx ")"
-					end else
-						gen_value ctx e2;
+					gen_rhs ();
 					spr ctx "), ";
-					(* Now emit the actual assignment *)
 					gen_value ctx e1;
 					gen_binop ctx op;
-					if lhs_type = "FibDynamic" && rhs_type = "FibArray*" then begin
-						spr ctx "fib_dynamic_array(";
-						gen_value ctx e2;
-						spr ctx ")"
-					end else if lhs_type = "FibDynamic" && rhs_type = "FibString*" then begin
-						spr ctx "fib_string_to_dynamic(";
-						gen_value ctx e2;
-						spr ctx ")"
-					end else if lhs_type = "FibDynamic" && is_class_pointer_type rhs_type then begin
-						spr ctx "fib_dynamic_object((FibObject*)";
-						gen_value ctx e2;
-						spr ctx ")"
-					end else
-						gen_value ctx e2;
+					gen_rhs ();
 					spr ctx ")"
 				end else begin
 					(* No write barrier needed for primitives *)
 					spr ctx "(";
 					gen_value ctx e1;
 					gen_binop ctx op;
-					if lhs_type = "FibDynamic" && rhs_type = "int32_t" then begin
-						spr ctx "fib_dynamic_int(";
-						gen_value ctx e2;
-						spr ctx ")"
-					end else if lhs_type = "FibDynamic" && rhs_type = "double" then begin
-						spr ctx "fib_dynamic_float(";
-						gen_value ctx e2;
-						spr ctx ")"
-					end else if lhs_type = "FibDynamic" && rhs_type = "bool" then begin
-						spr ctx "fib_dynamic_bool(";
-						gen_value ctx e2;
-						spr ctx ")"
-					end else
-						gen_value ctx e2;
+					gen_rhs ();
 					spr ctx ")"
 				end
 			| _ ->
 				(* Regular assignment (local variable, etc.) - no write barrier needed *)
-				let lhs_type = s_type ctx e1.etype in
-				let rhs_type = match get_actual_c_type ctx e2 with
-					| Some t -> t
-					| None -> s_type ctx e2.etype
-				in
+				let lhs_tc = tc_type_of e1.etype in
+				let rhs_tc = get_expr_tc_type e2 in
 				spr ctx "(";
 				gen_value ctx e1;
 				gen_binop ctx op;
-				if lhs_type = "FibDynamic" && rhs_type = "FibArray*" then begin
-					spr ctx "fib_dynamic_array(";
-					gen_value ctx e2;
-					spr ctx ")"
-				end else if lhs_type = "FibDynamic" && rhs_type = "FibString*" then begin
-					spr ctx "fib_string_to_dynamic(";
-					gen_value ctx e2;
-					spr ctx ")"
-				end else if lhs_type = "FibDynamic" && rhs_type = "int32_t" then begin
-					spr ctx "fib_dynamic_int(";
-					gen_value ctx e2;
-					spr ctx ")"
-				end else if lhs_type = "FibDynamic" && rhs_type = "double" then begin
-					spr ctx "fib_dynamic_float(";
-					gen_value ctx e2;
-					spr ctx ")"
-				end else if lhs_type = "FibDynamic" && rhs_type = "bool" then begin
-					spr ctx "fib_dynamic_bool(";
-					gen_value ctx e2;
-					spr ctx ")"
-				end else if lhs_type = "FibDynamic" && is_class_pointer_type rhs_type then begin
-					spr ctx "fib_dynamic_object((FibObject*)";
-					gen_value ctx e2;
-					spr ctx ")"
-				end else
+				if lhs_tc = TCFibDynamic && rhs_tc <> TCFibDynamic then
+					gen_box_to_fib_dynamic_tc ctx rhs_tc (fun () -> gen_value ctx e2)
+				else
 					gen_value ctx e2;
 				spr ctx ")")
 		| OpUShr, _, _, _, _ ->
 			(* Unsigned right shift: cast to uint32_t, shift, cast back to int32_t *)
-			let e1_type = match get_actual_c_type ctx e1 with Some t -> t | None -> s_type ctx e1.etype in
-			let e2_type = match get_actual_c_type ctx e2 with Some t -> t | None -> s_type ctx e2.etype in
+			let e1_tc = get_expr_tc_type e1 in
+			let e2_tc = get_expr_tc_type e2 in
+			let gen_unbox_int tc gen_val =
+				if tc = TCFibDynamic then begin spr ctx "fib_dynamic_to_int("; gen_val (); spr ctx ")" end
+				else gen_val ()
+			in
 			spr ctx "((int32_t)((uint32_t)(";
-			if e1_type = "FibDynamic" then begin spr ctx "fib_dynamic_to_int("; gen_value ctx e1; spr ctx ")" end
-			else gen_value ctx e1;
+			gen_unbox_int e1_tc (fun () -> gen_value ctx e1);
 			spr ctx ") >> (";
-			if e2_type = "FibDynamic" then begin spr ctx "fib_dynamic_to_int("; gen_value ctx e2; spr ctx ")" end
-			else gen_value ctx e2;
+			gen_unbox_int e2_tc (fun () -> gen_value ctx e2);
 			spr ctx ")))"
 		| OpAssignOp OpUShr, _, _, _, _ ->
 			(* Unsigned right shift assignment: e1 = (int32_t)((uint32_t)e1 >> e2) *)
-			let e1_type = match get_actual_c_type ctx e1 with Some t -> t | None -> s_type ctx e1.etype in
-			let e2_type = match get_actual_c_type ctx e2 with Some t -> t | None -> s_type ctx e2.etype in
+			let e1_tc = get_expr_tc_type e1 in
+			let e2_tc = get_expr_tc_type e2 in
+			let gen_unbox_int tc gen_val =
+				if tc = TCFibDynamic then begin spr ctx "fib_dynamic_to_int("; gen_val (); spr ctx ")" end
+				else gen_val ()
+			in
 			spr ctx "(";
 			gen_value ctx e1;
-			if e1_type = "FibDynamic" then begin
+			if e1_tc = TCFibDynamic then begin
 				spr ctx " = fib_dynamic_int((int32_t)((uint32_t)fib_dynamic_to_int(";
 				gen_value ctx e1;
 				spr ctx ") >> (";
-				if e2_type = "FibDynamic" then begin spr ctx "fib_dynamic_to_int("; gen_value ctx e2; spr ctx ")" end
-				else gen_value ctx e2;
+				gen_unbox_int e2_tc (fun () -> gen_value ctx e2);
 				spr ctx ")))"
 			end else begin
 				spr ctx " = (int32_t)((uint32_t)(";
 				gen_value ctx e1;
 				spr ctx ") >> (";
-				if e2_type = "FibDynamic" then begin spr ctx "fib_dynamic_to_int("; gen_value ctx e2; spr ctx ")" end
-				else gen_value ctx e2;
+				gen_unbox_int e2_tc (fun () -> gen_value ctx e2);
 				spr ctx ")))"
 			end
 		| OpAssignOp inner_op, _, _, _, _ when (match e1.eexpr with TArray _ -> true | _ -> false) ->
 			(* Array compound assignment: arr[i] op= value  ->  arr_set(arr, i, arr_get(arr, i) op value) *)
 			(match e1.eexpr with
 			| TArray (arr, idx) ->
-				let arr_type = s_type ctx arr.etype in
-				if arr_type = "FibIntArray*" then begin
-					spr ctx "fib_int_array_set(";
+				let arr_tc = tc_type_of arr.etype in
+				(match arr_tc with
+				| TCFibArray kind when kind <> TCArrGeneric ->
+					(* Specialized array: prefix_set(arr, idx, prefix_get(arr, idx) op value) *)
+					let prefix = array_kind_prefix kind in
+					print ctx "%sset(" prefix;
 					gen_value ctx arr;
 					spr ctx ", ";
 					gen_value ctx idx;
-					spr ctx ", fib_int_array_get(";
-					gen_value ctx arr;
-					spr ctx ", ";
-					gen_value ctx idx;
-					spr ctx ")";
-					gen_binop ctx inner_op;
-					gen_value ctx e2;
-					spr ctx ")"
-				end else if arr_type = "FibFloatArray*" then begin
-					spr ctx "fib_float_array_set(";
-					gen_value ctx arr;
-					spr ctx ", ";
-					gen_value ctx idx;
-					spr ctx ", fib_float_array_get(";
+					print ctx ", %sget(" prefix;
 					gen_value ctx arr;
 					spr ctx ", ";
 					gen_value ctx idx;
@@ -2057,59 +1920,7 @@ and gen_value ctx e =
 					gen_binop ctx inner_op;
 					gen_value ctx e2;
 					spr ctx ")"
-				end else if arr_type = "FibUInt8Array*" then begin
-					spr ctx "fib_uint8_array_set(";
-					gen_value ctx arr;
-					spr ctx ", ";
-					gen_value ctx idx;
-					spr ctx ", fib_uint8_array_get(";
-					gen_value ctx arr;
-					spr ctx ", ";
-					gen_value ctx idx;
-					spr ctx ")";
-					gen_binop ctx inner_op;
-					gen_value ctx e2;
-					spr ctx ")"
-				end else if arr_type = "FibInt64Array*" then begin
-					spr ctx "fib_int64_array_set(";
-					gen_value ctx arr;
-					spr ctx ", ";
-					gen_value ctx idx;
-					spr ctx ", fib_int64_array_get(";
-					gen_value ctx arr;
-					spr ctx ", ";
-					gen_value ctx idx;
-					spr ctx ")";
-					gen_binop ctx inner_op;
-					gen_value ctx e2;
-					spr ctx ")"
-				end else if arr_type = "FibUInt64Array*" then begin
-					spr ctx "fib_uint64_array_set(";
-					gen_value ctx arr;
-					spr ctx ", ";
-					gen_value ctx idx;
-					spr ctx ", fib_uint64_array_get(";
-					gen_value ctx arr;
-					spr ctx ", ";
-					gen_value ctx idx;
-					spr ctx ")";
-					gen_binop ctx inner_op;
-					gen_value ctx e2;
-					spr ctx ")"
-				end else if arr_type = "FibFloat32Array*" then begin
-					spr ctx "fib_float32_array_set(";
-					gen_value ctx arr;
-					spr ctx ", ";
-					gen_value ctx idx;
-					spr ctx ", fib_float32_array_get(";
-					gen_value ctx arr;
-					spr ctx ", ";
-					gen_value ctx idx;
-					spr ctx ")";
-					gen_binop ctx inner_op;
-					gen_value ctx e2;
-					spr ctx ")"
-				end else begin
+				| _ ->
 					(* Generic array with FibDynamic *)
 					spr ctx "fib_array_set(";
 					gen_value ctx arr;
@@ -2122,14 +1933,23 @@ and gen_value ctx e =
 					spr ctx "))";
 					gen_binop ctx inner_op;
 					gen_value ctx e2;
-					spr ctx "))"
-				end
+					spr ctx "))")
 			| _ -> assert false)
 		| OpAssignOp inner_op, _, _, _, _ ->
 			(* Compound assignment on FibDynamic: a op= b -> a = fib_dynamic_XXX(fib_dynamic_to_XXX(a) op b) *)
-			let lhs_type = match get_actual_c_type ctx e1 with Some t -> t | None -> s_type ctx e1.etype in
-			let rhs_type = match get_actual_c_type ctx e2 with Some t -> t | None -> s_type ctx e2.etype in
-			if lhs_type = "FibDynamic" then begin
+			let lhs_tc = get_expr_tc_type e1 in
+			let rhs_tc = get_expr_tc_type e2 in
+			let gen_unbox_rhs () =
+				if rhs_tc = TCFibDynamic then begin
+					if lhs_tc = TCFloat64 then begin
+						spr ctx "fib_dynamic_to_float("; gen_value ctx e2; spr ctx ")"
+					end else begin
+						spr ctx "fib_dynamic_to_int("; gen_value ctx e2; spr ctx ")"
+					end
+				end else
+					gen_value ctx e2
+			in
+			if lhs_tc = TCFibDynamic then begin
 				(* LHS is FibDynamic - need to extract, operate, and re-box *)
 				spr ctx "(";
 				gen_value ctx e1;
@@ -2137,50 +1957,26 @@ and gen_value ctx e =
 				gen_value ctx e1;
 				spr ctx ")";
 				gen_binop ctx inner_op;
-				if rhs_type = "FibDynamic" then begin
-					spr ctx "fib_dynamic_to_int(";
-					gen_value ctx e2;
-					spr ctx ")"
-				end else
-					gen_value ctx e2;
+				gen_unbox_rhs ();
 				spr ctx "))"
 			end else begin
 				(* LHS is not FibDynamic - regular compound assignment *)
 				spr ctx "(";
 				gen_value ctx e1;
 				gen_binop ctx (OpAssignOp inner_op);
-				if rhs_type = "FibDynamic" then begin
-					(* RHS is FibDynamic - extract it *)
-					if lhs_type = "double" then begin
-						spr ctx "fib_dynamic_to_float(";
-						gen_value ctx e2;
-						spr ctx ")"
-					end else begin
-						spr ctx "fib_dynamic_to_int(";
-						gen_value ctx e2;
-						spr ctx ")"
-					end
-				end else
-					gen_value ctx e2;
+				gen_unbox_rhs ();
 				spr ctx ")"
 			end
 		| _, _, _, _, _ ->
 			(* Check if either operand needs FibDynamic extraction for comparisons/arithmetic *)
-			(* Use get_actual_c_type to detect dynamic field access that returns FibDynamic at runtime *)
-			let get_c_type exp =
-				match get_actual_c_type ctx exp with
-				| Some t -> t
-				| None -> s_type ctx exp.etype
-			in
-			let my_type = get_c_type e1 in
-			let other_type = get_c_type e2 in
-			(* Determine the extraction target type based on Haxe result type *)
-			let result_type = s_type ctx e.etype in
+			let e1_tc = get_expr_tc_type e1 in
+			let e2_tc = get_expr_tc_type e2 in
+			let result_tc = tc_type_of e.etype in
 			(* For arithmetic, comparison, bitwise, and boolean ops, we need to extract FibDynamic to primitives *)
 			let is_numeric_op = match op with
 				| OpAdd | OpSub | OpMult | OpDiv | OpMod -> true
-				| OpLt | OpLte | OpGt | OpGte -> true  (* comparison ops need extraction *)
-				| OpAnd | OpOr | OpXor | OpShl | OpShr | OpUShr -> true  (* bitwise ops need extraction *)
+				| OpLt | OpLte | OpGt | OpGte -> true
+				| OpAnd | OpOr | OpXor | OpShl | OpShr | OpUShr -> true
 				| _ -> false
 			in
 			let is_bool_op = match op with
@@ -2188,44 +1984,31 @@ and gen_value ctx e =
 				| _ -> false
 			in
 			let is_arithmetic = is_numeric_op || is_bool_op in
-			(* For equality ops between FibDynamic and primitive, extract the FibDynamic side *)
-			let is_equality = match op with
-				| OpEq | OpNotEq -> true
+			let is_equality = match op with OpEq | OpNotEq -> true | _ -> false in
+			let is_primitive_tc = function
+				| TCInt32 | TCFloat64 | TCBool | TCInt64 -> true
 				| _ -> false
 			in
-			let is_primitive_type t = 
-				t = "int32_t" || t = "double" || t = "bool" || t = "int64_t"
-			in
 			(* If operand's C type is FibDynamic, we need to extract for arithmetic/equality *)
-			let e1_needs_extract = my_type = "FibDynamic" && (is_arithmetic || (is_equality && is_primitive_type other_type)) in
-			let e2_needs_extract = other_type = "FibDynamic" && (is_arithmetic || (is_equality && is_primitive_type my_type)) in
-			(* Determine target type for extraction - use the non-FibDynamic operand's type for equality/comparison *)
+			let e1_needs_extract = e1_tc = TCFibDynamic && (is_arithmetic || (is_equality && is_primitive_tc e2_tc)) in
+			let e2_needs_extract = e2_tc = TCFibDynamic && (is_arithmetic || (is_equality && is_primitive_tc e1_tc)) in
+			(* Determine target type for extraction *)
 			let is_comparison = match op with OpLt | OpLte | OpGt | OpGte -> true | _ -> false in
-			let target_type_for_extract = 
+			let target_tc =
 				if is_equality || is_comparison then
-					(* For equality/comparison, extract FibDynamic to match the other operand's type *)
-					if my_type = "FibDynamic" then other_type else my_type
-				else if is_bool_op then
-					"bool"  (* Boolean ops always need bool extraction *)
-				else 
-					result_type
+					if e1_tc = TCFibDynamic then e2_tc else e1_tc
+				else if is_bool_op then TCBool
+				else result_tc
 			in
 			let gen_with_extraction exp needs_extract =
-				if needs_extract then begin
-					(* Extract based on the target type *)
-					if target_type_for_extract = "double" then begin
-						spr ctx "fib_dynamic_to_float("; gen_value ctx exp; spr ctx ")"
-					end else if target_type_for_extract = "int32_t" then begin
-						spr ctx "fib_dynamic_to_int("; gen_value ctx exp; spr ctx ")"
-					end else if target_type_for_extract = "bool" then begin
-						spr ctx "fib_dynamic_to_bool("; gen_value ctx exp; spr ctx ")"
-					end else if target_type_for_extract = "int64_t" then begin
-						spr ctx "fib_dynamic_to_int64("; gen_value ctx exp; spr ctx ")"
-					end else begin
-						(* Fallback: try int for unknown types (safer than double for bitwise ops) *)
-						spr ctx "fib_dynamic_to_int("; gen_value ctx exp; spr ctx ")"
-					end
-				end else
+				if needs_extract then
+					match target_tc with
+					| TCFloat64 -> spr ctx "fib_dynamic_to_float("; gen_value ctx exp; spr ctx ")"
+					| TCInt32 -> spr ctx "fib_dynamic_to_int("; gen_value ctx exp; spr ctx ")"
+					| TCBool -> spr ctx "fib_dynamic_to_bool("; gen_value ctx exp; spr ctx ")"
+					| TCInt64 -> spr ctx "fib_dynamic_to_int64("; gen_value ctx exp; spr ctx ")"
+					| _ -> spr ctx "fib_dynamic_to_int("; gen_value ctx exp; spr ctx ")"
+				else
 					gen_value ctx exp
 			in
 			spr ctx "(";
@@ -2449,93 +2232,32 @@ and gen_value ctx e =
 		| (Increment | Decrement), TArray (arr, idx) ->
 			(* Array element increment/decrement needs special handling *)
 			(* Generate: fib_xxx_array_set(arr, idx, fib_xxx_array_get(arr, idx) +/- 1) *)
-			let arr_type = match get_actual_c_type ctx arr with
-				| Some t -> t
-				| None -> s_type ctx arr.etype
-			in
+			let arr_tc = get_expr_tc_type arr in
 			let op_str = match op with Increment -> " + 1" | Decrement -> " - 1" | _ -> "" in
-			if arr_type = "FibIntArray*" then begin
-				spr ctx "fib_int_array_set(";
+			(match arr_tc with
+			| TCFibArray kind when kind <> TCArrGeneric ->
+				(* Specialized array: prefix_set(arr, idx, prefix_get(arr, idx) +/- 1) *)
+				let prefix = array_kind_prefix kind in
+				print ctx "%sset(" prefix;
 				gen_value ctx arr;
 				spr ctx ", ";
 				gen_value ctx idx;
-				spr ctx ", fib_int_array_get(";
-				gen_value ctx arr;
-				spr ctx ", ";
-				gen_value ctx idx;
-				spr ctx ")";
-				spr ctx op_str;
-				spr ctx ")"
-			end else if arr_type = "FibFloatArray*" then begin
-				spr ctx "fib_float_array_set(";
-				gen_value ctx arr;
-				spr ctx ", ";
-				gen_value ctx idx;
-				spr ctx ", fib_float_array_get(";
+				print ctx ", %sget(" prefix;
 				gen_value ctx arr;
 				spr ctx ", ";
 				gen_value ctx idx;
 				spr ctx ")";
 				spr ctx op_str;
 				spr ctx ")"
-			end else if arr_type = "FibUInt8Array*" then begin
-				spr ctx "fib_uint8_array_set(";
-				gen_value ctx arr;
-				spr ctx ", ";
-				gen_value ctx idx;
-				spr ctx ", fib_uint8_array_get(";
-				gen_value ctx arr;
-				spr ctx ", ";
-				gen_value ctx idx;
-				spr ctx ")";
-				spr ctx op_str;
-				spr ctx ")"
-			end else if arr_type = "FibInt64Array*" then begin
-				spr ctx "fib_int64_array_set(";
-				gen_value ctx arr;
-				spr ctx ", ";
-				gen_value ctx idx;
-				spr ctx ", fib_int64_array_get(";
-				gen_value ctx arr;
-				spr ctx ", ";
-				gen_value ctx idx;
-				spr ctx ")";
-				spr ctx op_str;
-				spr ctx ")"
-			end else if arr_type = "FibUInt64Array*" then begin
-				spr ctx "fib_uint64_array_set(";
-				gen_value ctx arr;
-				spr ctx ", ";
-				gen_value ctx idx;
-				spr ctx ", fib_uint64_array_get(";
-				gen_value ctx arr;
-				spr ctx ", ";
-				gen_value ctx idx;
-				spr ctx ")";
-				spr ctx op_str;
-				spr ctx ")"
-			end else if arr_type = "FibFloat32Array*" then begin
-				spr ctx "fib_float32_array_set(";
-				gen_value ctx arr;
-				spr ctx ", ";
-				gen_value ctx idx;
-				spr ctx ", fib_float32_array_get(";
-				gen_value ctx arr;
-				spr ctx ", ";
-				gen_value ctx idx;
-				spr ctx ")";
-				spr ctx op_str;
-				spr ctx ")"
-			end else begin
+			| _ ->
 				(* Generic array - use standard ++ *)
 				if flag = Prefix then gen_unop ctx op flag;
 				gen_value ctx e;
-				if flag = Postfix then gen_unop ctx op flag
-			end
+				if flag = Postfix then gen_unop ctx op flag)
 		| (Increment | Decrement), _ ->
 			(* Check if operand is FibDynamic - need special handling *)
-			let operand_type = match get_actual_c_type ctx e with Some t -> t | None -> s_type ctx e.etype in
-			if operand_type = "FibDynamic" then begin
+			let operand_tc = get_expr_tc_type e in
+			if operand_tc = TCFibDynamic then begin
 				(* FibDynamic increment/decrement:
 				 * Pre:  ({ e = fib_dynamic_int(fib_dynamic_to_int(e) +/- 1); fib_dynamic_to_int(e); })
 				 * Post: ({ int32_t _old = fib_dynamic_to_int(e); e = fib_dynamic_int(_old +/- 1); _old; })
@@ -2568,8 +2290,8 @@ and gen_value ctx e =
 			end
 		| _ ->
 			(* Other unary operations (Not, Neg, NegBits) *)
-			let operand_type = match get_actual_c_type ctx e with Some t -> t | None -> s_type ctx e.etype in
-			if operand_type = "FibDynamic" then begin
+			let operand_tc = get_expr_tc_type e in
+			if operand_tc = TCFibDynamic then begin
 				(* FibDynamic unary ops need extraction *)
 				(match op with
 				| Not ->
@@ -2718,15 +2440,15 @@ and gen_value ctx e =
 	| TIf (cond, e1, e2) ->
 		ctx.in_value <- true;
 		(* Check for type mismatch in ternary - need to coerce branches to same type *)
-		let t1 = match get_actual_c_type ctx e1 with Some t -> t | None -> s_type ctx e1.etype in
-		let t2 = match e2 with
-			| Some e -> (match get_actual_c_type ctx e with Some t -> t | None -> s_type ctx e.etype)
-			| None -> "FibDynamic"
+		let t1_tc = get_expr_tc_type e1 in
+		let t2_tc = match e2 with
+			| Some e -> get_expr_tc_type e
+			| None -> TCFibDynamic
 		in
 		spr ctx "((";
 		(* Condition might be FibDynamic - extract to bool if needed *)
-		let cond_type = match get_actual_c_type ctx cond with Some t -> t | None -> s_type ctx cond.etype in
-		if cond_type = "FibDynamic" then begin
+		let cond_tc = get_expr_tc_type cond in
+		if cond_tc = TCFibDynamic then begin
 			spr ctx "fib_dynamic_to_bool(";
 			gen_value ctx cond;
 			spr ctx ")"
@@ -2734,16 +2456,16 @@ and gen_value ctx e =
 			gen_value ctx cond;
 		spr ctx ") ? (";
 		(* If one side is FibDynamic and other is primitive, box the primitive *)
-		if t2 = "FibDynamic" && t1 <> "FibDynamic" then
-			gen_box_to_fib_dynamic ctx t1 (fun () -> gen_value ctx e1)
+		if t2_tc = TCFibDynamic && t1_tc <> TCFibDynamic then
+			gen_box_to_fib_dynamic_tc ctx t1_tc (fun () -> gen_value ctx e1)
 		else
 			gen_value ctx e1;
 		spr ctx ") : (";
 		(match e2 with
 		| None -> spr ctx "fib_dynamic_null()"
 		| Some e ->
-			if t1 = "FibDynamic" && t2 <> "FibDynamic" then
-				gen_box_to_fib_dynamic ctx t2 (fun () -> gen_value ctx e)
+			if t1_tc = TCFibDynamic && t2_tc <> TCFibDynamic then
+				gen_box_to_fib_dynamic_tc ctx t2_tc (fun () -> gen_value ctx e)
 			else
 				gen_value ctx e);
 		spr ctx "))"
@@ -2765,111 +2487,50 @@ and gen_value ctx e =
 		(* Begin exception unwinding - captures stack frames as we unwind *)
 		spr ctx "fib_exception_begin(); fib_throw(";
 		(* Box the value into FibDynamic based on its type *)
-		let throw_type = s_type ctx e.etype in
-		if throw_type = "FibDynamic" then
-			gen_value ctx e
-		else if throw_type = "FibString*" then begin
-			spr ctx "fib_string_to_dynamic(";
-			gen_value ctx e;
-			spr ctx ")"
-		end else if throw_type = "int32_t" then begin
-			spr ctx "fib_dynamic_int(";
-			gen_value ctx e;
-			spr ctx ")"
-		end else if throw_type = "double" then begin
-			spr ctx "fib_dynamic_float(";
-			gen_value ctx e;
-			spr ctx ")"
-		end else if throw_type = "bool" then begin
-			spr ctx "fib_dynamic_bool(";
-			gen_value ctx e;
-			spr ctx ")"
-		end else if is_enum_struct_type throw_type then begin
-			(* For enum values (value types), box with fib_dynamic_enum.
-			   Need to use statement expression with temp var since we can't take address of function return. *)
-			print ctx "({ %s _enum_tmp = " throw_type;
-			gen_value ctx e;
-			print ctx "; fib_dynamic_enum(&_enum_tmp, sizeof(%s)); })" throw_type
-		end else begin
-			(* For objects/exceptions, wrap in FibDynamic *)
-			spr ctx "fib_dynamic_object((FibObject*)";
-			gen_value ctx e;
-			spr ctx ")"
-		end;
+		let throw_tc = tc_type_of e.etype in
+		gen_box_to_fib_dynamic_tc ctx throw_tc (fun () -> gen_value ctx e);
 		spr ctx ")"
 	| TCast (inner, _) ->
 		(* Generate type conversion if needed *)
-		let from_c = match get_actual_c_type ctx inner with
-			| Some t -> t
-			| None -> s_type ctx inner.etype
-		in
-		let to_c = s_type ctx e.etype in
-		if from_c = to_c then
+		let from_tc = get_expr_tc_type inner in
+		let to_tc = tc_type_of e.etype in
+		if from_tc = to_tc then
 			gen_value ctx inner
-		else if from_c = "FibDynamic" && to_c = "int32_t" then begin
-			spr ctx "fib_dynamic_to_int(";
-			gen_value ctx inner;
-			spr ctx ")"
-		end else if from_c = "FibDynamic" && to_c = "double" then begin
-			spr ctx "fib_dynamic_to_float(";
-			gen_value ctx inner;
-			spr ctx ")"
-		end else if from_c = "FibDynamic" && to_c = "bool" then begin
-			spr ctx "fib_dynamic_to_bool(";
-			gen_value ctx inner;
-			spr ctx ")"
-		end else if from_c = "FibDynamic" && to_c = "FibString*" then begin
-			spr ctx "fib_dynamic_to_string(";
-			gen_value ctx inner;
-			spr ctx ")"
-		end else if from_c = "FibDynamic" && is_class_pointer_type to_c then begin
-			print ctx "((%s)fib_dynamic_to_object(" to_c;
-			gen_value ctx inner;
-			spr ctx "))"
-		end else
+		else if from_tc = TCFibDynamic then
+			(* Unbox from FibDynamic to target type *)
+			(match to_tc with
+			| TCInt32 -> spr ctx "fib_dynamic_to_int("; gen_value ctx inner; spr ctx ")"
+			| TCFloat64 -> spr ctx "fib_dynamic_to_float("; gen_value ctx inner; spr ctx ")"
+			| TCBool -> spr ctx "fib_dynamic_to_bool("; gen_value ctx inner; spr ctx ")"
+			| TCFibString -> spr ctx "fib_dynamic_to_string("; gen_value ctx inner; spr ctx ")"
+			| TCFibClass name -> print ctx "((%s*)fib_dynamic_to_object(" name; gen_value ctx inner; spr ctx "))"
+			| _ -> gen_value ctx inner)
+		else
 			gen_value ctx inner
 	| TMeta (_, e) ->
 		gen_value ctx e
 	| TEnumParameter (enum_expr, _, i) ->
 		(* Enum params are stored as FibDynamic, need to unbox based on target type *)
-		let param_type = s_type ctx e.etype in
-		if param_type = "FibString*" then begin
-			spr ctx "fib_dynamic_to_string(";
-			gen_value ctx enum_expr;
-			print ctx ".params[%d])" i
-		end else if param_type = "FibArray*" then begin
-			spr ctx "fib_dynamic_to_array(";
-			gen_value ctx enum_expr;
-			print ctx ".params[%d])" i
-		end else if param_type = "int32_t" then begin
-			spr ctx "fib_dynamic_to_int(";
-			gen_value ctx enum_expr;
-			print ctx ".params[%d])" i
-		end else if param_type = "double" then begin
-			spr ctx "fib_dynamic_to_float(";
-			gen_value ctx enum_expr;
-			print ctx ".params[%d])" i
-		end else if param_type = "bool" then begin
-			spr ctx "fib_dynamic_to_bool(";
-			gen_value ctx enum_expr;
-			print ctx ".params[%d])" i
-		end else if is_class_pointer_type param_type then begin
-			(* Unbox to object and cast to class type *)
-			print ctx "((%s)fib_dynamic_to_object(" param_type;
-			gen_value ctx enum_expr;
-			print ctx ".params[%d]))" i
-		end else if is_enum_struct_type param_type then begin
+		let param_tc = tc_type_of e.etype in
+		let gen_param_access () = gen_value ctx enum_expr; print ctx ".params[%d]" i in
+		(match param_tc with
+		| TCFibString -> spr ctx "fib_dynamic_to_string("; gen_param_access (); spr ctx ")"
+		| TCFibArray TCArrGeneric -> spr ctx "fib_dynamic_to_array("; gen_param_access (); spr ctx ")"
+		| TCInt32 -> spr ctx "fib_dynamic_to_int("; gen_param_access (); spr ctx ")"
+		| TCFloat64 -> spr ctx "fib_dynamic_to_float("; gen_param_access (); spr ctx ")"
+		| TCBool -> spr ctx "fib_dynamic_to_bool("; gen_param_access (); spr ctx ")"
+		| TCFibClass name ->
+			print ctx "((%s*)fib_dynamic_to_object(" name; gen_param_access (); spr ctx "))"
+		| TCFibEnum name ->
 			(* Unbox enum with null check - use index=-1 for null *)
 			print ctx "(fib_dynamic_is_null(";
-			gen_value ctx enum_expr;
-			print ctx ".params[%d]) ? (%s){ .index = -1 } : (*(%s*)fib_dynamic_to_ptr(" i param_type param_type;
-			gen_value ctx enum_expr;
-			print ctx ".params[%d])))" i
-		end else begin
+			gen_param_access ();
+			print ctx ") ? (%s){ .index = -1 } : (*(%s*)fib_dynamic_to_ptr(" name name;
+			gen_param_access ();
+			spr ctx ")))"
+		| _ ->
 			(* FibDynamic or unknown - access directly *)
-			gen_value ctx enum_expr;
-			print ctx ".params[%d]" i
-		end
+			gen_param_access ())
 	| TEnumIndex enum_e ->
 		(* Check if expression returns FibDynamic (dynamic field access) *)
 		let is_dyn = match enum_e.eexpr with
@@ -3409,37 +3070,8 @@ and gen_expr ctx e =
 		(* Begin exception unwinding - captures stack frames as we unwind *)
 		spr ctx "fib_exception_begin(); fib_throw(";
 		(* Box the value into FibDynamic based on its type *)
-		let throw_type = s_type ctx e.etype in
-		if throw_type = "FibDynamic" then
-			gen_value ctx e
-		else if throw_type = "FibString*" then begin
-			spr ctx "fib_string_to_dynamic(";
-			gen_value ctx e;
-			spr ctx ")"
-		end else if throw_type = "int32_t" then begin
-			spr ctx "fib_dynamic_int(";
-			gen_value ctx e;
-			spr ctx ")"
-		end else if throw_type = "double" then begin
-			spr ctx "fib_dynamic_float(";
-			gen_value ctx e;
-			spr ctx ")"
-		end else if throw_type = "bool" then begin
-			spr ctx "fib_dynamic_bool(";
-			gen_value ctx e;
-			spr ctx ")"
-		end else if is_enum_struct_type throw_type then begin
-			(* For enum values (value types), box with fib_dynamic_enum.
-			   Need to use statement expression with temp var since we can't take address of function return. *)
-			print ctx "({ %s _enum_tmp = " throw_type;
-			gen_value ctx e;
-			print ctx "; fib_dynamic_enum(&_enum_tmp, sizeof(%s)); })" throw_type
-		end else begin
-			(* For objects/exceptions, wrap in FibDynamic *)
-			spr ctx "fib_dynamic_object((FibObject*)";
-			gen_value ctx e;
-			spr ctx ")"
-		end;
+		let throw_tc = tc_type_of e.etype in
+		gen_box_to_fib_dynamic_tc ctx throw_tc (fun () -> gen_value ctx e);
 		spr ctx ")"
 
 let gen_function ctx name f c is_static =
@@ -3873,8 +3505,8 @@ let gen_class_impl ctx c =
 		let gc_fields = List.filter (fun cf ->
 			match cf.cf_kind with
 			| Var _ when not (has_class_field_flag cf CfStatic) ->
-				let type_str = s_type ctx cf.cf_type in
-				needs_gc_marking type_str
+				let type_tc = tc_type_of cf.cf_type in
+				needs_gc_marking_tc type_tc
 			| _ -> false
 		) c.cl_ordered_fields in
 
@@ -4330,13 +3962,9 @@ let gen_enum_impl ctx e =
 				newline ctx;
 				let i = ref 0 in
 				List.iter (fun (n, _, t) ->
-					let arg_type = s_type ctx t in
+					let arg_tc = tc_type_of t in
 					print ctx "_e.params[%d] = " !i;
-					if is_enum_struct_type arg_type then
-						(* Enum struct - box it using fib_dynamic_enum *)
-						print ctx "fib_dynamic_enum(&%s, sizeof(%s))" (ident n) arg_type
-					else
-						gen_box_to_fib_dynamic ctx arg_type (fun () -> spr ctx (ident n));
+					gen_box_to_fib_dynamic_tc ctx arg_tc (fun () -> spr ctx (ident n));
 					spr ctx ";";
 					newline ctx;
 					incr i
