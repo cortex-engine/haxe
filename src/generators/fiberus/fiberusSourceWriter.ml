@@ -351,9 +351,10 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
         | TCBoxObject | TCBoxClosure ->
             write w "(FibObject*)";
             write_expr w e
-        | TCBoxEnum _ ->
+        | TCBoxEnum enum_name ->
             write w "&";
-            write_expr w e
+            write_expr w e;
+            writef w ", sizeof(%s)" enum_name
         | _ ->
             write_expr w e);
         write w ")"

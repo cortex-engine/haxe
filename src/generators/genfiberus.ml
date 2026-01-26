@@ -2067,11 +2067,8 @@ let gen_constructor ctx c =
 				spr ctx " {";
 				newline ctx;
 				ctx.tabs <- "\t";
-				(* Use inline allocation directly - avoids extra TLS caching when _init doesn't need it *)
-				print ctx "%s* this = gc_alloc_object_inline(sizeof(%s));" class_name class_name;
-				newline ctx;
-				(* Set class pointer *)
-				print ctx "((FibObject*)this)->clazz = &%s_class;" class_name;
+				(* Use gc_alloc_object_with_class - sets clazz atomically before allocStart *)
+				print ctx "%s* this = gc_alloc_object_with_class(sizeof(%s), &%s_class);" class_name class_name class_name;
 				newline ctx;
 				(* Call _init with args - use filtered args for consistency *)
 				let arg_names = List.map (fun (v, _) -> ident v.v_name) filtered_args in
@@ -2812,6 +2809,7 @@ let gen_header ctx com =
 	spr ctx "#include \"scheduler.h\"\n";
 	spr ctx "#include \"counter.h\"\n";
 	spr ctx "#include \"iouring.h\"\n";
+	spr ctx "#include \"date.h\"\n";
 	spr ctx "\n";
 
 	(* Fiber yield point macro - uses runtime scheduler_should_yield from scheduler.h *)
@@ -2848,8 +2846,9 @@ let gen_header ctx com =
 	spr ctx "\treturn v.type == FIB_TYPE_ARRAY;\n";
 	spr ctx "}\n\n";
 	spr ctx "/* Memory allocation - GC-tracked objects (inline fast path) */\n";
+	spr ctx "/* NOTE: For object allocation, prefer gc_alloc_object_with_class() to avoid race conditions */\n";
 	spr ctx "static inline void* fib_alloc(size_t size) {\n";
-	spr ctx "\treturn gc_alloc_object_inline(size);\n";
+	spr ctx "\treturn gc_alloc_ctx(tls_current_alloc, size);\n";
 	spr ctx "}\n\n";
 	spr ctx "/* Context-based allocation (preferred - avoids repeated TLS access) */\n";
 	spr ctx "static inline void* fib_alloc_ctx(FibrixLocalAlloc* ctx, size_t size) {\n";
@@ -3206,9 +3205,7 @@ let gen_header ctx com =
 				newline ctx;
 				print ctx "static inline %s* %s_new(void) {" class_name class_name;
 				newline ctx;
-				print ctx "\t%s* this = gc_alloc_object_inline(sizeof(%s));" class_name class_name;
-				newline ctx;
-				print ctx "\t((FibObject*)this)->clazz = &%s_class;" class_name;
+				print ctx "\t%s* this = gc_alloc_object_with_class(sizeof(%s), &%s_class);" class_name class_name class_name;
 				newline ctx;
 				print ctx "\treturn this;";
 				newline ctx;
@@ -3258,9 +3255,7 @@ let gen_header ctx com =
 						let arg_names = List.map (fun (v, _) -> ident v.v_name) filtered_args in
 						print ctx "static inline %s* %s_new(%s) {" class_name class_name args_str_for_new;
 						newline ctx;
-						print ctx "\t%s* this = gc_alloc_object_inline(sizeof(%s));" class_name class_name;
-						newline ctx;
-						print ctx "\t((FibObject*)this)->clazz = &%s_class;" class_name;
+						print ctx "\t%s* this = gc_alloc_object_with_class(sizeof(%s), &%s_class);" class_name class_name class_name;
 						newline ctx;
 						print ctx "\t%s_init(this%s);" class_name
 							(if arg_names = [] then "" else ", " ^ String.concat ", " arg_names);
@@ -3377,11 +3372,11 @@ let gen_runtime_globals gc_roots =
 	Buffer.add_string buf "};\n\n";
 	Buffer.add_string buf "void haxe_Exception_init(haxe_Exception* this, FibString* message, haxe_Exception* previous, FibDynamic native) {\n";
 	Buffer.add_string buf "\t(void)previous; (void)native;\n";
-	Buffer.add_string buf "\t((FibObject*)this)->clazz = &haxe_Exception_class;\n";
+	Buffer.add_string buf "\t/* clazz already set by gc_alloc_object_with_class */\n";
 	Buffer.add_string buf "\tthis->message = message ? message : fib_string_new(\"Exception\");\n";
 	Buffer.add_string buf "}\n\n";
 	Buffer.add_string buf "haxe_Exception* haxe_Exception_new(FibString* message, haxe_Exception* previous, FibDynamic native) {\n";
-	Buffer.add_string buf "\thaxe_Exception* this = fib_alloc(sizeof(haxe_Exception));\n";
+	Buffer.add_string buf "\thaxe_Exception* this = gc_alloc_object_with_class(sizeof(haxe_Exception), &haxe_Exception_class);\n";
 	Buffer.add_string buf "\thaxe_Exception_init(this, message, previous, native);\n";
 	Buffer.add_string buf "\treturn this;\n";
 	Buffer.add_string buf "}\n\n";

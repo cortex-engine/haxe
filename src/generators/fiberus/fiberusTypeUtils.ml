@@ -9,6 +9,7 @@
  * - Boxing/unboxing helpers
  *)
 
+open Ast
 open Type
 open FiberusAst
 open FiberusStrings
@@ -88,7 +89,11 @@ let rec tc_type_of t =
       | (["fiberus"], "Float64") -> TCFloat64
       | (["fiberus"], "SizeT") -> TCSizeT
       | (["fiberus"], "AtomicInt") -> TCAtomicInt
-      | _ -> tc_type_of (Abstract.get_underlying_type a tl))
+      | _ ->
+          (* Check for @:native metadata before falling back to underlying type *)
+          match get_meta_string a.a_meta Meta.Native with
+          | Some native_str -> TCRaw native_str
+          | None -> tc_type_of (Abstract.get_underlying_type a tl))
   | TLazy f -> tc_type_of (lazy_type f)
 
 (* Convert a tvar to tc_type *)

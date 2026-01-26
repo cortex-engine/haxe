@@ -1261,13 +1261,23 @@ and convert_string_call ctx str_expr args arg_exprs method_name result_tc pos =
     else str_expr
   in
   
-  (* Helper to get arg or default *)
+  (* Check if expression is null *)
+  let is_null_expr e = match e.cexpr with
+    | TCENull -> true
+    | TCECall (TCTFunc "fib_dynamic_null", []) -> true
+    | _ -> false
+  in
+  (* Helper to get arg or default (use default if arg is null or missing) *)
   let arg_or_int_default idx default =
-    if idx < List.length arg_exprs then List.nth arg_exprs idx
+    if idx < List.length arg_exprs then
+      let arg = List.nth arg_exprs idx in
+      if is_null_expr arg then mk_int (Int32.of_int default) else arg
     else mk_int (Int32.of_int default)
   in
   let arg_or_string_default idx default =
-    if idx < List.length arg_exprs then List.nth arg_exprs idx
+    if idx < List.length arg_exprs then
+      let arg = List.nth arg_exprs idx in
+      if is_null_expr arg then mk_expr (TCEString default) TCFibString else arg
     else mk_expr (TCEString default) TCFibString
   in
   
@@ -1455,9 +1465,23 @@ and convert_call ctx callee args result_tc pos =
   | Some FiberusBuiltins.ITrace ->
       mk_expr_pos (TCERaw "/* trace handled by gen_call */") result_tc pos
   
-  (* __fiberus__() raw code emission - handled in gen_call *)
+  (* __fiberus__() raw code emission - concatenate string literals with converted expressions *)
   | Some FiberusBuiltins.IFiberus ->
-      mk_expr_pos (TCERaw "/* __fiberus__ handled by gen_call */") result_tc pos
+      (* Build raw C code by iterating through arguments:
+         - String constants are emitted directly
+         - Other expressions are converted to C-AST and serialized *)
+      let buf = Buffer.create 64 in
+      List.iter (fun arg ->
+        match arg.Type.eexpr with
+        | Type.TConst (Type.TString s) -> Buffer.add_string buf s
+        | _ ->
+            (* Convert expression to C-AST and serialize via SourceWriter *)
+            let arg_expr = convert_expr ctx arg in
+            let w = FiberusSourceWriter.create () in
+            FiberusSourceWriter.write_expr w arg_expr;
+            Buffer.add_string buf (FiberusSourceWriter.contents w)
+      ) args;
+      mk_expr_pos (TCERaw (Buffer.contents buf)) result_tc pos
   
   | None ->
   

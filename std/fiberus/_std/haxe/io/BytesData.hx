@@ -4,9 +4,13 @@
  */
 package haxe.io;
 
+/* Backing class for BytesData - never instantiated directly */
+@:native("FibBytesData")
+private extern class BytesDataImpl {}
+
 /* BytesData as abstract over native pointer for array access support */
 @:native("FibBytesData*")
-abstract BytesData(Dynamic) {
+abstract BytesData(BytesDataImpl) {
 	/* Array access support for standard library compatibility */
 	@:arrayAccess public inline function arrayGet(index:Int):Int {
 		return untyped __fiberus__("fib_bytes_get(", this, ", ", index, ")");
