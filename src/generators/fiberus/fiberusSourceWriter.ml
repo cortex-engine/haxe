@@ -626,6 +626,22 @@ and write_stmt (w : writer) (s : tc_stmt) : unit =
   | TCSGCSafePoint ->
       write w "GC_SAFE_POINT();";
       newline w
+  | TCSGCRootCheck expected ->
+      (* Debug assertion for GC root count verification.
+       * Only emitted under FIBERUS_DEBUG to catch push/pop imbalances. *)
+      write w "#ifdef FIBERUS_DEBUG";
+      newline w;
+      writef w "if (_fib_ctx && _fib_ctx->mTempRootCount != _gc_base_count + %d) {" expected;
+      newline w;
+      write w "  fprintf(stderr, \"[GC ROOT MISMATCH] expected %%zu got %%zu\\n\", ";
+      writef w "(size_t)(_gc_base_count + %d), (size_t)_fib_ctx->mTempRootCount);" expected;
+      newline w;
+      write w "  __builtin_trap();";
+      newline w;
+      write w "}";
+      newline w;
+      write w "#endif";
+      newline w
   
   (* Fiber integration *)
   | TCSYieldPoint ->

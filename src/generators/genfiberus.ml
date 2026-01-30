@@ -102,6 +102,21 @@ let emit_cexpr ctx (cexpr : tc_expr) =
   FiberusSourceWriter.write_expr w cexpr;
   spr ctx (FiberusSourceWriter.contents w)
 
+(* Emit a C-AST expression and return its gc_roots count for later cleanup.
+ * Used when the expression is part of a statement that needs to pop roots. *)
+let emit_cexpr_with_roots ctx (cexpr : tc_expr) : int =
+  let w = FiberusSourceWriter.create () in
+  FiberusSourceWriter.write_expr w cexpr;
+  spr ctx (FiberusSourceWriter.contents w);
+  cexpr.gc_roots
+
+(* Emit gc_pop for expression-level roots if needed.
+ * Call this after emitting an expression that may have unpaired roots. *)
+let emit_expr_gc_pop ctx gc_roots =
+  if gc_roots > 0 then begin
+    print ctx "; gc_pop_temp_roots_ctx(FIB_CTX, %d)" gc_roots
+  end
+
 (* Emit a C-AST statement directly to the buffer (without trailing newline) *)
 let emit_cstmt_inline ctx (cstmt : tc_stmt) =
   let w = FiberusSourceWriter.create () in
@@ -128,6 +143,13 @@ let gen_value_via_cast ctx e =
   let conv_ctx = make_conv_ctx ctx in
   let cexpr = FiberusConvert.convert_expr conv_ctx e in
   emit_cexpr ctx cexpr
+
+(* Convert a Haxe expression to C-AST, emit it, and return gc_roots count.
+ * Used for initializers where we need to pop expression roots after. *)
+let gen_value_with_roots ctx e : int =
+  let conv_ctx = make_conv_ctx ctx in
+  let cexpr = FiberusConvert.convert_expr conv_ctx e in
+  emit_cexpr_with_roots ctx cexpr
 
 let open_block ctx =
 	let old_tabs = ctx.tabs in
@@ -661,8 +683,8 @@ and gen_builtin_call ctx e args =
 			| _ -> gen_value ctx arg
 		) code_args;
 		true
-	(* Fiber.spawn with closure *)
-	| TField (_, FStatic ({ cl_path = ([], "Fiber") }, { cf_name = "spawn" })), [arg] ->
+	(* Fiber.spawn with closure - matches both ([], "Fiber") and (["fiberus"], "Fiber") *)
+	| TField (_, FStatic ({ cl_path = (([] | ["fiberus"]), "Fiber") }, { cf_name = "spawn" })), [arg] ->
 		(match extract_closure_for_spawn ctx arg with
 		| Some (free_vars, closure_name) ->
 			(* Fiber spawn closures are never called dynamically, so pass impl for both fn and fn_dynamic *)
@@ -681,7 +703,7 @@ and gen_builtin_call ctx e args =
 			spr ctx ")");
 		true
 	(* Fiber.spawnOn with closure *)
-	| TField (_, FStatic ({ cl_path = ([], "Fiber") }, { cf_name = "spawnOn" })), [thread_id; arg] ->
+	| TField (_, FStatic ({ cl_path = (([] | ["fiberus"]), "Fiber") }, { cf_name = "spawnOn" })), [thread_id; arg] ->
 		(match extract_closure_for_spawn ctx arg with
 		| Some (free_vars, closure_name) ->
 			let impl_name = closure_name ^ "_impl" in
@@ -703,7 +725,7 @@ and gen_builtin_call ctx e args =
 			spr ctx ")");
 		true
 	(* Fiber.spawnAny with closure *)
-	| TField (_, FStatic ({ cl_path = ([], "Fiber") }, { cf_name = "spawnAny" })), [arg] ->
+	| TField (_, FStatic ({ cl_path = (([] | ["fiberus"]), "Fiber") }, { cf_name = "spawnAny" })), [arg] ->
 		(match extract_closure_for_spawn ctx arg with
 		| Some (free_vars, closure_name) ->
 			let impl_name = closure_name ^ "_impl" in
@@ -717,6 +739,28 @@ and gen_builtin_call ctx e args =
 			spr ctx "gc_mature_alloc_end(); gc_pop_temp_roots(1); _fib; })"
 		| None ->
 			spr ctx "Fiber_spawnAny(";
+			gen_value ctx arg;
+			spr ctx ")");
+		true
+	(* Fiber.spawnWithStack with closure - custom stack size *)
+	| TField (_, FStatic ({ cl_path = (([] | ["fiberus"]), "Fiber") }, { cf_name = "spawnWithStack" })), [stack_size; arg] ->
+		(match extract_closure_for_spawn ctx arg with
+		| Some (free_vars, closure_name) ->
+			let impl_name = closure_name ^ "_impl" in
+			spr ctx "({ size_t _sz = (size_t)";
+			gen_value ctx stack_size;
+			spr ctx "; gc_mature_alloc_begin(); FibClosure* _fc = fib_closure_create_for_fiber((void*)";
+			spr ctx impl_name;
+			spr ctx ", (void*)";
+			spr ctx closure_name;
+			print ctx ", %d, 0); gc_push_temp_root((void**)&_fc); " (List.length free_vars);
+			gen_fiber_spawn_closure ctx free_vars closure_name;
+			spr ctx "Fiber* _fib = scheduler_spawn_sized(_sz, _fib_spawn_closure_trampoline, (void*)_fc); ";
+			spr ctx "gc_mature_alloc_end(); gc_pop_temp_roots(1); _fib; })"
+		| None ->
+			spr ctx "Fiber_spawnWithStack(";
+			gen_value ctx stack_size;
+			spr ctx ", ";
 			gen_value ctx arg;
 			spr ctx ")");
 		true
@@ -1173,6 +1217,7 @@ and gen_value ctx e =
 			| Some FiberusBuiltins.IFiberSpawn -> true
 			| Some FiberusBuiltins.IFiberSpawnOn -> true
 			| Some FiberusBuiltins.IFiberSpawnAny -> true
+			| Some FiberusBuiltins.IFiberSpawnWithStack -> true
 			| _ -> false
 		in
 		(* Also check if any argument is a TFunction - needs gen_call for closure handling *)
@@ -1462,8 +1507,19 @@ and gen_expr ctx e =
 	match e.eexpr with
 	| TConst _ | TLocal _ | TArray _ | TBinop _ | TField _
 	| TTypeExpr _ | TParenthesis _ | TObjectDecl _ | TArrayDecl _
-	| TCall _ | TNew _ | TUnop _ | TCast _ | TMeta _
+	| TNew _ | TUnop _ | TCast _ | TMeta _
 	| TEnumParameter _ | TEnumIndex _ | TIdent _ ->
+		(* For value expressions used as statements, we need to:
+		 * 1. Emit the expression
+		 * 2. Pop any gc_roots the expression leaves on the stack
+		 * Convert to C-AST to check gc_roots *)
+		let conv_ctx = make_conv_ctx ctx in
+		let cexpr = FiberusConvert.convert_expr conv_ctx e in
+		emit_cexpr ctx cexpr;
+		if cexpr.gc_roots > 0 then
+			print ctx "; gc_pop_temp_roots_ctx(FIB_CTX, %d)" cexpr.gc_roots
+	| TCall _ ->
+		(* Calls need gen_value for intrinsic handling (Fiber.spawn, trace, etc.) *)
 		gen_value ctx e
 	| TFunction _ ->
 		()  (* Function expressions handled elsewhere *)
@@ -1503,17 +1559,41 @@ and gen_expr ctx e =
 			let is_gc_ptr = String.length type_str > 0 && type_str.[String.length type_str - 1] = '*' in
 			(* Generate variable declaration (no more volatile - we use gc_push_temp_root instead) *)
 			print ctx "%s %s" type_str (ident v.v_name);
+			(* Track gc_roots from initializer for proper cleanup order *)
+			let init_gc_roots = ref 0 in
 			(match eo with
 			| None -> ()
 			| Some e ->
 				spr ctx " = ";
-				gen_coerce_with_expr ctx e.etype v.v_type (Some e) (fun () -> gen_value ctx e));
-			(* For GC pointer types, push as temp root to ensure GC can find it *)
+				(* Convert to C-AST first to get gc_roots count *)
+				let conv_ctx = make_conv_ctx ctx in
+				let cexpr = FiberusConvert.convert_expr conv_ctx e in
+				init_gc_roots := cexpr.gc_roots;
+				(* Emit with proper coercion *)
+				let from_tc = cexpr.ctype in
+				let to_tc = tc_type_of v.v_type in
+				if from_tc = to_tc then
+					emit_cexpr ctx cexpr
+				else
+					(* Need coercion - emit via coerce function *)
+					gen_coerce_with_expr ctx e.etype v.v_type (Some e) (fun () -> emit_cexpr ctx cexpr));
+			(* For GC pointer types:
+			 * 1. FIRST push the variable as a root - this protects the value
+			 * 2. THEN pop expression-level roots from the initializer
+			 * This order is critical: gc_pop may trigger GC, and at that point
+			 * the value must already be rooted. If we pop first, the value in
+			 * the variable could be relocated without updating the variable. *)
 			if is_gc_ptr then begin
 				spr ctx "; gc_push_temp_root_ctx(FIB_CTX, (void**)&";
 				spr ctx (ident v.v_name);
 				spr ctx ")";
-				ctx.gc_local_count <- ctx.gc_local_count + 1
+				ctx.gc_local_count <- ctx.gc_local_count + 1;
+				if !init_gc_roots > 0 then begin
+					print ctx "; gc_pop_temp_roots_ctx(FIB_CTX, %d)" !init_gc_roots
+				end
+			end else if !init_gc_roots > 0 then begin
+				(* Non-GC pointer type but init had gc_roots - still need to pop *)
+				print ctx "; gc_pop_temp_roots_ctx(FIB_CTX, %d)" !init_gc_roots
 			end
 		end
 	| TBlock el ->
@@ -1814,53 +1894,56 @@ and gen_expr ctx e =
 		newline ctx;
 		spr ctx "}"
 	| TReturn eo ->
-		(* Handle GC roots cleanup before return *)
-		if ctx.gc_local_count > 0 then begin
-			(match eo with
-			| None ->
-				(* Simple case: no return value, just pop and return *)
+		(* Handle GC roots cleanup before return.
+		 * We need to pop:
+		 * 1. Expression-level roots from the return expression (gc_roots)
+		 * 2. Function-level local variable roots (ctx.gc_local_count) *)
+		(match eo with
+		| None ->
+			(* No return value, just pop function locals and return *)
+			if ctx.gc_local_count > 0 then
 				print ctx "gc_pop_temp_roots_ctx(FIB_CTX, %d); return" ctx.gc_local_count
-			| Some e ->
-				(* Complex case: evaluate return value first, save to temp, pop roots, return temp *)
-				let ret_type = match ctx.current_ret_type with
-					| Some t -> s_type ctx t
-					| None -> s_type ctx e.etype
-				in
-				(* For simple values like constants/locals, we can return directly after pop *)
-				let is_simple = match e.eexpr with
-					| TConst _ | TLocal _ -> true
-					| _ -> false
-				in
-				if is_simple then begin
-					print ctx "gc_pop_temp_roots_ctx(FIB_CTX, %d); return " ctx.gc_local_count;
-					(match ctx.current_ret_type with
-					| Some ret_type -> gen_coerce_with_expr ctx e.etype ret_type (Some e) (fun () -> gen_value ctx e)
-					| None -> gen_value ctx e)
-				end else begin
-					(* Evaluate into temp, then pop, then return *)
-					spr ctx "{ ";
-					print ctx "%s __ret = " ret_type;
-					(match ctx.current_ret_type with
-					| Some ret_type -> gen_coerce_with_expr ctx e.etype ret_type (Some e) (fun () -> gen_value ctx e)
-					| None -> gen_value ctx e);
-					print ctx "; gc_pop_temp_roots_ctx(FIB_CTX, %d); return __ret; }" ctx.gc_local_count
-				end)
-			(* NOTE: We do NOT reset gc_local_count here because:
-			 * 1. The TIf handler properly saves/restores gc_local_count for each branch
-			 * 2. Setting it to 0 would corrupt tracking for later code paths
-			 * 3. The duplicate gc_pop issue needs a different fix *)
-		end else begin
-			(* No GC locals to pop - original code *)
-			match eo with
-			| None -> spr ctx "return"
-			| Some e ->
+			else
+				spr ctx "return"
+		| Some e ->
+			(* Convert return expression to check for gc_roots *)
+			let conv_ctx = make_conv_ctx ctx in
+			let cexpr_raw = FiberusConvert.convert_expr conv_ctx e in
+			(* Coerce to return type if known *)
+			let cexpr = match conv_ctx.FiberusConvert.current_ret_type with
+				| Some ret_tc -> FiberusConvert.coerce_to_type cexpr_raw ret_tc
+				| None -> cexpr_raw
+			in
+			let expr_gc_roots = cexpr.gc_roots in
+			let total_to_pop = ctx.gc_local_count + expr_gc_roots in
+			let ret_type = match ctx.current_ret_type with
+				| Some t -> s_type ctx t
+				| None -> s_type ctx e.etype
+			in
+			(* For simple values with no gc_roots and no locals, return directly *)
+			let is_simple = match e.eexpr with
+				| TConst _ | TLocal _ -> true
+				| _ -> false
+			in
+			if is_simple && total_to_pop = 0 then begin
 				spr ctx "return ";
-				(match ctx.current_ret_type with
-				| Some ret_type ->
-					gen_coerce_with_expr ctx e.etype ret_type (Some e) (fun () -> gen_value ctx e)
-				| None ->
-					gen_value ctx e)
-		end
+				emit_cexpr ctx cexpr
+			end else if is_simple && expr_gc_roots = 0 then begin
+				(* Simple value, only function locals to pop *)
+				print ctx "gc_pop_temp_roots_ctx(FIB_CTX, %d); return " ctx.gc_local_count;
+				emit_cexpr ctx cexpr
+			end else begin
+				(* Complex: evaluate into temp, pop all roots, return temp *)
+				spr ctx "{ ";
+				print ctx "%s __ret = " ret_type;
+				emit_cexpr ctx cexpr;
+				if total_to_pop > 0 then
+					print ctx "; gc_pop_temp_roots_ctx(FIB_CTX, %d)" total_to_pop;
+				spr ctx "; return __ret; }"
+			end)
+		(* NOTE: We do NOT reset gc_local_count here because:
+		 * 1. The TIf handler properly saves/restores gc_local_count for each branch
+		 * 2. Setting it to 0 would corrupt tracking for later code paths *)
 	| TBreak -> emit_cstmt_inline ctx TCSBreak
 	| TContinue -> emit_cstmt_inline ctx TCSContinue
 	| TThrow _ ->
@@ -1893,6 +1976,13 @@ let gen_function ctx name f c is_static =
 	newline ctx;
 	(* Inject GC safe point at function entry - stack is clean here *)
 	spr ctx "GC_SAFE_POINT();";
+	newline ctx;
+	(* Debug: save base root count for verification at return *)
+	spr ctx "#ifdef FIBERUS_DEBUG";
+	newline ctx;
+	spr ctx "size_t _gc_base_count = _fib_ctx ? _fib_ctx->mTempRootCount : 0;";
+	newline ctx;
+	spr ctx "#endif";
 	newline ctx;
 	(* Reset GC local count and context flag for this function *)
 	let old_gc_count = ctx.gc_local_count in
@@ -2984,6 +3074,14 @@ let gen_header ctx com =
 	spr ctx "\tFiber* fiber = scheduler_spawn_any(_fib_spawn_on_closure_trampoline, (void*)closure);\n";
 	spr ctx "\tgc_pop_temp_roots(1);\n";
 	spr ctx "\treturn fiber;\n";
+	spr ctx "}\n";
+	spr ctx "/* Fiber_spawnWithStack - spawn fiber with custom stack size */\n";
+	spr ctx "static inline Fiber* Fiber_spawnWithStack(size_t stackSize, FibClosure* closure) {\n";
+	spr ctx "\t/* Push temp root to protect closure during fiber creation */\n";
+	spr ctx "\tgc_push_temp_root((void**)&closure);\n";
+	spr ctx "\tFiber* fiber = scheduler_spawn_sized(stackSize, _fib_spawn_closure_trampoline, (void*)closure);\n";
+	spr ctx "\tgc_pop_temp_roots(1);\n";
+	spr ctx "\treturn fiber;\n";
 	spr ctx "}\n\n";
 	spr ctx "/* Counter API bridge - maps Haxe Counter class to runtime functions */\n";
 	spr ctx "static inline Counter* Counter_create(int initialValue) {\n";
@@ -3030,6 +3128,13 @@ let gen_header ctx com =
 	spr ctx "/* GC API bridge - maps Haxe GC class to runtime functions */\n";
 	spr ctx "#define GC_collect() gc_collect()\n";
 	spr ctx "#define GC_printStats() gc_print_stats()\n";
+	spr ctx "static inline FibString* GC_statsString(void) {\n";
+	spr ctx "\tchar* cstr = gc_stats_string();\n";
+	spr ctx "\tif (!cstr) return fib_string_new(\"\");\n";
+	spr ctx "\tFibString* result = fib_string_new(cstr);\n";
+	spr ctx "\tfree(cstr);\n";
+	spr ctx "\treturn result;\n";
+	spr ctx "}\n";
 	spr ctx "static inline void GC_setDebug(bool enabled) {\n";
 	spr ctx "\tgc_set_debug(enabled);\n";
 	spr ctx "}\n";
@@ -3597,6 +3702,8 @@ let generate com =
 	Buffer.add_string build_xml "<include name=\"${FIBERUS}/build-tool/BuildCommon.xml\"/>\n\n";
 	Buffer.add_string build_xml "<!-- Generated Haxe code -->\n";
 	Buffer.add_string build_xml "<files id=\"haxe\" dir=\"src\" tags=\"fiberus\">\n";
+	(* Add Options.txt as a dependency for proper cache invalidation *)
+	Buffer.add_string build_xml "  <options name=\"Options.txt\"/>\n";
 	List.iter (fun filename ->
 		Buffer.add_string build_xml (Printf.sprintf "  <file name=\"%s\"/>\n" filename)
 	) (List.rev !generated_files);
@@ -3621,14 +3728,31 @@ let generate com =
 	output_string bch (Buffer.contents build_xml);
 	close_out bch;
 
+	(* Escape function for command-line and options file values *)
+	let escape_command s =
+		let b = Buffer.create 0 in
+		String.iter (fun ch ->
+			if ch == '"' || ch == '\\' then Buffer.add_string b "\\";
+			Buffer.add_char b ch
+		) s;
+		Buffer.contents b
+	in
+
 	(* Write Options.txt for build dependency tracking *)
 	let options_file = dir ^ "/Options.txt" in
 	let och = open_out_bin options_file in
 	PMap.iter (fun name value ->
 		match name with
 		| "true" | "sys" | "dce" | "fiberus" | "debug" -> ()
-		| _ -> output_string och (Printf.sprintf "%s=%s\n" name value)
+		| _ -> output_string och (Printf.sprintf "%s=%s\n" name (escape_command value))
 	) com.defines.Define.values;
+	(* Add fiberus path to Options.txt (like hxcpp does) *)
+	let pin, pid = Process_helper.open_process_args_in_pid "haxelib" [|"haxelib"; "path"; "fiberus"|] in
+	set_binary_mode_in pin false;
+	(try
+		output_string och (Printf.sprintf "fiberus=%s\n" (Stdlib.input_line pin))
+	with _ -> ());
+	ignore (Process_helper.close_process_in_pid (pin, pid));
 	close_out och;
 
 	com.print (Printf.sprintf "Generated %d source files\n" (List.length !generated_files));
@@ -3639,6 +3763,16 @@ let generate com =
 		Sys.chdir dir;
 		let cmd = ref ["run"; "fiberus"; "Build.xml"] in
 		if com.debug then cmd := !cmd @ ["-Ddebug"];
+		(* Forward all defines to the build tool (matching gencpp.ml behavior) *)
+		PMap.iter (fun name value -> match name with
+			| "true" | "sys" | "dce" | "fiberus" | "debug" -> ()
+			| _ -> cmd := !cmd @ [Printf.sprintf "-D%s=\"%s\"" name (escape_command value)]
+		) com.defines.Define.values;
+		(* Forward class paths to the build tool *)
+		com.class_paths#iter (fun path ->
+			let path = path#path in
+			cmd := !cmd @ [Printf.sprintf "-I%s" (escape_command path)]
+		);
 		com.print ("haxelib " ^ (String.concat " " !cmd) ^ "\n");
 		if com.run_command_args "haxelib" !cmd <> 0 then failwith "Build failed";
 		Sys.chdir old_dir

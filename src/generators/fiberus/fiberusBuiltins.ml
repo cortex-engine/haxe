@@ -28,6 +28,7 @@ type intrinsic =
   | IFiberSpawn                (* Fiber.spawn() *)
   | IFiberSpawnOn              (* Fiber.spawnOn() *)
   | IFiberSpawnAny             (* Fiber.spawnAny() *)
+  | IFiberSpawnWithStack       (* Fiber.spawnWithStack() *)
 
 (* Check if an expression is a call to an intrinsic *)
 let get_intrinsic (e : texpr) : intrinsic option =
@@ -43,9 +44,11 @@ let get_intrinsic (e : texpr) : intrinsic option =
   | TField (_, FStatic ({ cl_path = ([], "Fiber") }, { cf_name = "spawn" })) -> Some IFiberSpawn
   | TField (_, FStatic ({ cl_path = ([], "Fiber") }, { cf_name = "spawnOn" })) -> Some IFiberSpawnOn
   | TField (_, FStatic ({ cl_path = ([], "Fiber") }, { cf_name = "spawnAny" })) -> Some IFiberSpawnAny
+  | TField (_, FStatic ({ cl_path = ([], "Fiber") }, { cf_name = "spawnWithStack" })) -> Some IFiberSpawnWithStack
   | TField (_, FStatic ({ cl_path = (["fiberus"], "Fiber") }, { cf_name = "spawn" })) -> Some IFiberSpawn
   | TField (_, FStatic ({ cl_path = (["fiberus"], "Fiber") }, { cf_name = "spawnOn" })) -> Some IFiberSpawnOn
   | TField (_, FStatic ({ cl_path = (["fiberus"], "Fiber") }, { cf_name = "spawnAny" })) -> Some IFiberSpawnAny
+  | TField (_, FStatic ({ cl_path = (["fiberus"], "Fiber") }, { cf_name = "spawnWithStack" })) -> Some IFiberSpawnWithStack
   | _ -> None
 
 (* ============================================================================

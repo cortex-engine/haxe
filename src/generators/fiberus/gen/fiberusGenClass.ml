@@ -244,9 +244,10 @@ let gen_mark_function_body (c : tclass) : tc_stmt list =
       vd_type = TCPointer (TCStruct class_name);
       vd_init = Some {
         cexpr = TCECast (TCPointer (TCStruct class_name), 
-                         { cexpr = TCELocal "obj"; ctype = TCPointer TCFibObject; cpos = null_pos });
+                         { cexpr = TCELocal "obj"; ctype = TCPointer TCFibObject; cpos = null_pos; gc_roots = 0 });
         ctype = TCPointer (TCStruct class_name);
         cpos = null_pos;
+        gc_roots = 0;
       };
       vd_static = false;
       vd_const = false;
@@ -254,14 +255,15 @@ let gen_mark_function_body (c : tclass) : tc_stmt list =
     let mark_stmts = List.map (fun sfi ->
       TCSExpr {
         cexpr = TCECall (TCTFunc "gc_mark_object", [
-          { cexpr = TCELocal "ctx"; ctype = TCPointer (TCStruct "MarkContext"); cpos = null_pos };
+          { cexpr = TCELocal "ctx"; ctype = TCPointer (TCStruct "MarkContext"); cpos = null_pos; gc_roots = 0 };
           { cexpr = TCEField (
-              { cexpr = TCELocal "this"; ctype = TCPointer (TCStruct class_name); cpos = null_pos },
+              { cexpr = TCELocal "this"; ctype = TCPointer (TCStruct class_name); cpos = null_pos; gc_roots = 0 },
               sfi.sfi_name
-            ); ctype = sfi.sfi_type; cpos = null_pos }
+            ); ctype = sfi.sfi_type; cpos = null_pos; gc_roots = 0 }
         ]);
         ctype = TCVoid;
         cpos = null_pos;
+        gc_roots = 0;
       }
     ) gc_fields in
     cast_stmt :: mark_stmts

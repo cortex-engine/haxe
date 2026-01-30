@@ -111,11 +111,14 @@ and tc_array_access = {
   elem_type: tc_type;
 }
 
-(* C expression with type and position *)
+(* C expression with type, position, and GC root tracking *)
 and tc_expr = {
   cexpr: tc_expr_kind;
   ctype: tc_type;
   cpos: pos;
+  gc_roots: int;  (* Unpaired GC roots this expression leaves on stack.
+                   * Used by wrap_with_gc_extraction to track roots that need
+                   * to be popped at statement boundaries. Default is 0. *)
 }
 
 and tc_expr_kind =
@@ -240,6 +243,7 @@ and tc_stmt =
   | TCSGCPop of int                         (* gc_pop_temp_roots(n) *)
   | TCSGCCtx                                (* FIB_GC_CTX; *)
   | TCSGCSafePoint                          (* GC_SAFE_POINT(); *)
+  | TCSGCRootCheck of int                   (* Debug assertion: check root count equals base + n *)
   
   (* Fiber integration *)
   | TCSYieldPoint                           (* FIBER_YIELD_POINT(); *)
@@ -419,13 +423,33 @@ type tc_unit = {
  * Helper Functions
  * ============================================================================ *)
 
-(* Create a simple expression with null position *)
+(* Create a simple expression with null position and zero gc_roots *)
 let mk_expr kind typ =
-  { cexpr = kind; ctype = typ; cpos = null_pos }
+  { cexpr = kind; ctype = typ; cpos = null_pos; gc_roots = 0 }
 
-(* Create an expression with position *)
+(* Create an expression with position and zero gc_roots *)
 let mk_expr_pos kind typ pos =
-  { cexpr = kind; ctype = typ; cpos = pos }
+  { cexpr = kind; ctype = typ; cpos = pos; gc_roots = 0 }
+
+(* Create an expression with explicit GC root count *)
+let mk_expr_gc kind typ gc_roots =
+  { cexpr = kind; ctype = typ; cpos = null_pos; gc_roots }
+
+(* Create an expression with position and explicit GC root count *)
+let mk_expr_pos_gc kind typ pos gc_roots =
+  { cexpr = kind; ctype = typ; cpos = pos; gc_roots }
+
+(* Sum gc_roots from multiple sub-expressions *)
+let sum_gc_roots exprs =
+  List.fold_left (fun acc e -> acc + e.gc_roots) 0 exprs
+
+(* Maximum gc_roots from expressions (for control flow branches) *)
+let max_gc_roots exprs =
+  List.fold_left (fun acc e -> max acc e.gc_roots) 0 exprs
+
+(* Create an expression inheriting gc_roots from sub-expressions (sum) *)
+let mk_expr_inherit kind typ sub_exprs =
+  { cexpr = kind; ctype = typ; cpos = null_pos; gc_roots = sum_gc_roots sub_exprs }
 
 (* Create an integer literal *)
 let mk_int i =

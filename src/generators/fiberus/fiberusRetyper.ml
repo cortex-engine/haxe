@@ -72,20 +72,20 @@ let convert_unop (op : Ast.unop) (is_postfix : bool) : tc_unop option =
 let convert_constant (c : tconstant) (pos : pos) : tc_expr =
   match c with
   | TInt i -> 
-      { cexpr = TCEInt i; ctype = TCInt32; cpos = pos }
+      { cexpr = TCEInt i; ctype = TCInt32; cpos = pos; gc_roots = 0 }
   | TFloat s -> 
-      { cexpr = TCEFloat s; ctype = TCFloat64; cpos = pos }
+      { cexpr = TCEFloat s; ctype = TCFloat64; cpos = pos; gc_roots = 0 }
   | TString s -> 
-      { cexpr = TCEString s; ctype = TCFibString; cpos = pos }
+      { cexpr = TCEString s; ctype = TCFibString; cpos = pos; gc_roots = 0 }
   | TBool b -> 
-      { cexpr = TCEBool b; ctype = TCBool; cpos = pos }
+      { cexpr = TCEBool b; ctype = TCBool; cpos = pos; gc_roots = 0 }
   | TNull -> 
-      { cexpr = TCENull; ctype = TCFibDynamic; cpos = pos }
+      { cexpr = TCENull; ctype = TCFibDynamic; cpos = pos; gc_roots = 0 }
   | TThis -> 
-      { cexpr = TCEThis; ctype = TCFibObject; cpos = pos }  (* Type refined by context *)
+      { cexpr = TCEThis; ctype = TCFibObject; cpos = pos; gc_roots = 0 }  (* Type refined by context *)
   | TSuper -> 
       (* Super is handled specially in field access *)
-      { cexpr = TCEThis; ctype = TCFibObject; cpos = pos }
+      { cexpr = TCEThis; ctype = TCFibObject; cpos = pos; gc_roots = 0 }
 
 (* ============================================================================
  * Type Coercion Detection
@@ -151,17 +151,17 @@ let apply_coercion (coercion : coercion) (expr : tc_expr) : tc_expr =
   match coercion with
   | NoCoercion -> expr
   | BoxToDynamic kind ->
-      { cexpr = TCEBox (expr, kind); ctype = TCFibDynamic; cpos = expr.cpos }
+      { cexpr = TCEBox (expr, kind); ctype = TCFibDynamic; cpos = expr.cpos; gc_roots = 0 }
   | UnboxFromDynamic target_type ->
-      { cexpr = TCEUnbox (expr, target_type); ctype = target_type; cpos = expr.cpos }
+      { cexpr = TCEUnbox (expr, target_type); ctype = target_type; cpos = expr.cpos; gc_roots = 0 }
   | CastToClass name ->
-      { cexpr = TCECast (TCFibClass name, expr); ctype = TCFibClass name; cpos = expr.cpos }
+      { cexpr = TCECast (TCFibClass name, expr); ctype = TCFibClass name; cpos = expr.cpos; gc_roots = 0 }
   | CastToObject ->
-      { cexpr = TCECast (TCFibObject, expr); ctype = TCFibObject; cpos = expr.cpos }
+      { cexpr = TCECast (TCFibObject, expr); ctype = TCFibObject; cpos = expr.cpos; gc_roots = 0 }
   | StringToFibString ->
-      { cexpr = TCECall (TCTFunc "fib_string_new", [expr]); ctype = TCFibString; cpos = expr.cpos }
+      { cexpr = TCECall (TCTFunc "fib_string_new", [expr]); ctype = TCFibString; cpos = expr.cpos; gc_roots = 0 }
   | NumericCast target_type ->
-      { cexpr = TCECast (target_type, expr); ctype = target_type; cpos = expr.cpos }
+      { cexpr = TCECast (target_type, expr); ctype = target_type; cpos = expr.cpos; gc_roots = 0 }
 
 (* Coerce expression to target type if needed *)
 let coerce_to (expr : tc_expr) (target : tc_type) : tc_expr =
@@ -175,33 +175,34 @@ let coerce_to (expr : tc_expr) (target : tc_type) : tc_expr =
 (* Create a local variable reference *)
 let make_local (v : tvar) : tc_expr =
   let tc_type = tc_type_of v.v_type in
-  { cexpr = TCELocal (FiberusStrings.ident v.v_name); ctype = tc_type; cpos = null_pos }
+  { cexpr = TCELocal (FiberusStrings.ident v.v_name); ctype = tc_type; cpos = null_pos; gc_roots = 0 }
 
 (* Create a 'this' reference for a class *)
 let make_this (class_name : string) : tc_expr =
-  { cexpr = TCEThis; ctype = TCFibClass class_name; cpos = null_pos }
+  { cexpr = TCEThis; ctype = TCFibClass class_name; cpos = null_pos; gc_roots = 0 }
 
 (* Create a null check expression *)
 let make_null_check (expr : tc_expr) : tc_expr =
-  { cexpr = TCEBinop (TCOpNeq, expr, { cexpr = TCENull; ctype = expr.ctype; cpos = expr.cpos });
+  { cexpr = TCEBinop (TCOpNeq, expr, { cexpr = TCENull; ctype = expr.ctype; cpos = expr.cpos; gc_roots = 0 });
     ctype = TCBool;
-    cpos = expr.cpos }
+    cpos = expr.cpos;
+    gc_roots = 0 }
 
 (* Create a field access *)
 let make_field_access (obj : tc_expr) (field : string) (field_type : tc_type) : tc_expr =
-  { cexpr = TCEField (obj, field); ctype = field_type; cpos = obj.cpos }
+  { cexpr = TCEField (obj, field); ctype = field_type; cpos = obj.cpos; gc_roots = 0 }
 
 (* Create a static field reference *)
 let make_static_field (class_name : string) (field : string) (field_type : tc_type) : tc_expr =
-  { cexpr = TCEStatic (class_name, field); ctype = field_type; cpos = null_pos }
+  { cexpr = TCEStatic (class_name, field); ctype = field_type; cpos = null_pos; gc_roots = 0 }
 
 (* Create a function call *)
 let make_call (func : string) (args : tc_expr list) (ret_type : tc_type) : tc_expr =
-  { cexpr = TCECall (TCTFunc func, args); ctype = ret_type; cpos = null_pos }
+  { cexpr = TCECall (TCTFunc func, args); ctype = ret_type; cpos = null_pos; gc_roots = 0 }
 
 (* Create a method call *)
 let make_method_call (class_name : string) (method_name : string) (args : tc_expr list) (ret_type : tc_type) : tc_expr =
-  { cexpr = TCECall (TCTMethod (class_name, method_name), args); ctype = ret_type; cpos = null_pos }
+  { cexpr = TCECall (TCTMethod (class_name, method_name), args); ctype = ret_type; cpos = null_pos; gc_roots = 0 }
 
 (* ============================================================================
  * Statement Helpers
@@ -237,7 +238,7 @@ let make_block (stmts : tc_stmt list) : tc_stmt =
 
 (* Create GC push statement for a local variable *)
 let make_gc_push (var_name : string) (var_type : tc_type) : tc_stmt =
-  let var_ref = { cexpr = TCELocal var_name; ctype = var_type; cpos = null_pos } in
+  let var_ref = { cexpr = TCELocal var_name; ctype = var_type; cpos = null_pos; gc_roots = 0 } in
   TCSGCPush var_ref
 
 (* Create GC pop statement *)
@@ -267,11 +268,11 @@ let make_array_access (arr : tc_expr) (idx : tc_expr) (arr_type : Type.t) : tc_a
 
 (* Create array get expression *)
 let make_array_get (access : tc_array_access) : tc_expr =
-  { cexpr = TCEArrayGet access; ctype = access.elem_type; cpos = access.arr.cpos }
+  { cexpr = TCEArrayGet access; ctype = access.elem_type; cpos = access.arr.cpos; gc_roots = 0 }
 
 (* Create array set expression *)
 let make_array_set (access : tc_array_access) (value : tc_expr) : tc_expr =
-  { cexpr = TCEArraySet (access, value); ctype = access.elem_type; cpos = access.arr.cpos }
+  { cexpr = TCEArraySet (access, value); ctype = access.elem_type; cpos = access.arr.cpos; gc_roots = 0 }
 
 (* ============================================================================
  * String Operation Helpers
@@ -279,11 +280,11 @@ let make_array_set (access : tc_array_access) (value : tc_expr) : tc_expr =
 
 (* Create string concatenation *)
 let make_string_concat (lhs : tc_expr) (rhs : tc_expr) : tc_expr =
-  { cexpr = TCEStringConcat (lhs, rhs); ctype = TCFibString; cpos = lhs.cpos }
+  { cexpr = TCEStringConcat (lhs, rhs); ctype = TCFibString; cpos = lhs.cpos; gc_roots = 0 }
 
 (* Create string equality check *)
 let make_string_eq (lhs : tc_expr) (rhs : tc_expr) : tc_expr =
-  { cexpr = TCEStringEq (lhs, rhs); ctype = TCBool; cpos = lhs.cpos }
+  { cexpr = TCEStringEq (lhs, rhs); ctype = TCBool; cpos = lhs.cpos; gc_roots = 0 }
 
 (* Check if binary operation on strings needs special handling *)
 let is_string_binop (op : Ast.binop) (lhs_type : tc_type) (rhs_type : tc_type) : bool =
@@ -299,15 +300,15 @@ let is_string_binop (op : Ast.binop) (lhs_type : tc_type) (rhs_type : tc_type) :
 
 (* Create enum index access *)
 let make_enum_index (enum_expr : tc_expr) : tc_expr =
-  { cexpr = TCEEnumIndex enum_expr; ctype = TCInt32; cpos = enum_expr.cpos }
+  { cexpr = TCEEnumIndex enum_expr; ctype = TCInt32; cpos = enum_expr.cpos; gc_roots = 0 }
 
 (* Create enum parameter access *)
 let make_enum_param (enum_expr : tc_expr) (param_idx : int) : tc_expr =
-  { cexpr = TCEEnumParam (enum_expr, param_idx); ctype = TCFibDynamic; cpos = enum_expr.cpos }
+  { cexpr = TCEEnumParam (enum_expr, param_idx); ctype = TCFibDynamic; cpos = enum_expr.cpos; gc_roots = 0 }
 
 (* Create enum constructor call *)
 let make_enum_construct (enum_name : string) (constr : string) (args : tc_expr list) : tc_expr =
-  { cexpr = TCEEnumConstruct (enum_name, constr, args); ctype = TCFibEnum enum_name; cpos = null_pos }
+  { cexpr = TCEEnumConstruct (enum_name, constr, args); ctype = TCFibEnum enum_name; cpos = null_pos; gc_roots = 0 }
 
 (* ============================================================================
  * Object Construction Helpers
@@ -315,8 +316,8 @@ let make_enum_construct (enum_name : string) (constr : string) (args : tc_expr l
 
 (* Create object allocation *)
 let make_new (class_name : string) (args : tc_expr list) : tc_expr =
-  { cexpr = TCENew (class_name, args); ctype = TCFibClass class_name; cpos = null_pos }
+  { cexpr = TCENew (class_name, args); ctype = TCFibClass class_name; cpos = null_pos; gc_roots = 0 }
 
 (* Create instanceof check *)
 let make_instanceof (obj : tc_expr) (class_name : string) : tc_expr =
-  { cexpr = TCEInstanceOf (obj, class_name); ctype = TCBool; cpos = obj.cpos }
+  { cexpr = TCEInstanceOf (obj, class_name); ctype = TCBool; cpos = obj.cpos; gc_roots = 0 }

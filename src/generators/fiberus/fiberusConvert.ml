@@ -99,6 +99,271 @@ let coerce_to_type expr target_tc =
     expr
 
 (* ============================================================================
+ * GC Safety for Nested Allocating Expressions
+ * ============================================================================
+ * 
+ * Problem: When we have nested allocating calls like:
+ *   fib_string_concat(fib_string_concat(a, b), c)
+ * 
+ * The inner call returns a GC pointer that's passed as an argument to the outer
+ * call. If the outer call triggers GC (during its allocation), the inner result
+ * may be in a CPU register that minor GC doesn't scan, causing use-after-free.
+ *
+ * Solution: Extract nested allocating expressions to temp variables with proper
+ * GC rooting before passing them as arguments:
+ *   FibString* _tmp0 = fib_string_concat(a, b);
+ *   gc_push_temp_root(&_tmp0);
+ *   FibString* result = fib_string_concat(_tmp0, c);
+ *   gc_pop_temp_roots(1);
+ *)
+
+(* Counter for generating unique temp variable names *)
+let gc_temp_counter = ref 0
+
+(* Generate a unique temp variable name *)
+let gen_gc_temp_name () =
+  let n = !gc_temp_counter in
+  gc_temp_counter := n + 1;
+  Printf.sprintf "_gc_tmp%d" n
+
+(* Check if a tc_expr can potentially allocate GC memory.
+ * These expressions need special handling when used as arguments to other
+ * allocating expressions, because they return GC pointers that may be held
+ * only in registers during the outer call. *)
+let rec is_allocating_expr (e : tc_expr) : bool =
+  match e.cexpr with
+  (* String operations allocate *)
+  | TCEStringConcat _ -> true
+  | TCECall (TCTFunc "fib_string_new", _) -> true
+  | TCECall (TCTFunc "fib_string_new_len", _) -> true
+  | TCECall (TCTFunc "fib_string_from_int", _) -> true
+  | TCECall (TCTFunc "fib_string_from_float", _) -> true
+  | TCECall (TCTFunc "fib_string_from_int64", _) -> true
+  | TCECall (TCTFunc "fib_string_format", _) -> true
+  | TCECall (TCTFunc "fib_string_substring", _) -> true
+  | TCECall (TCTFunc "fib_dynamic_to_string", _) -> true
+  
+  (* Object/array allocations *)
+  | TCENew _ -> true
+  | TCECall (TCTFunc "fib_array_new", _) -> true
+  | TCECall (TCTFunc "fib_anon_new", _) -> true
+  | TCEAnonObject _ -> true
+  | TCEArrayDecl _ -> true
+  
+  (* Method calls that may allocate (conservatively assume they do if returning GC type) *)
+  | TCECall _ when needs_gc_root_tc e.ctype -> true
+  | TCEVtableCall _ when needs_gc_root_tc e.ctype -> true
+  
+  (* Boxing allocates *)
+  | TCEBox _ -> true
+  
+  (* Ternary - allocates if either branch allocates *)
+  | TCETernary (_, t, f) -> is_allocating_expr t || is_allocating_expr f
+  
+  (* Block - check the result expression *)
+  | TCEBlock (_, Some result) -> is_allocating_expr result
+  
+  (* String literals allocate via fib_string_new *)
+  | TCEString _ -> true
+  
+  (* These don't allocate *)
+  | TCELocal _ | TCEInt _ | TCEInt64 _ | TCEFloat _ | TCEBool _ | TCENull -> false
+  | TCEUnop _ | TCEBinop _ -> false
+  | TCEDot _ | TCEArrow _ | TCEArrayGet _ -> false
+  | TCECast _ | TCEUnbox _ -> false
+  | TCEEnumIndex _ | TCEEnumParam _ | TCEEnumConst _ -> false
+  | TCEStringEq _ | TCEStringLength _ -> false
+  | TCEInstanceOf _ -> false
+  | _ -> false
+
+(* Extract an allocating sub-expression to a temp variable with GC rooting.
+ * Returns (new_expr, stmts) where:
+ *   - new_expr is either the original expr (if not allocating) or a reference to a temp var
+ *   - stmts are the statements needed to set up the temp var with GC rooting
+ * 
+ * The caller is responsible for generating the gc_pop_temp_roots at the end. *)
+let extract_if_allocating (e : tc_expr) : tc_expr * tc_stmt list * int =
+  if not (is_allocating_expr e) || not (needs_gc_root_tc e.ctype) then
+    (* Not allocating or not a GC type - no extraction needed *)
+    (e, [], 0)
+  else begin
+    (* Generate temp variable *)
+    let tmp_name = gen_gc_temp_name () in
+    let tmp_type = e.ctype in
+    
+    (* Create variable declaration *)
+    let var_decl = TCSVar {
+      vd_name = tmp_name;
+      vd_type = tmp_type;
+      vd_init = Some e;
+      vd_static = false;
+      vd_const = false;
+    } in
+    
+    (* Create GC push statement *)
+    let gc_push = TCSGCPush (mk_expr (TCELocal tmp_name) tmp_type) in
+    
+    (* Return reference to temp variable *)
+    let tmp_ref = mk_expr (TCELocal tmp_name) tmp_type in
+    
+    (tmp_ref, [var_decl; gc_push], 1)
+  end
+
+(* Wrap an expression with GC-safe extraction of allocating sub-expressions.
+ * This is used for binary operations like string concat where both operands
+ * might be allocating expressions.
+ * 
+ * If any extraction is needed, wraps the final expression in a TCEBlock
+ * that includes the temp var setup, the expression, GC cleanup, and returns
+ * the result via another temp variable.
+ * 
+ * CRITICAL: The result itself must be rooted before we pop the input roots,
+ * because the block's return value may be passed to another allocating function
+ * which could trigger GC. Without rooting the result, it would be corrupted.
+ * 
+ * The sequence is:
+ *   1. Push roots for extracted input arguments
+ *   2. Compute the final expression, store in result temp
+ *   3. Push root for result temp (so it survives any subsequent GC)
+ *   4. Pop roots for input arguments (they're no longer needed)
+ *   5. Return result (still rooted)
+ * 
+ * The returned expression has gc_roots=1 to indicate one unpaired root remains.
+ * The caller (genfiberus.ml) will pop this root at statement boundaries.
+ *)
+let wrap_with_gc_extraction (make_final : tc_expr -> tc_expr -> tc_expr) (e1 : tc_expr) (e2 : tc_expr) : tc_expr =
+  let (e1', stmts1, roots1) = extract_if_allocating e1 in
+  let (e2', stmts2, roots2) = extract_if_allocating e2 in
+  let total_input_roots = roots1 + roots2 in
+  
+  (* Also inherit gc_roots from input expressions *)
+  let inherited_roots = e1.gc_roots + e2.gc_roots in
+  
+  if total_input_roots = 0 then begin
+    (* No extraction needed - just create the expression directly *)
+    let final = make_final e1 e2 in
+    (* Preserve inherited gc_roots from inputs *)
+    { final with gc_roots = inherited_roots }
+  end else begin
+    (* Need to wrap in a block with GC push/pop *)
+    let final_expr = make_final e1' e2' in
+    let result_type = final_expr.ctype in
+    
+    (* Only root the result if it's a GC pointer type *)
+    let result_needs_gc = needs_gc_root_tc result_type in
+    
+    (* Save result to temp *)
+    let result_name = gen_gc_temp_name () in
+    let result_var = TCSVar {
+      vd_name = result_name;
+      vd_type = result_type;
+      vd_init = Some final_expr;
+      vd_static = false;
+      vd_const = false;
+    } in
+    
+    (* Pop the INPUT roots - must happen BEFORE pushing result, since gc_pop
+     * pops from the top of the stack. If we pushed result first, gc_pop would
+     * pop the result instead of the inputs! *)
+    let gc_pop = TCSGCPop total_input_roots in
+    
+    let result_ref = mk_expr (TCELocal result_name) result_type in
+    
+    (* Build statement list: 
+     * 1. Input extractions (stmts1, stmts2) - these push input roots
+     * 2. Compute result into temp var
+     * 3. Pop input roots (BEFORE pushing result - LIFO stack order!)
+     * 4. Push result root (if GC type) - now result is on top, stays rooted *)
+    let stmts = 
+      if result_needs_gc then
+        (* Push root for result AFTER popping inputs *)
+        let result_gc_push = TCSGCPush (mk_expr (TCELocal result_name) result_type) in
+        stmts1 @ stmts2 @ [result_var; gc_pop; result_gc_push]
+      else
+        (* Non-GC result: just pop inputs, no need to root result *)
+        stmts1 @ stmts2 @ [result_var; gc_pop]
+    in
+    
+    (* Block leaves 1 GC root if result is GC type, plus inherited roots.
+     * If result is not GC type, only inherited roots remain.
+     * The caller will pop these at statement boundaries. *)
+    let result_roots = if result_needs_gc then 1 else 0 in
+    mk_expr_gc 
+      (TCEBlock (stmts, Some result_ref)) 
+      result_type 
+      (result_roots + inherited_roots)
+  end
+
+(* Similar to wrap_with_gc_extraction but for call arguments.
+ * Extracts all allocating arguments to temp variables.
+ * 
+ * Like wrap_with_gc_extraction, the result is rooted and gc_roots is set
+ * so that the caller can pop at statement boundaries.
+ *)
+let wrap_call_with_gc_extraction (make_call : tc_expr list -> tc_expr) (args : tc_expr list) : tc_expr =
+  let extracted = List.map extract_if_allocating args in
+  let args' = List.map (fun (e, _, _) -> e) extracted in
+  let all_stmts = List.concat (List.map (fun (_, stmts, _) -> stmts) extracted) in
+  let total_roots = List.fold_left (fun acc (_, _, n) -> acc + n) 0 extracted in
+  
+  (* Also sum gc_roots from input expressions *)
+  let inherited_roots = sum_gc_roots args in
+  
+  if total_roots = 0 then begin
+    (* No extraction needed - preserve inherited gc_roots *)
+    let final = make_call args in
+    { final with gc_roots = inherited_roots }
+  end else begin
+    (* Wrap in block with GC management *)
+    let final_expr = make_call args' in
+    let result_type = final_expr.ctype in
+    
+    (* Only root the result if it's a GC pointer type *)
+    let result_needs_gc = needs_gc_root_tc result_type in
+    
+    (* Save result to temp *)
+    let result_name = gen_gc_temp_name () in
+    let result_var = TCSVar {
+      vd_name = result_name;
+      vd_type = result_type;
+      vd_init = Some final_expr;
+      vd_static = false;
+      vd_const = false;
+    } in
+    
+    (* Pop the INPUT roots - must happen BEFORE pushing result, since gc_pop
+     * pops from the top of the stack. If we pushed result first, gc_pop would
+     * pop the result instead of the inputs! *)
+    let gc_pop = TCSGCPop total_roots in
+    
+    let result_ref = mk_expr (TCELocal result_name) result_type in
+    
+    (* Build statement list:
+     * 1. Input extractions (all_stmts) - these push input roots
+     * 2. Compute result into temp var  
+     * 3. Pop input roots (BEFORE pushing result - LIFO stack order!)
+     * 4. Push result root (if GC type) - now result is on top, stays rooted *)
+    let stmts = 
+      if result_needs_gc then
+        (* Push root for result AFTER popping inputs *)
+        let result_gc_push = TCSGCPush (mk_expr (TCELocal result_name) result_type) in
+        all_stmts @ [result_var; gc_pop; result_gc_push]
+      else
+        (* Non-GC result: just pop inputs, no need to root result *)
+        all_stmts @ [result_var; gc_pop]
+    in
+    
+    (* Block leaves 1 GC root if result is GC type, plus inherited roots.
+     * If result is not GC type, only inherited roots remain.
+     * The caller will pop these at statement boundaries. *)
+    let result_roots = if result_needs_gc then 1 else 0 in
+    mk_expr_gc 
+      (TCEBlock (stmts, Some result_ref)) 
+      result_type 
+      (result_roots + inherited_roots)
+  end
+
+(* ============================================================================
  * Operator Conversion
  * ============================================================================ *)
 
@@ -290,7 +555,9 @@ let rec convert_expr (ctx : conv_ctx) (e : texpr) : tc_expr =
         else
           (then_expr, else_expr, tc)
       in
-      mk_expr_pos (TCETernary (cond_expr, then_expr, else_expr)) result_tc pos
+      (* Take max of gc_roots from both branches (conservative but safe) *)
+      let gc_roots = max then_expr.gc_roots else_expr.gc_roots in
+      mk_expr_pos_gc (TCETernary (cond_expr, then_expr, else_expr)) result_tc pos gc_roots
   
   (* Field access *)
   | TField (obj, fa) ->
@@ -390,7 +657,8 @@ let rec convert_expr (ctx : conv_ctx) (e : texpr) : tc_expr =
           then_expr
       in
       let else_expr = mk_expr (TCECall (TCTFunc "fib_dynamic_null", [])) TCFibDynamic in
-      mk_expr_pos (TCETernary (cond_expr, then_expr, else_expr)) TCFibDynamic pos
+      (* else_expr has no gc_roots, so just use then_expr's gc_roots *)
+      mk_expr_pos_gc (TCETernary (cond_expr, then_expr, else_expr)) TCFibDynamic pos then_expr.gc_roots
   
   | TReturn None ->
       (* Return without value in expression context - unusual *)
@@ -461,13 +729,16 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
   | OpAssignOp inner_op when (match e1.Type.eexpr with Type.TArray _ -> true | _ -> false) ->
       convert_array_compound_assign ctx inner_op e1 e2 pos
   
-  (* String compound assignment: s += "str" *)
+  (* String compound assignment: s += "str" - with GC safety *)
   | OpAssignOp OpAdd when is_string_op ->
       let e1_expr = convert_expr ctx e1 in
       let e2_expr = convert_expr ctx e2 in
       let s1 = ensure_string ctx e1 e1_expr in
       let s2 = ensure_string ctx e2 e2_expr in
-      let concat = mk_expr (TCEStringConcat (s1, s2)) TCFibString in
+      (* Use GC-safe wrapper for the concat, then assign *)
+      let concat = wrap_with_gc_extraction 
+        (fun a b -> mk_expr (TCEStringConcat (a, b)) TCFibString)
+        s1 s2 in
       mk_expr_pos (TCEAssign (e1_expr, concat)) TCFibString pos
   
   (* FibDynamic compound assignment: dyn op= value *)
@@ -548,13 +819,19 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
   
   (* === STRING OPERATIONS === *)
   
-  (* String concatenation *)
+  (* String concatenation - with GC safety for nested allocating expressions.
+   * When we have nested concat like: concat(concat(a, b), c), the inner concat
+   * result may be in a register when the outer concat allocates and triggers GC.
+   * We extract allocating sub-expressions to rooted temp variables. *)
   | OpAdd when is_string_op ->
       let e1_expr = convert_expr ctx e1 in
       let e2_expr = convert_expr ctx e2 in
       let s1 = ensure_string ctx e1 e1_expr in
       let s2 = ensure_string ctx e2 e2_expr in
-      mk_expr_pos (TCEStringConcat (s1, s2)) TCFibString pos
+      (* Use GC-safe wrapper to extract nested allocating expressions *)
+      wrap_with_gc_extraction 
+        (fun a b -> mk_expr_pos (TCEStringConcat (a, b)) TCFibString pos)
+        s1 s2
   
   (* String equality *)
   | OpEq when is_string_op ->
@@ -985,7 +1262,8 @@ and convert_block_expr ctx exprs result_tc pos =
           stmts
         end
       in
-      mk_expr_pos (TCEBlock (final_stmts, Some last_expr)) result_tc pos
+      (* Block inherits gc_roots from the last (result) expression *)
+      mk_expr_pos_gc (TCEBlock (final_stmts, Some last_expr)) result_tc pos last_expr.gc_roots
 
 (* ============================================================================
  * Array Literal Conversion
@@ -1298,16 +1576,25 @@ and convert_string_call ctx str_expr args arg_exprs method_name result_tc pos =
   | "indexOf" ->
       let needle_expr = arg_or_string_default 0 "" in
       let start_expr = arg_or_int_default 1 0 in
-      mk_expr_pos (TCECall (TCTFunc "fib_string_index_of", [str_expr; needle_expr; start_expr])) TCInt32 pos
+      (* Wrap with GC extraction to protect allocating string arguments *)
+      wrap_call_with_gc_extraction
+        (fun args -> mk_expr_pos (TCECall (TCTFunc "fib_string_index_of", args)) TCInt32 pos)
+        [str_expr; needle_expr; start_expr]
   
   | "lastIndexOf" ->
       let needle_expr = arg_or_string_default 0 "" in
       let start_expr = arg_or_int_default 1 (-1) in
-      mk_expr_pos (TCECall (TCTFunc "fib_string_last_index_of", [str_expr; needle_expr; start_expr])) TCInt32 pos
+      (* Wrap with GC extraction to protect allocating string arguments *)
+      wrap_call_with_gc_extraction
+        (fun args -> mk_expr_pos (TCECall (TCTFunc "fib_string_last_index_of", args)) TCInt32 pos)
+        [str_expr; needle_expr; start_expr]
   
   | "split" ->
       let delim_expr = arg_or_string_default 0 "" in
-      mk_expr_pos (TCECall (TCTFunc "fib_string_split", [str_expr; delim_expr])) (TCFibArray TCArrGeneric) pos
+      (* Wrap with GC extraction to protect allocating string arguments *)
+      wrap_call_with_gc_extraction
+        (fun args -> mk_expr_pos (TCECall (TCTFunc "fib_string_split", args)) (TCFibArray TCArrGeneric) pos)
+        [str_expr; delim_expr]
   
   | "toUpperCase" ->
       mk_expr_pos (TCECall (TCTFunc "fib_string_to_upper", [str_expr])) TCFibString pos
@@ -1456,8 +1743,8 @@ and convert_call ctx callee args result_tc pos =
             | _ -> mk_expr_pos (TCEBool false) TCBool pos)
        | _ -> mk_expr_pos (TCEBool false) TCBool pos)
   
-  (* Fiber.spawn/spawnOn/spawnAny are handled in gen_call due to closure complexity *)
-  | Some (FiberusBuiltins.IFiberSpawn | FiberusBuiltins.IFiberSpawnOn | FiberusBuiltins.IFiberSpawnAny) ->
+  (* Fiber.spawn/spawnOn/spawnAny/spawnWithStack are handled in gen_call due to closure complexity *)
+  | Some (FiberusBuiltins.IFiberSpawn | FiberusBuiltins.IFiberSpawnOn | FiberusBuiltins.IFiberSpawnAny | FiberusBuiltins.IFiberSpawnWithStack) ->
       (* Fallback - let gen_call handle these *)
       mk_expr_pos (TCERaw "/* Fiber spawn handled by gen_call */") result_tc pos
   
@@ -1698,7 +1985,15 @@ let rec convert_stmt (ctx : conv_ctx) (e : texpr) : tc_stmt list =
   
   (* Return statement *)
   | TReturn expr_opt ->
-      let ret_expr = Option.map (convert_expr ctx) expr_opt in
+      let ret_expr = match expr_opt with
+        | None -> None
+        | Some inner ->
+            let inner_expr = convert_expr ctx inner in
+            (* Coerce to return type if known *)
+            match ctx.current_ret_type with
+            | Some ret_tc -> Some (coerce_to_type inner_expr ret_tc)
+            | None -> Some inner_expr
+      in
       [TCSReturn ret_expr]
   
   (* Break *)
@@ -1763,7 +2058,9 @@ let convert_function ctx name func is_static class_name_opt =
         { fa_name = "this"; fa_type = TCFibClass class_name } :: args
     | _ -> args
   in
-  let body = convert_stmt ctx func.tf_expr in
+  (* Set return type in context for proper coercion *)
+  let body_ctx = { ctx with current_ret_type = Some ret_type } in
+  let body = convert_stmt body_ctx func.tf_expr in
   {
     fd_name = name;
     fd_ret = ret_type;

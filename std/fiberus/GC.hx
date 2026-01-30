@@ -117,6 +117,17 @@ extern class GC {
 	public static function printStats():Void;
 
 	/**
+	 * Returns a formatted string containing GC statistics.
+	 *
+	 * Returns the same information as printStats() but as a String
+	 * instead of printing to stderr. Useful for logging or displaying
+	 * in UI.
+	 *
+	 * @return Formatted multi-line string with GC statistics
+	 */
+	public static function statsString():String;
+
+	/**
 	 * Sets the allocation threshold before automatic collection.
 	 *
 	 * When allocations since the last collection exceed this threshold,
