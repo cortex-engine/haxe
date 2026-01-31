@@ -239,32 +239,19 @@ let gen_mark_function_body (c : tclass) : tc_stmt list =
   let gc_fields = get_gc_fields c in
   if gc_fields = [] then []
   else
+    let obj_local = mk_expr (TCELocal "obj") (TCPointer TCFibObject) in
     let cast_stmt = TCSVar {
       vd_name = "this";
       vd_type = TCPointer (TCStruct class_name);
-      vd_init = Some {
-        cexpr = TCECast (TCPointer (TCStruct class_name), 
-                         { cexpr = TCELocal "obj"; ctype = TCPointer TCFibObject; cpos = null_pos; gc_roots = 0 });
-        ctype = TCPointer (TCStruct class_name);
-        cpos = null_pos;
-        gc_roots = 0;
-      };
+      vd_init = Some (mk_expr (TCECast (TCPointer (TCStruct class_name), obj_local)) (TCPointer (TCStruct class_name)));
       vd_static = false;
       vd_const = false;
     } in
     let mark_stmts = List.map (fun sfi ->
-      TCSExpr {
-        cexpr = TCECall (TCTFunc "gc_mark_object", [
-          { cexpr = TCELocal "ctx"; ctype = TCPointer (TCStruct "MarkContext"); cpos = null_pos; gc_roots = 0 };
-          { cexpr = TCEField (
-              { cexpr = TCELocal "this"; ctype = TCPointer (TCStruct class_name); cpos = null_pos; gc_roots = 0 },
-              sfi.sfi_name
-            ); ctype = sfi.sfi_type; cpos = null_pos; gc_roots = 0 }
-        ]);
-        ctype = TCVoid;
-        cpos = null_pos;
-        gc_roots = 0;
-      }
+      let ctx_local = mk_expr (TCELocal "ctx") (TCPointer (TCStruct "MarkContext")) in
+      let this_local = mk_expr (TCELocal "this") (TCPointer (TCStruct class_name)) in
+      let field_access = mk_expr (TCEField (this_local, sfi.sfi_name)) sfi.sfi_type in
+      TCSExpr (mk_expr (TCECall (TCTFunc "gc_mark_object", [ctx_local; field_access])) TCVoid)
     ) gc_fields in
     cast_stmt :: mark_stmts
 

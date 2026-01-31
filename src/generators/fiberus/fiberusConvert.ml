@@ -29,6 +29,13 @@ type conv_ctx = {
   (* GC tracking for statement conversion *)
   mutable gc_local_count: int;        (* Current temp roots pushed in this scope *)
   mutable loop_depth: int;            (* Nesting depth for yield points *)
+  (* Closure support *)
+  mutable closure_counter: int;       (* Counter for unique closure names *)
+  mutable closures: tc_closure list;  (* Closures created during conversion *)
+  mutable in_fiber_spawn: bool;       (* True if inside Fiber.spawn context *)
+  mutable spawn_counter: int;         (* Counter for unique Fiber.spawn temp variable names *)
+  (* Debug/codegen options *)
+  debug_level: int;                   (* 0=none, 1=function, 2=line *)
 }
 
 (* Create an empty conversion context *)
@@ -39,6 +46,11 @@ let empty_ctx = {
   current_ret_type = None;
   gc_local_count = 0;
   loop_depth = 0;
+  closure_counter = 0;
+  closures = [];
+  in_fiber_spawn = false;
+  spawn_counter = 0;
+  debug_level = 0;
 }
 
 (* Create context with current class *)
@@ -46,14 +58,38 @@ let ctx_with_class c = {
   empty_ctx with
   current_class = Some c;
   current_class_name = Some (flat_path c.cl_path);
-  current_ret_type = None;
 }
 
-(* Create a context copy for nested scope (preserves gc_local_count for tracking) *)
+(* Create a context copy for nested scope *)
 let ctx_for_scope ctx = {
   ctx with
-  gc_local_count = ctx.gc_local_count;  (* Will be mutated independently *)
+  gc_local_count = ctx.gc_local_count;
 }
+
+(* Global counters - simple and avoids all context propagation issues *)
+let global_closure_counter = ref 0
+let global_spawn_counter = ref 0
+
+(* Reset counters at start of each class/file *)
+let reset_counters () =
+  global_closure_counter := 0;
+  global_spawn_counter := 0
+
+(* Generate a fresh closure name using global counter *)
+let fresh_closure_name _ctx =
+  let id = !global_closure_counter in
+  incr global_closure_counter;
+  Printf.sprintf "_closure_%d" id
+
+(* Generate fresh spawn temp variable names to avoid redefinition errors *)
+(* Returns (fc_name, fib_name, id) so callers can use the id for related vars *)
+let fresh_spawn_vars _ctx =
+  let id = !global_spawn_counter in
+  incr global_spawn_counter;
+  (Printf.sprintf "_fc%d" id, Printf.sprintf "_fib%d" id, id)
+
+(* Get all closures registered during conversion *)
+let get_closures ctx = List.rev ctx.closures
 
 (* ============================================================================
  * GC-Aware Conversion Helpers
@@ -81,6 +117,15 @@ let gc_pop_roots ctx n =
 (* Calculate how many roots to pop to return to saved count *)
 let gc_roots_to_pop ctx saved_count =
   ctx.gc_local_count - saved_count
+
+(* Get the C element type for a specialized array kind *)
+let element_type_of_array_kind = function
+  | TCArrInt -> TCInt32
+  | TCArrFloat -> TCFloat64
+  | TCArrInt64 -> TCInt64
+  | TCArrUInt64 -> TCUInt64
+  | TCArrFloat32 -> TCFloat32
+  | TCArrGeneric -> TCFibDynamic
 
 (* Save current gc_local_count for later restoration *)
 let gc_save_count ctx = ctx.gc_local_count
@@ -181,12 +226,28 @@ let rec is_allocating_expr (e : tc_expr) : bool =
  *   - new_expr is either the original expr (if not allocating) or a reference to a temp var
  *   - stmts are the statements needed to set up the temp var with GC rooting
  * 
- * The caller is responsible for generating the gc_pop_temp_roots at the end. *)
+ * The caller is responsible for generating the gc_pop_temp_roots at the end.
+ *
+ * We extract in two cases:
+ * 1. The expression is allocating AND is a GC type - need to root the result
+ * 2. The expression has gc_roots > 0 - need to clean up those roots
+ * Case 2 handles nested blocks that leave roots on the stack even if their
+ * final result is a simple local variable. *)
 let extract_if_allocating (e : tc_expr) : tc_expr * tc_stmt list * int =
-  if not (is_allocating_expr e) || not (needs_gc_root_tc e.ctype) then
-    (* Not allocating or not a GC type - no extraction needed *)
+  let needs_extraction = 
+    (is_allocating_expr e && needs_gc_root_tc e.ctype) || e.gc_roots > 0
+  in
+  if not needs_extraction then
+    (* No extraction needed - expression is simple and leaves no roots *)
     (e, [], 0)
-  else begin
+  else if not (needs_gc_root_tc e.ctype) && e.gc_roots > 0 then begin
+    (* Special case: expression has gc_roots but result doesn't need rooting.
+     * We just need to clean up the gc_roots, not create a rooted temp var.
+     * This happens for blocks that compute a non-GC value but internally
+     * use GC-allocated temporaries. *)
+    let cleanup = TCSGCPop e.gc_roots in
+    (e, [cleanup], 0)  (* Note: roots_pushed=0 since we only cleaned up *)
+  end else begin
     (* Generate temp variable *)
     let tmp_name = gen_gc_temp_name () in
     let tmp_type = e.ctype in
@@ -200,13 +261,24 @@ let extract_if_allocating (e : tc_expr) : tc_expr * tc_stmt list * int =
       vd_const = false;
     } in
     
+    (* If the expression leaves gc_roots on the stack (e.g., it's a nested block),
+     * we need to pop those BEFORE pushing our temp var. Otherwise they accumulate
+     * and the outer gc_pop count becomes wrong.
+     * 
+     * Sequence: var = expr; pop(expr.gc_roots); push(&var);
+     * This ensures only OUR root remains on the stack. *)
+    let cleanup_stmts = 
+      if e.gc_roots > 0 then [TCSGCPop e.gc_roots]
+      else []
+    in
+    
     (* Create GC push statement *)
     let gc_push = TCSGCPush (mk_expr (TCELocal tmp_name) tmp_type) in
     
     (* Return reference to temp variable *)
     let tmp_ref = mk_expr (TCELocal tmp_name) tmp_type in
     
-    (tmp_ref, [var_decl; gc_push], 1)
+    (tmp_ref, [var_decl] @ cleanup_stmts @ [gc_push], 1)
   end
 
 (* Wrap an expression with GC-safe extraction of allocating sub-expressions.
@@ -236,16 +308,20 @@ let wrap_with_gc_extraction (make_final : tc_expr -> tc_expr -> tc_expr) (e1 : t
   let (e2', stmts2, roots2) = extract_if_allocating e2 in
   let total_input_roots = roots1 + roots2 in
   
-  (* Also inherit gc_roots from input expressions *)
-  let inherited_roots = e1.gc_roots + e2.gc_roots in
+  (* NOTE: We no longer inherit gc_roots from input expressions.
+   * extract_if_allocating now handles cleanup of any gc_roots left by 
+   * nested blocks. This prevents gc_roots from accumulating incorrectly
+   * when we have deeply nested string concatenations. *)
   
   if total_input_roots = 0 then begin
-    (* No extraction needed - just create the expression directly *)
+    (* No extraction needed - just create the expression directly.
+     * Collect pending_stmts from both inputs. *)
     let final = make_final e1 e2 in
-    (* Preserve inherited gc_roots from inputs *)
-    { final with gc_roots = inherited_roots }
+    { final with 
+      gc_roots = e1.gc_roots + e2.gc_roots;
+      pending_stmts = e1.pending_stmts @ e2.pending_stmts @ final.pending_stmts }
   end else begin
-    (* Need to wrap in a block with GC push/pop *)
+    (* Need to lift to statement level with GC push/pop *)
     let final_expr = make_final e1' e2' in
     let result_type = final_expr.ctype in
     
@@ -267,14 +343,12 @@ let wrap_with_gc_extraction (make_final : tc_expr -> tc_expr -> tc_expr) (e1 : t
      * pop the result instead of the inputs! *)
     let gc_pop = TCSGCPop total_input_roots in
     
-    let result_ref = mk_expr (TCELocal result_name) result_type in
-    
-    (* Build statement list: 
+    (* Build pending statements list: 
      * 1. Input extractions (stmts1, stmts2) - these push input roots
      * 2. Compute result into temp var
      * 3. Pop input roots (BEFORE pushing result - LIFO stack order!)
      * 4. Push result root (if GC type) - now result is on top, stays rooted *)
-    let stmts = 
+    let pending = 
       if result_needs_gc then
         (* Push root for result AFTER popping inputs *)
         let result_gc_push = TCSGCPush (mk_expr (TCELocal result_name) result_type) in
@@ -284,14 +358,15 @@ let wrap_with_gc_extraction (make_final : tc_expr -> tc_expr -> tc_expr) (e1 : t
         stmts1 @ stmts2 @ [result_var; gc_pop]
     in
     
-    (* Block leaves 1 GC root if result is GC type, plus inherited roots.
-     * If result is not GC type, only inherited roots remain.
-     * The caller will pop these at statement boundaries. *)
+    (* Result expression is just the local variable reference.
+     * Leaves exactly 1 GC root if result is GC type, 0 otherwise.
+     * Input expression gc_roots have already been cleaned up by extract_if_allocating. *)
     let result_roots = if result_needs_gc then 1 else 0 in
-    mk_expr_gc 
-      (TCEBlock (stmts, Some result_ref)) 
+    mk_expr_lifted_gc 
+      (TCELocal result_name) 
       result_type 
-      (result_roots + inherited_roots)
+      pending
+      result_roots
   end
 
 (* Similar to wrap_with_gc_extraction but for call arguments.
@@ -306,15 +381,18 @@ let wrap_call_with_gc_extraction (make_call : tc_expr list -> tc_expr) (args : t
   let all_stmts = List.concat (List.map (fun (_, stmts, _) -> stmts) extracted) in
   let total_roots = List.fold_left (fun acc (_, _, n) -> acc + n) 0 extracted in
   
-  (* Also sum gc_roots from input expressions *)
-  let inherited_roots = sum_gc_roots args in
+  (* NOTE: We no longer inherit gc_roots from input expressions.
+   * extract_if_allocating now handles cleanup of any gc_roots left by 
+   * nested blocks. This prevents gc_roots from accumulating incorrectly. *)
   
   if total_roots = 0 then begin
-    (* No extraction needed - preserve inherited gc_roots *)
+    (* No extraction needed - collect pending_stmts from all args *)
     let final = make_call args in
-    { final with gc_roots = inherited_roots }
+    { final with 
+      gc_roots = sum_gc_roots args;
+      pending_stmts = collect_pending args @ final.pending_stmts }
   end else begin
-    (* Wrap in block with GC management *)
+    (* Lift to statement level with GC management *)
     let final_expr = make_call args' in
     let result_type = final_expr.ctype in
     
@@ -336,14 +414,12 @@ let wrap_call_with_gc_extraction (make_call : tc_expr list -> tc_expr) (args : t
      * pop the result instead of the inputs! *)
     let gc_pop = TCSGCPop total_roots in
     
-    let result_ref = mk_expr (TCELocal result_name) result_type in
-    
-    (* Build statement list:
+    (* Build pending statements list:
      * 1. Input extractions (all_stmts) - these push input roots
      * 2. Compute result into temp var  
      * 3. Pop input roots (BEFORE pushing result - LIFO stack order!)
      * 4. Push result root (if GC type) - now result is on top, stays rooted *)
-    let stmts = 
+    let pending = 
       if result_needs_gc then
         (* Push root for result AFTER popping inputs *)
         let result_gc_push = TCSGCPush (mk_expr (TCELocal result_name) result_type) in
@@ -353,14 +429,15 @@ let wrap_call_with_gc_extraction (make_call : tc_expr list -> tc_expr) (args : t
         all_stmts @ [result_var; gc_pop]
     in
     
-    (* Block leaves 1 GC root if result is GC type, plus inherited roots.
-     * If result is not GC type, only inherited roots remain.
-     * The caller will pop these at statement boundaries. *)
+    (* Result expression is just the local variable reference.
+     * Leaves exactly 1 GC root if result is GC type, 0 otherwise.
+     * Input expression gc_roots have already been cleaned up by extract_if_allocating. *)
     let result_roots = if result_needs_gc then 1 else 0 in
-    mk_expr_gc 
-      (TCEBlock (stmts, Some result_ref)) 
+    mk_expr_lifted_gc 
+      (TCELocal result_name) 
       result_type 
-      (result_roots + inherited_roots)
+      pending
+      result_roots
   end
 
 (* ============================================================================
@@ -534,30 +611,39 @@ let rec convert_expr (ctx : conv_ctx) (e : texpr) : tc_expr =
   
   (* If expression (ternary) *)
   | TIf (cond, ethen, Some eelse) when not (is_void tc) ->
-      let cond_expr = convert_expr ctx cond in
+      let cond_expr_raw = convert_expr ctx cond in
       (* Extract bool from FibDynamic condition *)
       let cond_expr = 
-        if cond_expr.ctype = TCFibDynamic then
-          mk_expr (TCECall (TCTFunc "fib_dynamic_to_bool", [cond_expr])) TCBool
+        if cond_expr_raw.ctype = TCFibDynamic then
+          mk_expr (TCECall (TCTFunc "fib_dynamic_to_bool", [cond_expr_raw])) TCBool
         else
-          cond_expr
+          cond_expr_raw
       in
-      let then_expr = convert_expr ctx ethen in
-      let else_expr = convert_expr ctx eelse in
-      let then_tc = then_expr.ctype in
-      let else_tc = else_expr.ctype in
+      let then_expr_raw = convert_expr ctx ethen in
+      let else_expr_raw = convert_expr ctx eelse in
+      let then_tc = then_expr_raw.ctype in
+      let else_tc = else_expr_raw.ctype in
       (* Coerce branches to same type if one is FibDynamic *)
       let then_expr, else_expr, result_tc = 
         if then_tc = TCFibDynamic && else_tc <> TCFibDynamic then
-          (then_expr, mk_expr (TCEBox (else_expr, box_kind_of_type else_tc)) TCFibDynamic, TCFibDynamic)
+          (then_expr_raw, mk_expr (TCEBox (else_expr_raw, box_kind_of_type else_tc)) TCFibDynamic, TCFibDynamic)
         else if else_tc = TCFibDynamic && then_tc <> TCFibDynamic then
-          (mk_expr (TCEBox (then_expr, box_kind_of_type then_tc)) TCFibDynamic, else_expr, TCFibDynamic)
+          (mk_expr (TCEBox (then_expr_raw, box_kind_of_type then_tc)) TCFibDynamic, else_expr_raw, TCFibDynamic)
         else
-          (then_expr, else_expr, tc)
+          (then_expr_raw, else_expr_raw, tc)
       in
       (* Take max of gc_roots from both branches (conservative but safe) *)
-      let gc_roots = max then_expr.gc_roots else_expr.gc_roots in
-      mk_expr_pos_gc (TCETernary (cond_expr, then_expr, else_expr)) result_tc pos gc_roots
+      let gc_roots = max then_expr_raw.gc_roots else_expr_raw.gc_roots in
+      (* Strip pending_stmts from branch expressions - they'll be propagated to the result.
+       * We can't have pending_stmts inside a C ternary expression. *)
+      let then_expr_clean = { then_expr with pending_stmts = [] } in
+      let else_expr_clean = { else_expr with pending_stmts = [] } in
+      let result = mk_expr_pos_gc (TCETernary (cond_expr, then_expr_clean, else_expr_clean)) result_tc pos gc_roots in
+      (* IMPORTANT: Propagate pending_stmts from condition AND both branches.
+       * All temp variables must be declared before the ternary expression. *)
+      { result with 
+        pending_stmts = cond_expr_raw.pending_stmts @ then_expr_raw.pending_stmts @ else_expr_raw.pending_stmts @ result.pending_stmts;
+        gc_roots = cond_expr_raw.gc_roots + gc_roots }
   
   (* Field access *)
   | TField (obj, fa) ->
@@ -611,8 +697,54 @@ let rec convert_expr (ctx : conv_ctx) (e : texpr) : tc_expr =
       let name = flat_path path in
       mk_expr_pos (TCELocal name) tc pos
   
+  (* Function expression - create a closure *)
+  | TFunction f ->
+      (* Find free variables that need to be captured *)
+      let free_vars = FiberusClosure.find_free_vars f in
+      let closure_name = fresh_closure_name ctx in
+      let impl_name = closure_name ^ "_impl" in
+      let arg_count = List.length f.tf_args in
+      
+      (* Convert captured variables to (name, type) pairs *)
+      let captures = List.map (fun v ->
+        (ident v.v_name, tc_type_of v.v_type)
+      ) free_vars in
+      
+      (* Convert the function body to C-AST for later emission *)
+      let body_ctx = { (ctx_for_scope ctx) with current_ret_type = Some (tc_type_of f.tf_type) } in
+      let body_stmts = convert_stmt body_ctx f.tf_expr in
+      (* Sync any nested closures from body back to outer context *)
+      ctx.closures <- body_ctx.closures @ ctx.closures;
+      let ret_type = tc_type_of f.tf_type in
+      let args = List.map (fun (v, _) ->
+        { fa_name = ident v.v_name; fa_type = tc_type_of v.v_type }
+      ) f.tf_args in
+      
+      (* Register the closure for later implementation generation *)
+      let closure_def = {
+        cl_id = ctx.closure_counter - 1;  (* ID was incremented by fresh_closure_name *)
+        cl_name = closure_name;
+        cl_impl_name = impl_name;
+        cl_args = args;
+        cl_ret = ret_type;
+        cl_captures = List.mapi (fun i (name, typ) ->
+          { cap_var = name; cap_type = typ; cap_index = i }
+        ) captures;
+        cl_body = body_stmts;
+      } in
+      ctx.closures <- closure_def :: ctx.closures;
+      
+      (* Return the closure creation expression *)
+      mk_expr_pos (TCEClosureCreate {
+        cc_name = closure_name;
+        cc_impl_name = impl_name;
+        cc_captures = captures;
+        cc_arg_count = arg_count;
+        cc_for_fiber = ctx.in_fiber_spawn;
+      }) TCFibClosure pos
+  
   (* For remaining unhandled cases, emit raw placeholder *)
-  | TVar _ | TFunction _ | TWhile _ | TSwitch _ | TTry _ | TBreak | TContinue | TThrow _ ->
+  | TVar _ | TWhile _ | TSwitch _ | TTry _ | TBreak | TContinue | TThrow _ ->
       (* These are statements, not value expressions - shouldn't reach here in value context *)
       mk_expr_pos (TCERaw (Printf.sprintf "/* stmt in expr context: %s */" (Type.s_expr_kind e))) tc pos
   
@@ -708,7 +840,11 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
       let e1_expr = convert_expr ctx e1 in
       let e2_expr = convert_expr ctx e2 in
       let rhs = box_if_needed e1_expr.ctype e2_expr in
-      mk_expr_pos (TCEAssign (e1_expr, rhs)) e1_expr.ctype pos
+      (* Propagate pending_stmts from both sides *)
+      let assign = mk_expr_pos (TCEAssign (e1_expr, rhs)) e1_expr.ctype pos in
+      { assign with 
+        pending_stmts = e1_expr.pending_stmts @ rhs.pending_stmts @ assign.pending_stmts;
+        gc_roots = e1_expr.gc_roots + rhs.gc_roots }
   
   (* Unsigned right shift assignment *)
   | OpAssignOp OpUShr ->
@@ -719,11 +855,17 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
       let unsigned = mk_expr (TCECast (TCUInt32, e1_ex)) TCUInt32 in
       let shifted = mk_expr (TCEBinop (TCOpShr, unsigned, e2_ex)) TCUInt32 in
       let result = mk_expr (TCECast (TCInt32, shifted)) TCInt32 in
-      if e1_expr.ctype = TCFibDynamic then
-        let boxed = mk_expr (TCECall (TCTFunc "fib_dynamic_int", [result])) TCFibDynamic in
-        mk_expr_pos (TCEAssign (e1_expr, boxed)) TCFibDynamic pos
-      else
-        mk_expr_pos (TCEAssign (e1_expr, result)) TCInt32 pos
+      let final_result = 
+        if e1_expr.ctype = TCFibDynamic then begin
+          let boxed = mk_expr (TCECall (TCTFunc "fib_dynamic_int", [result])) TCFibDynamic in
+          mk_expr_pos (TCEAssign (e1_expr, boxed)) TCFibDynamic pos
+        end else
+          mk_expr_pos (TCEAssign (e1_expr, result)) TCInt32 pos
+      in
+      (* Propagate pending_stmts from both operands *)
+      { final_result with 
+        pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ final_result.pending_stmts;
+        gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
   
   (* Array compound assignment: arr[i] op= value *)
   | OpAssignOp inner_op when (match e1.Type.eexpr with Type.TArray _ -> true | _ -> false) ->
@@ -735,11 +877,17 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
       let e2_expr = convert_expr ctx e2 in
       let s1 = ensure_string ctx e1 e1_expr in
       let s2 = ensure_string ctx e2 e2_expr in
-      (* Use GC-safe wrapper for the concat, then assign *)
+      (* Use GC-safe wrapper for the concat, then assign.
+       * IMPORTANT: The concat expression may have pending_stmts from GC extraction
+       * that must be propagated to the final assignment expression. *)
       let concat = wrap_with_gc_extraction 
         (fun a b -> mk_expr (TCEStringConcat (a, b)) TCFibString)
         s1 s2 in
-      mk_expr_pos (TCEAssign (e1_expr, concat)) TCFibString pos
+      (* Propagate pending_stmts from concat to the assign expression *)
+      let assign = mk_expr_pos (TCEAssign (e1_expr, concat)) TCFibString pos in
+      { assign with 
+        pending_stmts = concat.pending_stmts @ assign.pending_stmts;
+        gc_roots = concat.gc_roots }
   
   (* FibDynamic compound assignment: dyn op= value *)
   | OpAssignOp inner_op when (tc_type_of e1.Type.etype) = TCFibDynamic ->
@@ -750,7 +898,11 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
       let c_op = convert_binop inner_op in
       let result = mk_expr (TCEBinop (c_op, e1_ex, e2_ex)) TCInt32 in
       let boxed = mk_expr (TCECall (TCTFunc "fib_dynamic_int", [result])) TCFibDynamic in
-      mk_expr_pos (TCEAssign (e1_expr, boxed)) TCFibDynamic pos
+      let assign = mk_expr_pos (TCEAssign (e1_expr, boxed)) TCFibDynamic pos in
+      (* Propagate pending_stmts from both operands *)
+      { assign with 
+        pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ assign.pending_stmts;
+        gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
   
   (* Regular compound assignment *)
   | OpAssignOp inner_op ->
@@ -758,7 +910,11 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
       let e2_expr = convert_expr ctx e2 in
       let e2_ex = extract_fib_dynamic e2_expr e1_expr.ctype in
       let c_op = convert_binop inner_op in
-      mk_expr_pos (TCEAssignOp (c_op, e1_expr, e2_ex)) e1_expr.ctype pos
+      let result = mk_expr_pos (TCEAssignOp (c_op, e1_expr, e2_ex)) e1_expr.ctype pos in
+      (* Propagate pending_stmts from both operands *)
+      { result with 
+        pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+        gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
   
   (* === NULL COMPARISONS === *)
   
@@ -769,7 +925,11 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
       let enum_expr = if is_null_const e1 then e2_expr else e1_expr in
       let index = mk_expr (TCEDot (enum_expr, "index")) TCInt32 in
       let neg_one = mk_int (-1l) in
-      mk_expr_pos (TCEBinop (TCOpEq, index, neg_one)) TCBool pos
+      let result = mk_expr_pos (TCEBinop (TCOpEq, index, neg_one)) TCBool pos in
+      (* Propagate pending_stmts from both operands *)
+      { result with 
+        pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+        gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
   
   | OpNotEq when is_null_compare && (is_enum_struct_expr e1 || is_enum_struct_expr e2) ->
       let e1_expr = convert_expr ctx e1 in
@@ -777,28 +937,48 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
       let enum_expr = if is_null_const e1 then e2_expr else e1_expr in
       let index = mk_expr (TCEDot (enum_expr, "index")) TCInt32 in
       let neg_one = mk_int (-1l) in
-      mk_expr_pos (TCEBinop (TCOpNeq, index, neg_one)) TCBool pos
+      let result = mk_expr_pos (TCEBinop (TCOpNeq, index, neg_one)) TCBool pos in
+      (* Propagate pending_stmts from both operands *)
+      { result with 
+        pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+        gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
   
   (* FibDynamic null check: dyn == null -> fib_dynamic_is_null(dyn) *)
   | OpEq when is_null_compare ->
       let e1_expr = convert_expr ctx e1 in
       let e2_expr = convert_expr ctx e2 in
-      if e1_expr.ctype = TCFibDynamic || e2_expr.ctype = TCFibDynamic then
+      if e1_expr.ctype = TCFibDynamic || e2_expr.ctype = TCFibDynamic then begin
         let dyn_expr = if is_null_const e1 then e2_expr else e1_expr in
-        mk_expr_pos (TCECall (TCTFunc "fib_dynamic_is_null", [dyn_expr])) TCBool pos
-      else
+        let result = mk_expr_pos (TCECall (TCTFunc "fib_dynamic_is_null", [dyn_expr])) TCBool pos in
+        (* Propagate pending_stmts from both operands *)
+        { result with 
+          pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+          gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
+      end else begin
         (* Regular null comparison *)
-        mk_expr_pos (TCEBinop (TCOpEq, e1_expr, e2_expr)) TCBool pos
+        let result = mk_expr_pos (TCEBinop (TCOpEq, e1_expr, e2_expr)) TCBool pos in
+        { result with 
+          pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+          gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
+      end
   
   | OpNotEq when is_null_compare ->
       let e1_expr = convert_expr ctx e1 in
       let e2_expr = convert_expr ctx e2 in
-      if e1_expr.ctype = TCFibDynamic || e2_expr.ctype = TCFibDynamic then
+      if e1_expr.ctype = TCFibDynamic || e2_expr.ctype = TCFibDynamic then begin
         let dyn_expr = if is_null_const e1 then e2_expr else e1_expr in
         let is_null = mk_expr (TCECall (TCTFunc "fib_dynamic_is_null", [dyn_expr])) TCBool in
-        mk_expr_pos (TCEUnop (TCUNot, is_null)) TCBool pos
-      else
-        mk_expr_pos (TCEBinop (TCOpNeq, e1_expr, e2_expr)) TCBool pos
+        let result = mk_expr_pos (TCEUnop (TCUNot, is_null)) TCBool pos in
+        (* Propagate pending_stmts from both operands *)
+        { result with 
+          pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+          gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
+      end else begin
+        let result = mk_expr_pos (TCEBinop (TCOpNeq, e1_expr, e2_expr)) TCBool pos in
+        { result with 
+          pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+          gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
+      end
   
   (* === ENUM COMPARISONS === *)
   
@@ -808,14 +988,22 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
       let e2_expr = convert_expr ctx e2 in
       let idx1 = mk_expr (TCEDot (e1_expr, "index")) TCInt32 in
       let idx2 = mk_expr (TCEDot (e2_expr, "index")) TCInt32 in
-      mk_expr_pos (TCEBinop (TCOpEq, idx1, idx2)) TCBool pos
+      let result = mk_expr_pos (TCEBinop (TCOpEq, idx1, idx2)) TCBool pos in
+      (* Propagate pending_stmts from both operands *)
+      { result with 
+        pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+        gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
   
   | OpNotEq when is_enum_struct_expr e1 && is_enum_struct_expr e2 ->
       let e1_expr = convert_expr ctx e1 in
       let e2_expr = convert_expr ctx e2 in
       let idx1 = mk_expr (TCEDot (e1_expr, "index")) TCInt32 in
       let idx2 = mk_expr (TCEDot (e2_expr, "index")) TCInt32 in
-      mk_expr_pos (TCEBinop (TCOpNeq, idx1, idx2)) TCBool pos
+      let result = mk_expr_pos (TCEBinop (TCOpNeq, idx1, idx2)) TCBool pos in
+      (* Propagate pending_stmts from both operands *)
+      { result with 
+        pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+        gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
   
   (* === STRING OPERATIONS === *)
   
@@ -843,7 +1031,11 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
       let s2 = if e2_expr.ctype = TCFibDynamic 
                then mk_expr (TCECall (TCTFunc "fib_dynamic_to_string", [e2_expr])) TCFibString 
                else e2_expr in
-      mk_expr_pos (TCEStringEq (s1, s2)) TCBool pos
+      let result = mk_expr_pos (TCEStringEq (s1, s2)) TCBool pos in
+      (* Propagate pending_stmts from both operands *)
+      { result with 
+        pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+        gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
   
   (* String inequality *)
   | OpNotEq when is_string_op ->
@@ -856,7 +1048,11 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
                then mk_expr (TCECall (TCTFunc "fib_dynamic_to_string", [e2_expr])) TCFibString 
                else e2_expr in
       let eq = mk_expr (TCEStringEq (s1, s2)) TCBool in
-      mk_expr_pos (TCEUnop (TCUNot, eq)) TCBool pos
+      let result = mk_expr_pos (TCEUnop (TCUNot, eq)) TCBool pos in
+      (* Propagate pending_stmts from both operands *)
+      { result with 
+        pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+        gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
   
   (* === UNSIGNED RIGHT SHIFT === *)
   
@@ -867,7 +1063,11 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
       let e2_ex = extract_fib_dynamic e2_expr TCInt32 in
       let unsigned = mk_expr_pos (TCECast (TCUInt32, e1_ex)) TCUInt32 pos in
       let shift = mk_expr_pos (TCEBinop (TCOpShr, unsigned, e2_ex)) TCUInt32 pos in
-      mk_expr_pos (TCECast (TCInt32, shift)) TCInt32 pos
+      let result = mk_expr_pos (TCECast (TCInt32, shift)) TCInt32 pos in
+      (* Propagate pending_stmts from both operands *)
+      { result with 
+        pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+        gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
   
   (* === FIBDYNAMIC ARITHMETIC === *)
   
@@ -880,10 +1080,18 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
         let e1_ex = extract_fib_dynamic e1_expr target_tc in
         let e2_ex = extract_fib_dynamic e2_expr target_tc in
         let c_op = convert_binop op in
-        mk_expr_pos (TCEBinop (c_op, e1_ex, e2_ex)) target_tc pos
+        let result = mk_expr_pos (TCEBinop (c_op, e1_ex, e2_ex)) target_tc pos in
+        (* Propagate pending_stmts from both operands *)
+        { result with 
+          pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+          gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
       end else begin
         let c_op = convert_binop op in
-        mk_expr_pos (TCEBinop (c_op, e1_expr, e2_expr)) result_tc pos
+        let result = mk_expr_pos (TCEBinop (c_op, e1_expr, e2_expr)) result_tc pos in
+        (* Propagate pending_stmts from both operands *)
+        { result with 
+          pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+          gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
       end
   
   (* Comparison operations - extract FibDynamic operands *)
@@ -897,10 +1105,18 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
         let e1_ex = extract_fib_dynamic e1_expr target_tc in
         let e2_ex = extract_fib_dynamic e2_expr target_tc in
         let c_op = convert_binop op in
-        mk_expr_pos (TCEBinop (c_op, e1_ex, e2_ex)) TCBool pos
+        let result = mk_expr_pos (TCEBinop (c_op, e1_ex, e2_ex)) TCBool pos in
+        (* Propagate pending_stmts from both operands *)
+        { result with 
+          pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+          gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
       end else begin
         let c_op = convert_binop op in
-        mk_expr_pos (TCEBinop (c_op, e1_expr, e2_expr)) TCBool pos
+        let result = mk_expr_pos (TCEBinop (c_op, e1_expr, e2_expr)) TCBool pos in
+        (* Propagate pending_stmts from both operands *)
+        { result with 
+          pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+          gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
       end
   
   (* Equality with FibDynamic - extract to primitive for comparison *)
@@ -914,10 +1130,18 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
         let e1_ex = extract_fib_dynamic e1_expr target_tc in
         let e2_ex = extract_fib_dynamic e2_expr target_tc in
         let c_op = convert_binop op in
-        mk_expr_pos (TCEBinop (c_op, e1_ex, e2_ex)) TCBool pos
+        let result = mk_expr_pos (TCEBinop (c_op, e1_ex, e2_ex)) TCBool pos in
+        (* Propagate pending_stmts from both operands *)
+        { result with 
+          pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+          gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
       end else begin
         let c_op = convert_binop op in
-        mk_expr_pos (TCEBinop (c_op, e1_expr, e2_expr)) TCBool pos
+        let result = mk_expr_pos (TCEBinop (c_op, e1_expr, e2_expr)) TCBool pos in
+        (* Propagate pending_stmts from both operands *)
+        { result with 
+          pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+          gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
       end
   
   (* Bitwise operations - extract FibDynamic to int *)
@@ -928,10 +1152,18 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
         let e1_ex = extract_fib_dynamic e1_expr TCInt32 in
         let e2_ex = extract_fib_dynamic e2_expr TCInt32 in
         let c_op = convert_binop op in
-        mk_expr_pos (TCEBinop (c_op, e1_ex, e2_ex)) TCInt32 pos
+        let result = mk_expr_pos (TCEBinop (c_op, e1_ex, e2_ex)) TCInt32 pos in
+        (* Propagate pending_stmts from both operands *)
+        { result with 
+          pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+          gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
       end else begin
         let c_op = convert_binop op in
-        mk_expr_pos (TCEBinop (c_op, e1_expr, e2_expr)) result_tc pos
+        let result = mk_expr_pos (TCEBinop (c_op, e1_expr, e2_expr)) result_tc pos in
+        (* Propagate pending_stmts from both operands *)
+        { result with 
+          pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+          gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
       end
   
   (* Boolean operations - extract FibDynamic to bool *)
@@ -942,10 +1174,18 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
         let e1_ex = extract_fib_dynamic e1_expr TCBool in
         let e2_ex = extract_fib_dynamic e2_expr TCBool in
         let c_op = convert_binop op in
-        mk_expr_pos (TCEBinop (c_op, e1_ex, e2_ex)) TCBool pos
+        let result = mk_expr_pos (TCEBinop (c_op, e1_ex, e2_ex)) TCBool pos in
+        (* Propagate pending_stmts from both operands *)
+        { result with 
+          pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+          gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
       end else begin
         let c_op = convert_binop op in
-        mk_expr_pos (TCEBinop (c_op, e1_expr, e2_expr)) TCBool pos
+        let result = mk_expr_pos (TCEBinop (c_op, e1_expr, e2_expr)) TCBool pos in
+        (* Propagate pending_stmts from both operands *)
+        { result with 
+          pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+          gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
       end
   
   (* Remaining operators *)
@@ -953,7 +1193,11 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
       let e1_expr = convert_expr ctx e1 in
       let e2_expr = convert_expr ctx e2 in
       let c_op = convert_binop op in
-      mk_expr_pos (TCEBinop (c_op, e1_expr, e2_expr)) result_tc pos
+      let result = mk_expr_pos (TCEBinop (c_op, e1_expr, e2_expr)) result_tc pos in
+      (* Propagate pending_stmts from both operands *)
+      { result with 
+        pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+        gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
 
 (* Extract value from FibDynamic if needed *)
 and extract_fib_dynamic expr target_tc =
@@ -1225,7 +1469,9 @@ and convert_expr_as_stmt ctx (e : texpr) : tc_stmt list =
         if exc_expr.ctype = TCFibDynamic then exc_expr
         else mk_expr (TCEBox (exc_expr, box_kind_of_type exc_expr.ctype)) TCFibDynamic
       in
-      [TCSThrow boxed_expr]
+      (* Emit pending_stmts before throw to ensure temp variables are declared *)
+      let pending_as_stmts = exc_expr.pending_stmts in
+      pending_as_stmts @ [TCSThrow boxed_expr]
   | _ ->
       (* Regular expression - wrap in TCSExpr *)
       [TCSExpr (convert_expr ctx e)]
@@ -1239,7 +1485,7 @@ and convert_block_expr ctx exprs result_tc pos =
       (* Single expression - just convert it *)
       convert_expr ctx single
   | _ ->
-      (* Multiple expressions - create statement block with result *)
+      (* Multiple expressions - use pending_stmts instead of TCEBlock *)
       (* Save GC count at start of block *)
       let saved_gc_count = gc_save_count ctx in
       (* Convert all but last expression as statements (may push GC roots) *)
@@ -1262,8 +1508,11 @@ and convert_block_expr ctx exprs result_tc pos =
           stmts
         end
       in
-      (* Block inherits gc_roots from the last (result) expression *)
-      mk_expr_pos_gc (TCEBlock (final_stmts, Some last_expr)) result_tc pos last_expr.gc_roots
+      (* Return the last expression with all prior statements as pending_stmts.
+       * This replaces the old TCEBlock pattern. *)
+      { last_expr with 
+        pending_stmts = final_stmts @ last_expr.pending_stmts;
+        cpos = pos }
 
 (* ============================================================================
  * Array Literal Conversion
@@ -1473,12 +1722,17 @@ and convert_array_call ctx arr arr_expr args arg_exprs method_name result_tc pos
       mk_expr_pos (TCECall (TCTFunc (prefix ^ "push"), [arr_expr; val_expr])) TCInt32 pos
   
   | "pop" ->
-      let call = mk_expr_pos (TCECall (TCTFunc (prefix ^ "pop"), [arr_expr])) result_tc pos in
+      (* For specialized arrays, pop returns the element type (e.g., int32_t for FibIntArray),
+         not the Haxe result_tc which may be Null<T>/Dynamic *)
+      let elem_tc = element_type_of_array_kind arr_kind in
+      let call = mk_expr_pos (TCECall (TCTFunc (prefix ^ "pop"), [arr_expr])) elem_tc pos in
       if is_specialized then call
       else mk_expr_pos (TCEUnbox (call, result_tc)) result_tc pos
   
   | "shift" ->
-      let call = mk_expr_pos (TCECall (TCTFunc (prefix ^ "shift"), [arr_expr])) result_tc pos in
+      (* For specialized arrays, shift returns the element type *)
+      let elem_tc = element_type_of_array_kind arr_kind in
+      let call = mk_expr_pos (TCECall (TCTFunc (prefix ^ "shift"), [arr_expr])) elem_tc pos in
       if is_specialized then call
       else mk_expr_pos (TCEUnbox (call, result_tc)) result_tc pos
   
@@ -1699,6 +1953,272 @@ and get_map_value_type map_type kind =
   | Type.TInst (_, [t]) -> tc_type_of (Type.follow t)
   | _ -> TCFibDynamic
 
+(* ============================================================================
+ * Fiber.spawn Conversion Helpers
+ * ============================================================================
+ * These helpers generate code for Fiber.spawn/spawnOn/spawnAny/spawnWithStack.
+ * The pattern uses pending_stmts to lift setup code to statement level,
+ * avoiding GCC statement expressions.
+ *
+ * Generated code pattern:
+ *   gc_mature_alloc_begin();
+ *   FibClosure* _fc = FIB_CLOSURE_CREATE_FOR_FIBER_N(...);
+ *   gc_push_temp_root([address of _fc]);
+ *   Fiber* _fib = scheduler_spawn(..., _fc);
+ *   gc_mature_alloc_end();
+ *   gc_pop_temp_roots(1);
+ *   [expression value is _fib]
+ *)
+
+(* Extract closure information from a Fiber.spawn argument *)
+and extract_fiber_closure ctx arg =
+  match arg.Type.eexpr with
+  | Type.TFunction f ->
+      (* Found a closure - register it as a fiber spawn closure *)
+      let closure_name = fresh_closure_name ctx in
+      let impl_name = closure_name ^ "_impl" in
+      let free_vars = FiberusClosure.find_free_vars f in
+      
+      (* Convert captured variables to (name, type) pairs *)
+      let captures = List.map (fun v ->
+        (ident v.v_name, tc_type_of (Type.follow v.v_type))
+      ) free_vars in
+      
+      (* Convert function body with fiber_spawn context *)
+      let saved_fiber_spawn = ctx.in_fiber_spawn in
+      ctx.in_fiber_spawn <- true;
+      
+      (* Function arguments - Fiber.spawn closures always take (FibDynamic) -> Void *)
+      let args = List.map (fun (v, _) ->
+        { fa_name = ident v.v_name; fa_type = tc_type_of (Type.follow v.v_type) }
+      ) f.tf_args in
+      let ret_type = tc_type_of (Type.follow f.tf_type) in
+      
+      (* Convert the body *)
+      let body_stmts = convert_stmt ctx f.tf_expr in
+      
+      ctx.in_fiber_spawn <- saved_fiber_spawn;
+      
+      (* Create closure definition *)
+      let closure_def = {
+        cl_id = ctx.closure_counter - 1;
+        cl_name = closure_name;
+        cl_impl_name = impl_name;
+        cl_args = args;
+        cl_ret = ret_type;
+        cl_captures = List.mapi (fun i (name, typ) ->
+          { cap_var = name; cap_type = typ; cap_index = i }
+        ) captures;
+        cl_body = body_stmts;
+      } in
+      ctx.closures <- closure_def :: ctx.closures;
+      
+      Some (closure_name, impl_name, captures, List.length f.tf_args)
+  | _ ->
+      (* Not a closure literal - will use simple Fiber_spawn *)
+      None
+
+(* Convert Fiber.spawn(closure) *)
+and convert_fiber_spawn ctx spawn_func trampoline_func args pos =
+  match args with
+  | [arg] ->
+      (match extract_fiber_closure ctx arg with
+      | Some (closure_name, impl_name, captures, _arg_count) ->
+          (* Generate unique variable names to avoid redefinition errors *)
+          let (fc_name, fib_name, _id) = fresh_spawn_vars ctx in
+          
+          (* Build pending_stmts for setup code *)
+          let pending = [
+            (* gc_mature_alloc_begin(); *)
+            TCSExpr (mk_expr (TCECall (TCTFunc "gc_mature_alloc_begin", [])) TCVoid);
+          ] in
+          
+          (* Build closure creation expression *)
+          let closure_expr = mk_expr (TCEClosureCreate {
+            cc_name = closure_name;
+            cc_impl_name = impl_name;
+            cc_captures = captures;
+            cc_arg_count = 0;  (* Fiber closures take 1 arg (FibDynamic) but dynamic calling not needed *)
+            cc_for_fiber = true;
+          }) TCFibClosure in
+          
+          (* FibClosure* _fcN = ...; *)
+          let fc_var = TCSVar {
+            vd_name = fc_name;
+            vd_type = TCFibClosure;
+            vd_init = Some closure_expr;
+            vd_static = false;
+            vd_const = false;
+          } in
+          
+          (* gc_push_temp_root - push address of _fcN as temp root *)
+          let push_root = TCSExpr (mk_expr (TCECall (TCTFunc "gc_push_temp_root", 
+            [mk_expr (TCECast (TCPointer (TCPointer TCVoid), mk_expr (TCEAddrOf (mk_expr (TCELocal fc_name) TCFibClosure)) (TCPointer TCFibClosure))) (TCPointer (TCPointer TCVoid))]
+          )) TCVoid) in
+          
+          (* Fiber* _fibN = scheduler_spawn(trampoline, _fcN) *)
+          let spawn_call = mk_expr (TCECall (TCTFunc spawn_func, [
+            mk_expr (TCELocal trampoline_func) (TCPointer TCVoid);
+            mk_expr (TCECast (TCPointer TCVoid, mk_expr (TCELocal fc_name) TCFibClosure)) (TCPointer TCVoid)
+          ])) TCFiber in
+          
+          let fib_var = TCSVar {
+            vd_name = fib_name;
+            vd_type = TCFiber;
+            vd_init = Some spawn_call;
+            vd_static = false;
+            vd_const = false;
+          } in
+          
+          (* gc_mature_alloc_end(); *)
+          let alloc_end = TCSExpr (mk_expr (TCECall (TCTFunc "gc_mature_alloc_end", [])) TCVoid) in
+          
+          (* gc_pop_temp_roots(1); *)
+          let pop_roots = TCSExpr (mk_expr (TCECall (TCTFunc "gc_pop_temp_roots", [mk_int 1l])) TCVoid) in
+          
+          (* Final expression is just _fibN *)
+          let result = mk_expr (TCELocal fib_name) TCFiber in
+          
+          (* Combine all pending statements *)
+          let all_pending = pending @ [fc_var; push_root; fib_var; alloc_end; pop_roots] in
+          
+          with_pending all_pending result
+          
+      | None ->
+          (* No closure - just call Fiber_spawn *)
+          let arg_expr = convert_expr ctx arg in
+          mk_expr_pos (TCECall (TCTFunc "Fiber_spawn", [arg_expr])) TCFiber pos)
+  | _ ->
+      mk_expr_pos (TCERaw "/* Fiber.spawn: wrong args */") TCFiber pos
+
+(* Convert Fiber.spawnOn(threadId, closure) *)
+and convert_fiber_spawn_on ctx tid_expr arg pos =
+  match extract_fiber_closure ctx arg with
+  | Some (closure_name, impl_name, captures, _arg_count) ->
+      (* Generate unique variable names to avoid redefinition errors *)
+      let (fc_name, fib_name, spawn_id) = fresh_spawn_vars ctx in
+      let tid_name = Printf.sprintf "_tid%d" spawn_id in
+      
+      let pending = [
+        (* int _tidN = tid_expr; *)
+        TCSVar {
+          vd_name = tid_name;
+          vd_type = TCInt32;
+          vd_init = Some tid_expr;
+          vd_static = false; vd_const = false;
+        };
+        (* gc_mature_alloc_begin(); *)
+        TCSExpr (mk_expr (TCECall (TCTFunc "gc_mature_alloc_begin", [])) TCVoid);
+      ] in
+      
+      let closure_expr = mk_expr (TCEClosureCreate {
+        cc_name = closure_name;
+        cc_impl_name = impl_name;
+        cc_captures = captures;
+        cc_arg_count = 0;
+        cc_for_fiber = true;
+      }) TCFibClosure in
+      
+      let fc_var = TCSVar {
+        vd_name = fc_name;
+        vd_type = TCFibClosure;
+        vd_init = Some closure_expr;
+        vd_static = false; vd_const = false;
+      } in
+      
+      let push_root = TCSExpr (mk_expr (TCECall (TCTFunc "gc_push_temp_root", 
+        [mk_expr (TCECast (TCPointer (TCPointer TCVoid), mk_expr (TCEAddrOf (mk_expr (TCELocal fc_name) TCFibClosure)) (TCPointer TCFibClosure))) (TCPointer (TCPointer TCVoid))]
+      )) TCVoid) in
+      
+      let spawn_call = mk_expr (TCECall (TCTFunc "scheduler_spawn_on", [
+        mk_expr (TCELocal tid_name) TCInt32;
+        mk_expr (TCELocal "_fib_spawn_on_closure_trampoline") (TCPointer TCVoid);
+        mk_expr (TCECast (TCPointer TCVoid, mk_expr (TCELocal fc_name) TCFibClosure)) (TCPointer TCVoid)
+      ])) TCFiber in
+      
+      let fib_var = TCSVar {
+        vd_name = fib_name;
+        vd_type = TCFiber;
+        vd_init = Some spawn_call;
+        vd_static = false; vd_const = false;
+      } in
+      
+      let alloc_end = TCSExpr (mk_expr (TCECall (TCTFunc "gc_mature_alloc_end", [])) TCVoid) in
+      let pop_roots = TCSExpr (mk_expr (TCECall (TCTFunc "gc_pop_temp_roots", [mk_int 1l])) TCVoid) in
+      
+      let result = mk_expr (TCELocal fib_name) TCFiber in
+      let all_pending = pending @ [fc_var; push_root; fib_var; alloc_end; pop_roots] in
+      
+      with_pending all_pending result
+      
+  | None ->
+      let arg_expr = convert_expr ctx arg in
+      mk_expr_pos (TCECall (TCTFunc "Fiber_spawnOn", [tid_expr; arg_expr])) TCFiber pos
+
+(* Convert Fiber.spawnWithStack(size, closure) *)
+and convert_fiber_spawn_with_stack ctx size_expr arg pos =
+  match extract_fiber_closure ctx arg with
+  | Some (closure_name, impl_name, captures, _arg_count) ->
+      (* Generate unique variable names to avoid redefinition errors *)
+      let (fc_name, fib_name, spawn_id) = fresh_spawn_vars ctx in
+      let sz_name = Printf.sprintf "_sz%d" spawn_id in
+      
+      let pending = [
+        (* size_t _szN = size_expr; *)
+        TCSVar {
+          vd_name = sz_name;
+          vd_type = TCUInt64;  (* size_t *)
+          vd_init = Some (mk_expr (TCECast (TCUInt64, size_expr)) TCUInt64);
+          vd_static = false; vd_const = false;
+        };
+        (* gc_mature_alloc_begin(); *)
+        TCSExpr (mk_expr (TCECall (TCTFunc "gc_mature_alloc_begin", [])) TCVoid);
+      ] in
+      
+      let closure_expr = mk_expr (TCEClosureCreate {
+        cc_name = closure_name;
+        cc_impl_name = impl_name;
+        cc_captures = captures;
+        cc_arg_count = 0;
+        cc_for_fiber = true;
+      }) TCFibClosure in
+      
+      let fc_var = TCSVar {
+        vd_name = fc_name;
+        vd_type = TCFibClosure;
+        vd_init = Some closure_expr;
+        vd_static = false; vd_const = false;
+      } in
+      
+      let push_root = TCSExpr (mk_expr (TCECall (TCTFunc "gc_push_temp_root", 
+        [mk_expr (TCECast (TCPointer (TCPointer TCVoid), mk_expr (TCEAddrOf (mk_expr (TCELocal fc_name) TCFibClosure)) (TCPointer TCFibClosure))) (TCPointer (TCPointer TCVoid))]
+      )) TCVoid) in
+      
+      let spawn_call = mk_expr (TCECall (TCTFunc "scheduler_spawn_sized", [
+        mk_expr (TCELocal sz_name) TCUInt64;
+        mk_expr (TCELocal "_fib_spawn_closure_trampoline") (TCPointer TCVoid);
+        mk_expr (TCECast (TCPointer TCVoid, mk_expr (TCELocal fc_name) TCFibClosure)) (TCPointer TCVoid)
+      ])) TCFiber in
+      
+      let fib_var = TCSVar {
+        vd_name = fib_name;
+        vd_type = TCFiber;
+        vd_init = Some spawn_call;
+        vd_static = false; vd_const = false;
+      } in
+      
+      let alloc_end = TCSExpr (mk_expr (TCECall (TCTFunc "gc_mature_alloc_end", [])) TCVoid) in
+      let pop_roots = TCSExpr (mk_expr (TCECall (TCTFunc "gc_pop_temp_roots", [mk_int 1l])) TCVoid) in
+      
+      let result = mk_expr (TCELocal fib_name) TCFiber in
+      let all_pending = pending @ [fc_var; push_root; fib_var; alloc_end; pop_roots] in
+      
+      with_pending all_pending result
+      
+  | None ->
+      let arg_expr = convert_expr ctx arg in
+      mk_expr_pos (TCECall (TCTFunc "Fiber_spawnWithStack", [size_expr; arg_expr])) TCFiber pos
+
 and convert_call ctx callee args result_tc pos =
   let arg_exprs = List.map (convert_expr ctx) args in
   
@@ -1743,14 +2263,71 @@ and convert_call ctx callee args result_tc pos =
             | _ -> mk_expr_pos (TCEBool false) TCBool pos)
        | _ -> mk_expr_pos (TCEBool false) TCBool pos)
   
-  (* Fiber.spawn/spawnOn/spawnAny/spawnWithStack are handled in gen_call due to closure complexity *)
-  | Some (FiberusBuiltins.IFiberSpawn | FiberusBuiltins.IFiberSpawnOn | FiberusBuiltins.IFiberSpawnAny | FiberusBuiltins.IFiberSpawnWithStack) ->
-      (* Fallback - let gen_call handle these *)
-      mk_expr_pos (TCERaw "/* Fiber spawn handled by gen_call */") result_tc pos
+  (* Fiber.spawn - spawn a fiber with a closure *)
+  | Some FiberusBuiltins.IFiberSpawn ->
+      convert_fiber_spawn ctx "scheduler_spawn" "_fib_spawn_closure_trampoline" args pos
   
-  (* trace() is handled in gen_call due to gen_trace_value complexity *)
+  (* Fiber.spawnOn - spawn a fiber on a specific thread *)
+  | Some FiberusBuiltins.IFiberSpawnOn ->
+      (match args with
+      | [thread_id; closure_arg] ->
+          (* Convert thread_id first *)
+          let tid_expr = convert_expr ctx thread_id in
+          (* Use dedicated spawnOn converter that handles tid + closure *)
+          convert_fiber_spawn_on ctx tid_expr closure_arg pos
+      | _ -> mk_expr_pos (TCERaw "/* Fiber.spawnOn: wrong args */") TCFiber pos)
+  
+  (* Fiber.spawnAny - spawn a fiber on any available thread *)
+  | Some FiberusBuiltins.IFiberSpawnAny ->
+      convert_fiber_spawn ctx "scheduler_spawn_any" "_fib_spawn_on_closure_trampoline" args pos
+  
+  (* Fiber.spawnWithStack - spawn a fiber with custom stack size *)
+  | Some FiberusBuiltins.IFiberSpawnWithStack ->
+      (match args with
+      | [stack_size; closure_arg] ->
+          let size_expr = convert_expr ctx stack_size in
+          convert_fiber_spawn_with_stack ctx size_expr closure_arg pos
+      | _ -> mk_expr_pos (TCERaw "/* Fiber.spawnWithStack: wrong args */") TCFiber pos)
+  
+  (* trace(msg, infos) -> haxe_Log_trace(boxed_msg, infos) *)
   | Some FiberusBuiltins.ITrace ->
-      mk_expr_pos (TCERaw "/* trace handled by gen_call */") result_tc pos
+      (match args with
+      | [msg; infos] ->
+          let msg_expr = convert_expr ctx msg in
+          let infos_expr = convert_expr ctx infos in
+          (* Box the message to FibDynamic based on its type *)
+          let boxed_msg = match msg_expr.ctype with
+            | TCFibString -> mk_expr (TCECall (TCTFunc "fib_string_to_dynamic", [msg_expr])) TCFibDynamic
+            | TCInt32 -> mk_expr (TCECall (TCTFunc "fib_dynamic_int", [msg_expr])) TCFibDynamic
+            | TCFloat64 -> mk_expr (TCECall (TCTFunc "fib_dynamic_float", [msg_expr])) TCFibDynamic
+            | TCBool -> mk_expr (TCECall (TCTFunc "fib_dynamic_bool", [msg_expr])) TCFibDynamic
+            | TCFibDynamic -> msg_expr
+            | _ -> 
+                (* Object or unknown type - convert to FibDynamic via object *)
+                let cast_obj = mk_expr (TCECast (TCFibObject, msg_expr)) TCFibObject in
+                mk_expr (TCECall (TCTFunc "fib_dynamic_object", [cast_obj])) TCFibDynamic
+          in
+          (* Combine pending_stmts from both expressions *)
+          let all_pending = msg_expr.pending_stmts @ infos_expr.pending_stmts in
+          let call_expr = mk_expr (TCECall (TCTFunc "haxe_Log_trace", [boxed_msg; infos_expr])) TCVoid in
+          { call_expr with pending_stmts = all_pending; cpos = pos }
+      | [msg] ->
+          (* trace with just message, no infos - create null infos *)
+          let msg_expr = convert_expr ctx msg in
+          let boxed_msg = match msg_expr.ctype with
+            | TCFibString -> mk_expr (TCECall (TCTFunc "fib_string_to_dynamic", [msg_expr])) TCFibDynamic
+            | TCInt32 -> mk_expr (TCECall (TCTFunc "fib_dynamic_int", [msg_expr])) TCFibDynamic
+            | TCFloat64 -> mk_expr (TCECall (TCTFunc "fib_dynamic_float", [msg_expr])) TCFibDynamic
+            | TCBool -> mk_expr (TCECall (TCTFunc "fib_dynamic_bool", [msg_expr])) TCFibDynamic
+            | TCFibDynamic -> msg_expr
+            | _ -> 
+                let cast_obj = mk_expr (TCECast (TCFibObject, msg_expr)) TCFibObject in
+                mk_expr (TCECall (TCTFunc "fib_dynamic_object", [cast_obj])) TCFibDynamic
+          in
+          let null_infos = mk_expr TCENull (TCPointer TCVoid) in
+          let call_expr = mk_expr (TCECall (TCTFunc "haxe_Log_trace", [boxed_msg; null_infos])) TCVoid in
+          { call_expr with pending_stmts = msg_expr.pending_stmts; cpos = pos }
+      | _ -> mk_expr_pos (TCERaw "/* trace: wrong number of args */") TCVoid pos)
   
   (* __fiberus__() raw code emission - concatenate string literals with converted expressions *)
   | Some FiberusBuiltins.IFiberus ->
@@ -1924,8 +2501,8 @@ and convert_call ctx callee args result_tc pos =
                 | None -> []
               in
               let coerced_args = coerce_args arg_exprs param_types in
-              (* Cast this to parent type *)
-              let parent_this = mk_expr (TCECast (TCPointer (TCFibClass parent_name), mk_expr TCEThis (TCPointer TCVoid))) (TCPointer (TCFibClass parent_name)) in
+              (* Cast this to parent type - TCFibClass already represents ClassName* *)
+              let parent_this = mk_expr (TCECast (TCFibClass parent_name, mk_expr TCEThis (TCPointer TCVoid))) (TCFibClass parent_name) in
               mk_expr_pos (TCECall (TCTMethod (parent_name, "init"), parent_this :: coerced_args)) TCVoid pos
           | None ->
               mk_expr_pos (TCERaw "/* super() with no parent class */") TCVoid pos)
@@ -1953,7 +2530,7 @@ and convert_call ctx callee args result_tc pos =
  * Statement Conversion
  * ============================================================================ *)
 
-let rec convert_stmt (ctx : conv_ctx) (e : texpr) : tc_stmt list =
+and convert_stmt (ctx : conv_ctx) (e : texpr) : tc_stmt list =
   match e.eexpr with
   (* Variable declaration *)
   | TVar (v, init_opt) ->
@@ -2012,7 +2589,9 @@ let rec convert_stmt (ctx : conv_ctx) (e : texpr) : tc_stmt list =
         if exc_expr.ctype = TCFibDynamic then exc_expr
         else mk_expr (TCEBox (exc_expr, box_kind_of_type exc_expr.ctype)) TCFibDynamic
       in
-      [TCSThrow boxed_expr]
+      (* Emit pending_stmts before throw to ensure temp variables are declared *)
+      let pending_as_stmts = exc_expr.pending_stmts in
+      pending_as_stmts @ [TCSThrow boxed_expr]
   
   (* Try/catch *)
   | TTry (body, catches) ->

@@ -48,6 +48,7 @@ type tc_type =
   | TCFibArray of tc_array_kind             (* Specialized arrays *)
   | TCFibClosure                            (* FibClosure* *)
   | TCFibObject                             (* FibObject* *)
+  | TCFiber                                 (* Fiber* - runtime fiber struct *)
   | TCFibClass of string                    (* ClassName* *)
   | TCFibEnum of string                     (* EnumName struct *)
   | TCFibIntMap                             (* FibIntMap* *)
@@ -119,6 +120,10 @@ and tc_expr = {
   gc_roots: int;  (* Unpaired GC roots this expression leaves on stack.
                    * Used by wrap_with_gc_extraction to track roots that need
                    * to be popped at statement boundaries. Default is 0. *)
+  pending_stmts: tc_stmt list;  (* Statements that must be emitted BEFORE this expression.
+                                 * Used for lifting complex sub-expressions to statement level,
+                                 * avoiding GCC statement expressions ({ ... }).
+                                 * Empty list means no pending statements. *)
 }
 
 and tc_expr_kind =
@@ -170,6 +175,13 @@ and tc_expr_kind =
   | TCEDynamicCall of {                     (* fib_closure_call_dynamic *)
       closure: tc_expr;
       args: tc_expr list;
+    }
+  | TCEClosureCreate of {                   (* Create a FibClosure *)
+      cc_name: string;                        (* _closure_N *)
+      cc_impl_name: string;                   (* _closure_N_impl *)
+      cc_captures: (string * tc_type) list;   (* (var_name, type) pairs *)
+      cc_arg_count: int;
+      cc_for_fiber: bool;                     (* Use fib_closure_create_for_fiber *)
     }
   
   (* Memory *)
@@ -423,33 +435,55 @@ type tc_unit = {
  * Helper Functions
  * ============================================================================ *)
 
-(* Create a simple expression with null position and zero gc_roots *)
+(* Create a simple expression with null position, zero gc_roots, and no pending statements *)
 let mk_expr kind typ =
-  { cexpr = kind; ctype = typ; cpos = null_pos; gc_roots = 0 }
+  { cexpr = kind; ctype = typ; cpos = null_pos; gc_roots = 0; pending_stmts = [] }
 
-(* Create an expression with position and zero gc_roots *)
+(* Create an expression with position, zero gc_roots, and no pending statements *)
 let mk_expr_pos kind typ pos =
-  { cexpr = kind; ctype = typ; cpos = pos; gc_roots = 0 }
+  { cexpr = kind; ctype = typ; cpos = pos; gc_roots = 0; pending_stmts = [] }
 
-(* Create an expression with explicit GC root count *)
+(* Create an expression with explicit GC root count and no pending statements *)
 let mk_expr_gc kind typ gc_roots =
-  { cexpr = kind; ctype = typ; cpos = null_pos; gc_roots }
+  { cexpr = kind; ctype = typ; cpos = null_pos; gc_roots; pending_stmts = [] }
 
-(* Create an expression with position and explicit GC root count *)
+(* Create an expression with position, explicit GC root count, and no pending statements *)
 let mk_expr_pos_gc kind typ pos gc_roots =
-  { cexpr = kind; ctype = typ; cpos = pos; gc_roots }
+  { cexpr = kind; ctype = typ; cpos = pos; gc_roots; pending_stmts = [] }
+
+(* Create an expression with pending statements (for lifting) *)
+let mk_expr_lifted kind typ pending_stmts =
+  { cexpr = kind; ctype = typ; cpos = null_pos; gc_roots = 0; pending_stmts }
+
+(* Create an expression with pending statements and gc_roots *)
+let mk_expr_lifted_gc kind typ pending_stmts gc_roots =
+  { cexpr = kind; ctype = typ; cpos = null_pos; gc_roots; pending_stmts }
 
 (* Sum gc_roots from multiple sub-expressions *)
 let sum_gc_roots exprs =
   List.fold_left (fun acc e -> acc + e.gc_roots) 0 exprs
 
+(* Collect all pending_stmts from multiple sub-expressions *)
+let collect_pending exprs =
+  List.concat_map (fun e -> e.pending_stmts) exprs
+
 (* Maximum gc_roots from expressions (for control flow branches) *)
 let max_gc_roots exprs =
   List.fold_left (fun acc e -> max acc e.gc_roots) 0 exprs
 
-(* Create an expression inheriting gc_roots from sub-expressions (sum) *)
+(* Create an expression inheriting gc_roots and pending_stmts from sub-expressions *)
 let mk_expr_inherit kind typ sub_exprs =
-  { cexpr = kind; ctype = typ; cpos = null_pos; gc_roots = sum_gc_roots sub_exprs }
+  { cexpr = kind; ctype = typ; cpos = null_pos; 
+    gc_roots = sum_gc_roots sub_exprs; 
+    pending_stmts = collect_pending sub_exprs }
+
+(* Add pending statements to an existing expression *)
+let with_pending stmts expr =
+  { expr with pending_stmts = stmts @ expr.pending_stmts }
+
+(* Extract a pure expression (no pending_stmts) and its pending statements *)
+let flatten_expr expr =
+  (expr.pending_stmts, { expr with pending_stmts = [] })
 
 (* Create an integer literal *)
 let mk_int i =
@@ -546,7 +580,7 @@ let mk_do_while body cond =
 (* Check if type is a pointer type *)
 let is_pointer_type = function
   | TCPointer _ | TCConstPointer _ | TCFibString | TCFibClosure
-  | TCFibObject | TCFibClass _ | TCFibArray _ 
+  | TCFibObject | TCFiber | TCFibClass _ | TCFibArray _ 
   | TCFibIntMap | TCFibStringMap | TCFibInt64Map | TCFibObjectMap
   | TCFibBytesData -> true
   | _ -> false
@@ -561,7 +595,7 @@ let is_primitive_type = function
 
 (* Check if type needs GC tracking *)
 let rec needs_gc_tracking = function
-  | TCFibString | TCFibClosure | TCFibObject | TCFibClass _
+  | TCFibString | TCFibClosure | TCFibObject | TCFiber | TCFibClass _
   | TCFibArray _ | TCFibDynamic
   | TCFibIntMap | TCFibStringMap | TCFibInt64Map | TCFibObjectMap
   | TCFibBytesData -> true

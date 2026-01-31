@@ -72,7 +72,7 @@ let get_base_config com =
 		purity_inference = not (Define.raw_defined com.defines "analyzer_no_purity_inference");
 		debug_kind = DebugNone;
 		detail_times = Timer.level_from_define com.defines Define.AnalyzerTimes;
-		user_var_fusion = (match com.platform with Flash | Jvm -> false | _ -> true) && (Define.raw_defined com.defines "analyzer_user_var_fusion" || (not com.debug && not (Define.raw_defined com.defines "analyzer_no_user_var_fusion")));
+		user_var_fusion = (match com.platform with Flash | Jvm | Fiberus -> false | _ -> true) && (Define.raw_defined com.defines "analyzer_user_var_fusion" || (not com.debug && not (Define.raw_defined com.defines "analyzer_no_user_var_fusion")));
 		fusion_debug = false;
 	}
 

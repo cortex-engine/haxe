@@ -114,38 +114,35 @@ let gen_enum_def (info : enum_info) : tc_enum_def =
 
 (* Get the appropriate boxing expression for an enum parameter *)
 let box_enum_param (param_name : string) (tc_t : tc_type) : tc_expr =
-  let param_ref = { cexpr = TCELocal param_name; ctype = tc_t; cpos = null_pos; gc_roots = 0 } in
+  let param_ref = mk_expr (TCELocal param_name) tc_t in
   match tc_t with
   | TCInt32 ->
-      { cexpr = TCEBox (param_ref, TCBoxInt); ctype = TCFibDynamic; cpos = null_pos; gc_roots = 0 }
+      mk_expr (TCEBox (param_ref, TCBoxInt)) TCFibDynamic
   | TCInt64 ->
-      { cexpr = TCEBox (param_ref, TCBoxInt64); ctype = TCFibDynamic; cpos = null_pos; gc_roots = 0 }
+      mk_expr (TCEBox (param_ref, TCBoxInt64)) TCFibDynamic
   | TCFloat64 | TCFloat32 ->
-      { cexpr = TCEBox (param_ref, TCBoxFloat); ctype = TCFibDynamic; cpos = null_pos; gc_roots = 0 }
+      mk_expr (TCEBox (param_ref, TCBoxFloat)) TCFibDynamic
   | TCBool ->
-      { cexpr = TCEBox (param_ref, TCBoxBool); ctype = TCFibDynamic; cpos = null_pos; gc_roots = 0 }
+      mk_expr (TCEBox (param_ref, TCBoxBool)) TCFibDynamic
   | TCFibString ->
-      { cexpr = TCEBox (param_ref, TCBoxString); ctype = TCFibDynamic; cpos = null_pos; gc_roots = 0 }
+      mk_expr (TCEBox (param_ref, TCBoxString)) TCFibDynamic
   | TCFibArray _ ->
-      { cexpr = TCEBox (param_ref, TCBoxArray); ctype = TCFibDynamic; cpos = null_pos; gc_roots = 0 }
+      mk_expr (TCEBox (param_ref, TCBoxArray)) TCFibDynamic
   | TCFibClosure ->
-      { cexpr = TCEBox (param_ref, TCBoxClosure); ctype = TCFibDynamic; cpos = null_pos; gc_roots = 0 }
+      mk_expr (TCEBox (param_ref, TCBoxClosure)) TCFibDynamic
   | TCFibObject | TCFibClass _ ->
-      { cexpr = TCEBox (param_ref, TCBoxObject); ctype = TCFibDynamic; cpos = null_pos; gc_roots = 0 }
-  | TCFibEnum enum_name ->
+      mk_expr (TCEBox (param_ref, TCBoxObject)) TCFibDynamic
+  | TCFibEnum _enum_name ->
       (* Enum struct - use fib_dynamic_enum with address and size *)
-      { cexpr = TCECall (TCTFunc "fib_dynamic_enum", [
-          { cexpr = TCEAddrOf param_ref; ctype = TCPointer tc_t; cpos = null_pos; gc_roots = 0 };
-          { cexpr = TCESizeOf tc_t; ctype = TCSizeT; cpos = null_pos; gc_roots = 0 };
-        ]); 
-        ctype = TCFibDynamic; 
-        cpos = null_pos;
-        gc_roots = 0 }
+      mk_expr (TCECall (TCTFunc "fib_dynamic_enum", [
+          mk_expr (TCEAddrOf param_ref) (TCPointer tc_t);
+          mk_expr (TCESizeOf tc_t) TCSizeT;
+        ])) TCFibDynamic
   | TCFibDynamic ->
       param_ref  (* Already FibDynamic *)
   | _ ->
       (* Default: treat as object pointer *)
-      { cexpr = TCEBox (param_ref, TCBoxObject); ctype = TCFibDynamic; cpos = null_pos; gc_roots = 0 }
+      mk_expr (TCEBox (param_ref, TCBoxObject)) TCFibDynamic
 
 (* ============================================================================
  * Constructor Function Generation
@@ -166,12 +163,7 @@ let gen_enum_constructor_func (info : enum_info) (ci : enum_constr_info) : tc_fu
     let decl_stmt = TCSVar {
       vd_name = "_e";
       vd_type = enum_type;
-      vd_init = Some {
-        cexpr = TCERaw (Printf.sprintf "{ .index = %d }" ci.eci_index);
-        ctype = enum_type;
-        cpos = null_pos;
-        gc_roots = 0;
-      };
+      vd_init = Some (mk_expr (TCERaw (Printf.sprintf "{ .index = %d }" ci.eci_index)) enum_type);
       vd_static = false;
       vd_const = false;
     } in
@@ -179,27 +171,13 @@ let gen_enum_constructor_func (info : enum_info) (ci : enum_constr_info) : tc_fu
     (* Assign each parameter: _e.params[i] = box(param); *)
     let assign_stmts = List.mapi (fun i (name, tc_t, _) ->
       let boxed = box_enum_param name tc_t in
-      TCSExpr {
-        cexpr = TCEAssign (
-          { cexpr = TCEEnumParam (
-              { cexpr = TCELocal "_e"; ctype = enum_type; cpos = null_pos; gc_roots = 0 },
-              i
-            ); ctype = TCFibDynamic; cpos = null_pos; gc_roots = 0 },
-          boxed
-        );
-        ctype = TCFibDynamic;
-        cpos = null_pos;
-        gc_roots = 0;
-      }
+      let local_e = mk_expr (TCELocal "_e") enum_type in
+      let param_access = mk_expr (TCEEnumParam (local_e, i)) TCFibDynamic in
+      TCSExpr (mk_expr (TCEAssign (param_access, boxed)) TCFibDynamic)
     ) ci.eci_params in
     
     (* Return _e; *)
-    let return_stmt = TCSReturn (Some {
-      cexpr = TCELocal "_e";
-      ctype = enum_type;
-      cpos = null_pos;
-      gc_roots = 0;
-    }) in
+    let return_stmt = TCSReturn (Some (mk_expr (TCELocal "_e") enum_type)) in
     
     [decl_stmt] @ assign_stmts @ [return_stmt]
   in
@@ -220,12 +198,7 @@ let gen_enum_const_decl (info : enum_info) (ci : enum_constr_info) : tc_decl =
   TCDVar {
     vd_name = info.ei_name ^ "_" ^ ci.eci_name;
     vd_type = enum_type;
-    vd_init = Some {
-      cexpr = TCERaw (Printf.sprintf "{ .index = %d }" ci.eci_index);
-      ctype = enum_type;
-      cpos = null_pos;
-      gc_roots = 0;
-    };
+    vd_init = Some (mk_expr (TCERaw (Printf.sprintf "{ .index = %d }" ci.eci_index)) enum_type);
     vd_static = false;
     vd_const = true;
   }
@@ -255,13 +228,8 @@ let gen_enum_decls (info : enum_info) : tc_decl list =
 
 (* Get unboxing expression for enum parameter access *)
 let unbox_enum_param (enum_expr : tc_expr) (param_idx : int) (target_type : tc_type) : tc_expr =
-  let param_access = {
-    cexpr = TCEEnumParam (enum_expr, param_idx);
-    ctype = TCFibDynamic;
-    cpos = enum_expr.cpos;
-    gc_roots = 0;
-  } in
-  { cexpr = TCEUnbox (param_access, target_type); ctype = target_type; cpos = enum_expr.cpos; gc_roots = 0 }
+  let param_access = mk_expr_pos (TCEEnumParam (enum_expr, param_idx)) TCFibDynamic enum_expr.cpos in
+  mk_expr_pos (TCEUnbox (param_access, target_type)) target_type enum_expr.cpos
 
 (* Check if type is an enum struct type *)
 let is_enum_type (t : tc_type) : bool =

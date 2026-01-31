@@ -135,6 +135,7 @@ let rec tc_type_to_string = function
   | TCFibArray TCArrFloat32 -> "FibFloat32Array*"
   | TCFibClosure -> "FibClosure*"
   | TCFibObject -> "FibObject*"
+  | TCFiber -> "Fiber*"
   | TCFibClass name -> name ^ "*"
   | TCFibEnum name -> name
   | TCFibIntMap -> "FibIntMap*"
@@ -185,7 +186,7 @@ let is_primitive = function
 (* Check if type is a pointer type *)
 let is_pointer = function
   | TCPointer _ | TCConstPointer _
-  | TCFibString | TCFibClosure | TCFibObject | TCFibClass _
+  | TCFibString | TCFibClosure | TCFibObject | TCFiber | TCFibClass _
   | TCFibArray _ | TCFibIntMap | TCFibStringMap | TCFibInt64Map | TCFibObjectMap
   | TCFibBytesData -> true
   | _ -> false
@@ -207,7 +208,7 @@ let is_enum_struct = function
 
 (* Check if type needs GC root registration *)
 let rec needs_gc_root = function
-  | TCFibString | TCFibClosure | TCFibObject | TCFibClass _
+  | TCFibString | TCFibClosure | TCFibObject | TCFiber | TCFibClass _
   | TCFibArray _ | TCFibDynamic
   | TCFibIntMap | TCFibStringMap | TCFibInt64Map | TCFibObjectMap
   | TCFibBytesData -> true

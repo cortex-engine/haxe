@@ -37,10 +37,10 @@ type ctx = {
 	mutable last_line : int;  (* Track last emitted line to avoid duplicates *)
 	(* Closure support *)
 	mutable closure_counter : int;
-	mutable closures : (string * tfunc * tvar list) list;  (* name, function, captured vars *)
+	mutable closures : tc_closure list;  (* Collected closures (C-AST) *)
 	mutable in_closure_impl : bool;  (* True when generating closure implementations *)
-	mutable closure_fwd_decls : Buffer.t;  (* Buffer for forward declarations during impl phase *)
 	mutable in_fiber_spawn : bool;  (* True when generating a closure for Fiber.spawn *)
+	mutable spawn_counter : int;  (* Counter for unique Fiber.spawn temp variable names *)
 	(* GC root tracking: count of gc_push_temp_root calls in current function *)
 	mutable gc_local_count : int;
 	(* Loop depth tracking: skip yield points in deeply nested loops *)
@@ -93,17 +93,32 @@ let make_conv_ctx ctx =
     FiberusConvert.vtable_ctx = ctx.vtable_ctx;
     FiberusConvert.current_ret_type = Option.map tc_type_of ctx.current_ret_type;
     FiberusConvert.gc_local_count = ctx.gc_local_count;
-    FiberusConvert.loop_depth = 0;  (* Reset loop depth for each conversion *)
+    FiberusConvert.loop_depth = 0;
+    FiberusConvert.closure_counter = ctx.closure_counter;
+    FiberusConvert.closures = [];
+    FiberusConvert.in_fiber_spawn = ctx.in_fiber_spawn;
+    FiberusConvert.spawn_counter = ctx.spawn_counter;
+    FiberusConvert.debug_level = ctx.debug_level;
   }
 
-(* Emit a C-AST expression directly to the buffer *)
+(* Sync closure state from conv_ctx back to genfiberus ctx, return collected closures *)
+let sync_closures_from_conv ctx conv_ctx =
+  ctx.closure_counter <- conv_ctx.FiberusConvert.closure_counter;
+  ctx.spawn_counter <- conv_ctx.FiberusConvert.spawn_counter;
+  FiberusConvert.get_closures conv_ctx
+
+(* Emit a C-AST expression directly to the buffer.
+ * NOTE: pending_stmts are NOT emitted here - they must be emitted by the caller
+ * at statement level before this expression is evaluated. Use emit_cexpr_as_stmt
+ * if you need pending_stmts to be emitted. *)
 let emit_cexpr ctx (cexpr : tc_expr) =
   let w = FiberusSourceWriter.create () in
   FiberusSourceWriter.write_expr w cexpr;
   spr ctx (FiberusSourceWriter.contents w)
 
 (* Emit a C-AST expression and return its gc_roots count for later cleanup.
- * Used when the expression is part of a statement that needs to pop roots. *)
+ * Used when the expression is part of a statement that needs to pop roots.
+ * NOTE: pending_stmts are NOT emitted here - they must be emitted by the caller. *)
 let emit_cexpr_with_roots ctx (cexpr : tc_expr) : int =
   let w = FiberusSourceWriter.create () in
   FiberusSourceWriter.write_expr w cexpr;
@@ -116,6 +131,16 @@ let emit_expr_gc_pop ctx gc_roots =
   if gc_roots > 0 then begin
     print ctx "; gc_pop_temp_roots_ctx(FIB_CTX, %d)" gc_roots
   end
+
+(* Emit pending_stmts from an expression, then the expression itself.
+ * This is for statement-level contexts where pending_stmts can be emitted. *)
+let emit_cexpr_with_pending ctx (cexpr : tc_expr) =
+  let w = FiberusSourceWriter.create () in
+  (* Emit any pending statements first *)
+  List.iter (FiberusSourceWriter.write_stmt w) cexpr.pending_stmts;
+  (* Emit the expression *)
+  FiberusSourceWriter.write_expr w cexpr;
+  spr ctx (FiberusSourceWriter.contents w)
 
 (* Emit a C-AST statement directly to the buffer (without trailing newline) *)
 let emit_cstmt_inline ctx (cstmt : tc_stmt) =
@@ -651,9 +676,33 @@ and extract_closure_for_spawn ctx arg =
 	| TFunction f ->
 		let free_vars = find_free_vars f in
 		let closure_name = Printf.sprintf "_closure_%d" ctx.closure_counter in
+		let impl_name = closure_name ^ "_impl" in
 		ctx.closure_counter <- ctx.closure_counter + 1;
-		if not ctx.in_closure_impl then
-			ctx.closures <- (closure_name, f, free_vars) :: ctx.closures;
+		if not ctx.in_closure_impl then begin
+			(* Create a C-AST closure record for the implementations to be generated later *)
+			let conv_ctx = make_conv_ctx ctx in
+			conv_ctx.FiberusConvert.in_fiber_spawn <- true;
+			(* Convert function body to C-AST *)
+			let body_ctx = { conv_ctx with FiberusConvert.current_ret_type = Some (tc_type_of f.tf_type) } in
+			let body_stmts = FiberusConvert.convert_stmt body_ctx f.tf_expr in
+			let ret_type = tc_type_of f.tf_type in
+			let args = List.map (fun (v, _) ->
+				{ FiberusAst.fa_name = ident v.v_name; FiberusAst.fa_type = tc_type_of v.v_type }
+			) f.tf_args in
+			let captures = List.mapi (fun i v ->
+				{ FiberusAst.cap_var = ident v.v_name; FiberusAst.cap_type = tc_type_of v.v_type; FiberusAst.cap_index = i }
+			) free_vars in
+			let closure_def = {
+				FiberusAst.cl_id = ctx.closure_counter - 1;
+				FiberusAst.cl_name = closure_name;
+				FiberusAst.cl_impl_name = impl_name;
+				FiberusAst.cl_args = args;
+				FiberusAst.cl_ret = ret_type;
+				FiberusAst.cl_captures = captures;
+				FiberusAst.cl_body = body_stmts;
+			} in
+			ctx.closures <- closure_def :: ctx.closures
+		end;
 		Some (free_vars, closure_name)
 	| _ -> None
 
@@ -1210,24 +1259,33 @@ and gen_value ctx e =
 		let cexpr = FiberusConvert.convert_expr conv_ctx e in
 		emit_cexpr ctx cexpr
 	| TCall (callee, args) ->
-		(* Check for builtins that require gen_call (closure extraction, trace, etc.) *)
+		(* Check for builtins that require gen_call (closure extraction, trace, etc.)
+		 * Note: Fiber.spawn/spawnOn/spawnAny/spawnWithStack now use C-AST pipeline *)
 		let needs_gen_call = match FiberusBuiltins.get_intrinsic callee with
 			| Some FiberusBuiltins.ITrace -> true
 			| Some FiberusBuiltins.IFiberus -> true
-			| Some FiberusBuiltins.IFiberSpawn -> true
-			| Some FiberusBuiltins.IFiberSpawnOn -> true
-			| Some FiberusBuiltins.IFiberSpawnAny -> true
-			| Some FiberusBuiltins.IFiberSpawnWithStack -> true
 			| _ -> false
 		in
-		(* Also check if any argument is a TFunction - needs gen_call for closure handling *)
-		let has_func_arg = List.exists (fun arg -> match arg.eexpr with TFunction _ -> true | _ -> false) args in
+		(* Also check if any argument is a TFunction - needs gen_call for closure handling.
+		 * Exception: Fiber.spawn variants handle their own closures in C-AST pipeline. *)
+		let is_fiber_spawn = match FiberusBuiltins.get_intrinsic callee with
+			| Some (FiberusBuiltins.IFiberSpawn | FiberusBuiltins.IFiberSpawnOn 
+			       | FiberusBuiltins.IFiberSpawnAny | FiberusBuiltins.IFiberSpawnWithStack) -> true
+			| _ -> false
+		in
+		let has_func_arg = not is_fiber_spawn && 
+			List.exists (fun arg -> match arg.eexpr with TFunction _ -> true | _ -> false) args in
 		if needs_gen_call || has_func_arg then
 			gen_call ctx callee args
 		else begin
-			(* Use C-AST pipeline for all other calls *)
+			(* Use C-AST pipeline for all other calls including Fiber.spawn variants *)
 			let conv_ctx = make_conv_ctx ctx in
 			let cexpr = FiberusConvert.convert_expr conv_ctx e in
+			(* Sync closures for Fiber.spawn cases *)
+			if is_fiber_spawn then begin
+				let new_closures = sync_closures_from_conv ctx conv_ctx in
+				ctx.closures <- new_closures @ ctx.closures
+			end;
 			emit_cexpr ctx cexpr
 		end
 	| TNew _ ->
@@ -1240,47 +1298,14 @@ and gen_value ctx e =
 		let conv_ctx = make_conv_ctx ctx in
 		let cexpr = FiberusConvert.convert_expr conv_ctx e in
 		emit_cexpr ctx cexpr
-	| TFunction f ->
-		(* Collect free variables to detect capturing closures *)
-		let free_vars = find_free_vars f in
-		let closure_name = Printf.sprintf "_closure_%d" ctx.closure_counter in
-		ctx.closure_counter <- ctx.closure_counter + 1;
-		(* Only add to closures list if we're NOT in implementation phase *)
-		(* During implementation, closures were already collected by pre-scan *)
-		if not ctx.in_closure_impl then
-			ctx.closures <- (closure_name, f, free_vars) :: ctx.closures;
-		(* Always generate FibClosure* for uniformity *)
-		(* Generate: ({ FibClosure* c = fib_closure_create[_for_fiber](fn, n); c->captures[i] = ...; c; }) *)
-		(* NOTE: For fiber spawns (in_fiber_spawn=true), the Fiber.spawn/spawnOn/spawnAny
-		 * handlers above generate the closure inline to ensure proper temp root protection.
-		 * This branch should NOT be reached for fiber spawns, but we keep the mature alloc
-		 * logic as a safety measure. *)
-		let arg_count = List.length f.tf_args in
-		let impl_name = closure_name ^ "_impl" in
-		if ctx.in_fiber_spawn then
-			spr ctx "({ FibClosure* _c = fib_closure_create_for_fiber((void*)"
-		else
-			spr ctx "({ FibClosure* _c = fib_closure_create((void*)";
-		spr ctx impl_name;
-		spr ctx ", (void*)";
-		spr ctx closure_name;
-		print ctx ", %d, %d); " (List.length free_vars) arg_count;
-		List.iteri (fun i v ->
-			print ctx "_c->captures[%d] = " i;
-			(* Box the captured value appropriately *)
-			let vtype = s_type ctx v.v_type in
-			if vtype = "int32_t" then
-				print ctx "fib_dynamic_int(%s); " (ident v.v_name)
-			else if vtype = "double" then
-				print ctx "fib_dynamic_float(%s); " (ident v.v_name)
-			else if vtype = "bool" then
-				print ctx "fib_dynamic_bool(%s); " (ident v.v_name)
-			else if vtype = "FibString*" then
-				print ctx "fib_dynamic_string(%s); " (ident v.v_name)
-			else
-				print ctx "(FibDynamic){.type=FIB_TYPE_OBJECT, .data.ptrVal=%s}; " (ident v.v_name)
-		) free_vars;
-		spr ctx "_c; })"
+	| TFunction _ ->
+		(* Use C-AST pipeline for closure creation *)
+		let conv_ctx = make_conv_ctx ctx in
+		let cexpr = FiberusConvert.convert_expr conv_ctx e in
+		(* Sync closures back to main context *)
+		let new_closures = sync_closures_from_conv ctx conv_ctx in
+		ctx.closures <- new_closures @ ctx.closures;
+		emit_cexpr ctx cexpr
 	| TVar (v, eo) ->
 		(* Check if this variable can be stack-allocated *)
 		let is_stack_alloc = Hashtbl.mem ctx.stack_alloc_vars v.v_id in
@@ -1510,17 +1535,28 @@ and gen_expr ctx e =
 	| TNew _ | TUnop _ | TCast _ | TMeta _
 	| TEnumParameter _ | TEnumIndex _ | TIdent _ ->
 		(* For value expressions used as statements, we need to:
-		 * 1. Emit the expression
-		 * 2. Pop any gc_roots the expression leaves on the stack
-		 * Convert to C-AST to check gc_roots *)
+		 * 1. Emit any pending_stmts from the expression
+		 * 2. Emit the expression
+		 * 3. Pop any gc_roots the expression leaves on the stack
+		 * Convert to C-AST to check gc_roots and pending_stmts *)
 		let conv_ctx = make_conv_ctx ctx in
 		let cexpr = FiberusConvert.convert_expr conv_ctx e in
-		emit_cexpr ctx cexpr;
+		emit_cexpr_with_pending ctx cexpr;
 		if cexpr.gc_roots > 0 then
 			print ctx "; gc_pop_temp_roots_ctx(FIB_CTX, %d)" cexpr.gc_roots
 	| TCall _ ->
-		(* Calls need gen_value for intrinsic handling (Fiber.spawn, trace, etc.) *)
-		gen_value ctx e
+		(* Convert call to C-AST to properly handle pending_stmts from complex arguments.
+		 * This handles trace(), Fiber.spawn, and all other calls that may have
+		 * string concatenation or other GC-allocating expressions as arguments. *)
+		let conv_ctx = make_conv_ctx ctx in
+		let cexpr = FiberusConvert.convert_expr conv_ctx e in
+		(* Sync closures back if any were created *)
+		let new_closures = sync_closures_from_conv ctx conv_ctx in
+		if new_closures <> [] then ctx.closures <- new_closures @ ctx.closures;
+		(* Emit pending statements first, then the expression *)
+		emit_cexpr_with_pending ctx cexpr;
+		if cexpr.gc_roots > 0 then
+			print ctx "; gc_pop_temp_roots_ctx(FIB_CTX, %d)" cexpr.gc_roots
 	| TFunction _ ->
 		()  (* Function expressions handled elsewhere *)
 	| TVar (v, eo) ->
@@ -1557,18 +1593,29 @@ and gen_expr ctx e =
 				| _ -> s_type ctx v.v_type
 			in
 			let is_gc_ptr = String.length type_str > 0 && type_str.[String.length type_str - 1] = '*' in
-			(* Generate variable declaration (no more volatile - we use gc_push_temp_root instead) *)
-			print ctx "%s %s" type_str (ident v.v_name);
 			(* Track gc_roots from initializer for proper cleanup order *)
 			let init_gc_roots = ref 0 in
 			(match eo with
-			| None -> ()
+			| None ->
+				(* No initializer - just declare the variable *)
+				print ctx "%s %s" type_str (ident v.v_name)
 			| Some e ->
-				spr ctx " = ";
-				(* Convert to C-AST first to get gc_roots count *)
+				(* Convert to C-AST first to get pending_stmts and gc_roots *)
 				let conv_ctx = make_conv_ctx ctx in
 				let cexpr = FiberusConvert.convert_expr conv_ctx e in
+				(* Sync closures back to main context - critical for TFunction initializers! *)
+				let new_closures = sync_closures_from_conv ctx conv_ctx in
+				if new_closures <> [] then ctx.closures <- new_closures @ ctx.closures;
 				init_gc_roots := cexpr.gc_roots;
+				(* IMPORTANT: Emit pending_stmts BEFORE the variable declaration.
+				 * These contain temp variable declarations needed by the initializer. *)
+				if cexpr.pending_stmts <> [] then begin
+					let w = FiberusSourceWriter.create () in
+					List.iter (FiberusSourceWriter.write_stmt w) cexpr.pending_stmts;
+					spr ctx (FiberusSourceWriter.contents w)
+				end;
+				(* Now emit the variable declaration with initializer *)
+				print ctx "%s %s = " type_str (ident v.v_name);
 				(* Emit with proper coercion *)
 				let from_tc = cexpr.ctype in
 				let to_tc = tc_type_of v.v_type in
@@ -1605,8 +1652,17 @@ and gen_expr ctx e =
 		) el;
 		b ()
 	| TIf (cond, e1, e2) ->
+		(* Convert condition to C-AST to handle pending_stmts from complex expressions *)
+		let conv_ctx = make_conv_ctx ctx in
+		let cond_expr = FiberusConvert.convert_expr conv_ctx cond in
+		(* Emit pending_stmts before the if - these declare temp variables used in condition *)
+		if cond_expr.pending_stmts <> [] then begin
+			let w = FiberusSourceWriter.create () in
+			List.iter (FiberusSourceWriter.write_stmt w) cond_expr.pending_stmts;
+			spr ctx (FiberusSourceWriter.contents w)
+		end;
 		spr ctx "if (";
-		gen_value ctx cond;
+		emit_cexpr ctx cond_expr;
 		spr ctx ") { ";
 		let saved_gc1 = ctx.gc_local_count in
 		gen_expr ctx e1;
@@ -1636,8 +1692,17 @@ and gen_expr ctx e =
 			ctx.gc_local_count <- saved_gc2;
 			spr ctx " }")
 	| TWhile (cond, e, NormalWhile) ->
+		(* Convert condition to C-AST to handle pending_stmts from complex expressions *)
+		let conv_ctx = make_conv_ctx ctx in
+		let cond_expr = FiberusConvert.convert_expr conv_ctx cond in
+		(* Emit pending_stmts before the while - these declare temp variables used in condition *)
+		if cond_expr.pending_stmts <> [] then begin
+			let w = FiberusSourceWriter.create () in
+			List.iter (FiberusSourceWriter.write_stmt w) cond_expr.pending_stmts;
+			spr ctx (FiberusSourceWriter.contents w)
+		end;
 		spr ctx "while (";
-		gen_value ctx cond;
+		emit_cexpr ctx cond_expr;
 		spr ctx ") {";
 		newline ctx;
 		ctx.tabs <- ctx.tabs ^ "\t";
@@ -1799,7 +1864,8 @@ and gen_expr ctx e =
 		print ctx "jmp_buf %s;" jmp;
 		newline ctx;
 		(* Save GC root count before try - will restore on exception *)
-		print ctx "size_t %s = FIB_CTX ? FIB_CTX->mTempRootCount : 0;" gc_save;
+		(* FIB_CTX is now FiberGCContext*, so use tempRootCount (not mTempRootCount) *)
+		print ctx "size_t %s = FIB_CTX ? FIB_CTX->tempRootCount : 0;" gc_save;
 		newline ctx;
 		(* Save stack frame count - longjmp bypasses cleanup handlers *)
 		print ctx "int %s = fib_current_fiber() ? fib_current_fiber()->stackFrameCount : 0;" stack_save;
@@ -1818,7 +1884,8 @@ and gen_expr ctx e =
 		newline ctx;
 		ctx.tabs <- ctx.tabs ^ "\t";
 		(* Restore GC roots to pre-try level - longjmp skipped cleanup code *)
-		print ctx "if (FIB_CTX && FIB_CTX->mTempRootCount > %s) FIB_CTX->mTempRootCount = %s;" gc_save gc_save;
+		(* FIB_CTX is now FiberGCContext*, so use tempRootCount (not mTempRootCount) *)
+		print ctx "if (FIB_CTX && FIB_CTX->tempRootCount > %s) FIB_CTX->tempRootCount = %s;" gc_save gc_save;
 		newline ctx;
 		(* Restore stack frame count - longjmp bypassed cleanup handlers *)
 		print ctx "if (fib_current_fiber()) fib_current_fiber()->stackFrameCount = %s;" stack_save;
@@ -1906,7 +1973,7 @@ and gen_expr ctx e =
 			else
 				spr ctx "return"
 		| Some e ->
-			(* Convert return expression to check for gc_roots *)
+			(* Convert return expression to check for gc_roots and pending_stmts *)
 			let conv_ctx = make_conv_ctx ctx in
 			let cexpr_raw = FiberusConvert.convert_expr conv_ctx e in
 			(* Coerce to return type if known *)
@@ -1915,26 +1982,33 @@ and gen_expr ctx e =
 				| None -> cexpr_raw
 			in
 			let expr_gc_roots = cexpr.gc_roots in
+			let has_pending = cexpr.pending_stmts <> [] in
 			let total_to_pop = ctx.gc_local_count + expr_gc_roots in
 			let ret_type = match ctx.current_ret_type with
 				| Some t -> s_type ctx t
 				| None -> s_type ctx e.etype
 			in
-			(* For simple values with no gc_roots and no locals, return directly *)
+			(* For simple values with no gc_roots, no locals, and no pending_stmts, return directly *)
 			let is_simple = match e.eexpr with
 				| TConst _ | TLocal _ -> true
 				| _ -> false
 			in
-			if is_simple && total_to_pop = 0 then begin
+			if is_simple && total_to_pop = 0 && not has_pending then begin
 				spr ctx "return ";
 				emit_cexpr ctx cexpr
-			end else if is_simple && expr_gc_roots = 0 then begin
+			end else if is_simple && expr_gc_roots = 0 && not has_pending then begin
 				(* Simple value, only function locals to pop *)
 				print ctx "gc_pop_temp_roots_ctx(FIB_CTX, %d); return " ctx.gc_local_count;
 				emit_cexpr ctx cexpr
 			end else begin
-				(* Complex: evaluate into temp, pop all roots, return temp *)
+				(* Complex: emit pending_stmts, evaluate into temp, pop all roots, return temp *)
 				spr ctx "{ ";
+				(* Emit pending statements FIRST - these declare temp variables needed by the expression *)
+				if has_pending then begin
+					let w = FiberusSourceWriter.create () in
+					List.iter (FiberusSourceWriter.write_stmt w) cexpr.pending_stmts;
+					spr ctx (FiberusSourceWriter.contents w)
+				end;
 				print ctx "%s __ret = " ret_type;
 				emit_cexpr ctx cexpr;
 				if total_to_pop > 0 then
@@ -1996,9 +2070,10 @@ let gen_function ctx name f c is_static =
 	spr ctx "GC_SAFE_POINT();";
 	newline ctx;
 	(* Debug: save base root count for verification at return *)
+	(* Note: _fib_gc_ctx is FiberGCContext*, uses tempRootCount (not mTempRootCount) *)
 	spr ctx "#ifdef FIBERUS_DEBUG";
 	newline ctx;
-	spr ctx "size_t _gc_base_count = _fib_ctx ? _fib_ctx->mTempRootCount : 0;";
+	spr ctx "size_t _gc_base_count = _fib_gc_ctx ? _fib_gc_ctx->tempRootCount : 0;";
 	newline ctx;
 	spr ctx "#endif";
 	newline ctx;
@@ -2405,6 +2480,9 @@ let gen_class_impl ctx c =
 		let class_name = flat_path c.cl_path in
 		let class_id = get_class_id ctx c.cl_path in
 
+		(* Reset global counters for this class - ensures unique names per file *)
+		FiberusConvert.reset_counters ();
+
 		(* Pre-scan to collect method thunks needed *)
 		prescan_class_for_thunks ctx c;
 
@@ -2618,258 +2696,23 @@ let gen_class_impl ctx c =
 		(* Get the main content we've generated so far *)
 		let main_content = Buffer.contents ctx.buf in
 
-		(* Generate closures collected during code generation *)
+		(* Generate closures collected during code generation using C-AST pipeline *)
 		if ctx.closures <> [] then begin
-			(* Generate forward declarations and implementations in a new buffer *)
 			Buffer.clear ctx.buf;
-
-			(* Pre-scan all closures to find nested closures recursively *)
-			(* This ensures all forward declarations are emitted before any implementations *)
-			let rec scan_expr e =
-				match e.eexpr with
-				| TFunction f ->
-					let free_vars = find_free_vars f in
-					let closure_name = Printf.sprintf "_closure_%d" ctx.closure_counter in
-					ctx.closure_counter <- ctx.closure_counter + 1;
-					ctx.closures <- (closure_name, f, free_vars) :: ctx.closures;
-					scan_expr f.tf_expr
-				| TBlock el -> List.iter scan_expr el
-				| TIf (econd, eif, eelse) ->
-					scan_expr econd; scan_expr eif;
-					(match eelse with Some e -> scan_expr e | None -> ())
-				| TWhile (econd, ebody, _) -> scan_expr econd; scan_expr ebody
-				| TSwitch sw ->
-					scan_expr sw.switch_subject;
-					List.iter (fun c -> List.iter scan_expr c.case_patterns; scan_expr c.case_expr) sw.switch_cases;
-					(match sw.switch_default with Some e -> scan_expr e | None -> ())
-				| TTry (e, catches) ->
-					scan_expr e;
-					List.iter (fun (_, e) -> scan_expr e) catches
-				| TReturn (Some e) -> scan_expr e
-				| TVar (_, Some e) -> scan_expr e
-				| TBinop (_, e1, e2) -> scan_expr e1; scan_expr e2
-				| TUnop (_, _, e) -> scan_expr e
-				| TCall (e, args) -> scan_expr e; List.iter scan_expr args
-				| TParenthesis e -> scan_expr e
-				| TField (e, fa) ->
-				scan_expr e;
-				(* Check for method references that need thunks *)
-				(match fa with
-				| FClosure (Some (c, _), cf) ->
-					let class_name = flat_path c.cl_path in
-					let method_name = ident cf.cf_name in
-					let thunk_name = Printf.sprintf "__%s_%s_thunk" class_name method_name in
-					let is_static = List.exists (fun scf -> scf.cf_name = cf.cf_name) c.cl_ordered_statics in
-					let arg_types, ret_type = match follow cf.cf_type with
-						| TFun (args, ret) -> (List.map (fun (n, _, t) -> (n, t)) args, ret)
-						| _ -> ([], t_dynamic)
-					in
-					Hashtbl.replace ctx.method_thunks thunk_name (is_static, c.cl_path, cf.cf_name, arg_types, ret_type)
-				| _ -> ())
-				| TArray (e1, e2) -> scan_expr e1; scan_expr e2
-				| TArrayDecl el -> List.iter scan_expr el
-				| TObjectDecl fields -> List.iter (fun (_, e) -> scan_expr e) fields
-				| TCast (e, _) -> scan_expr e
-				| TMeta (_, e) -> scan_expr e
-				| TEnumParameter (e, _, _) -> scan_expr e
-				| TEnumIndex e -> scan_expr e
-				| TNew (_, _, args) -> List.iter scan_expr args
-				| TThrow e -> scan_expr e
-				| _ -> ()
-			in
-			(* Save closure counter before pre-scan *)
-			let counter_before_prescan = ctx.closure_counter in
-			(* Scan all closure bodies to find nested closures *)
-			let initial_closures = List.rev ctx.closures in
-			ctx.closures <- [];
-			List.iter (fun (name, f, captured) ->
-				ctx.closures <- (name, f, captured) :: ctx.closures;
-				scan_expr f.tf_expr
-			) initial_closures;
-
-			(* Forward declarations for ALL closures (including nested ones) *)
-			(* Note: The thunks always take FibDynamic params and return FibDynamic *)
-			spr ctx "/* Closure forward declarations */\n";
-			List.iter (fun (name, f, _captured) ->
-				let ret_type = match follow f.tf_type with
-					| TFun _ -> "FibClosure*"
-					| _ -> s_type ctx f.tf_type
-				in
-				let filtered_args = filter_void_args f.tf_args in
-				(* Forward declaration for typed impl function *)
-				let impl_name = name ^ "_impl" in
-				let typed_args = List.map (fun (v, _) ->
-					s_type_with_name ctx v.v_type (ident v.v_name)
-				) filtered_args in
-				let all_typed_args = "FibClosure* _closure" :: typed_args in
-				let typed_args_str = String.concat ", " all_typed_args in
-				print ctx "static %s %s(%s);\n" ret_type impl_name typed_args_str;
-				(* Forward declaration for dynamic thunk *)
-				let dyn_args = List.mapi (fun i _ -> Printf.sprintf "FibDynamic _arg%d" i) filtered_args in
-				let all_dyn_args = "FibClosure* _closure" :: dyn_args in
-				let dyn_args_str = String.concat ", " all_dyn_args in
-				print ctx "static FibDynamic %s(%s);\n" name dyn_args_str
-			) (List.rev ctx.closures);
-			spr ctx "\n";
-
+			
+			(* Use FiberusSourceWriter to generate forward declarations *)
+			let w = FiberusSourceWriter.create () in
+			FiberusSourceWriter.write_closures_forward_decls w (List.rev ctx.closures);
+			spr ctx (FiberusSourceWriter.contents w);
+			
 			(* Add main content *)
 			spr ctx main_content;
-
-			(* Generate closure implementations *)
-			(* Reset closure counter so nested closures get same numbers as pre-scan *)
-			ctx.closure_counter <- counter_before_prescan;
-			(* Set flag so nested closures don't re-register *)
-			ctx.in_closure_impl <- true;
-			newline ctx;
-			spr ctx "/* Closure implementations */";
-			newline ctx;
-			List.iter (fun (name, f, captured) ->
-				let ret_type = match follow f.tf_type with
-					| TFun _ -> "FibClosure*"
-					| _ -> s_type ctx f.tf_type
-				in
-				let filtered_args = filter_void_args f.tf_args in
-				let args = List.map (fun (v, _) ->
-					s_type_with_name ctx v.v_type (ident v.v_name)
-				) filtered_args in
-				let all_args = "FibClosure* _closure" :: args in
-				let args_str = String.concat ", " all_args in
-				(* Generate the typed implementation function as _closure_N_impl *)
-				let impl_name = name ^ "_impl" in
-				print ctx "static %s %s(%s) {" ret_type impl_name args_str;
-				newline ctx;
-				ctx.tabs <- "\t";
-				(* Cache GC context at closure entry *)
-				spr ctx "FIB_GC_CTX;";
-				newline ctx;
-				(* Add stack frame for Tracy profiling *)
-				if ctx.debug_level > 0 then begin
-					print ctx "FIB_LOCAL_STACK_FRAME(_fib_pos_%s, \"<closure>\", \"%s\", \"<closure>.%s\", \"generated\", 0);" impl_name name name;
-					newline ctx;
-					print ctx "FIB_STACKFRAME(&_fib_pos_%s);" impl_name;
-					newline ctx
-				end;
-				ctx.current_ret_type <- Some f.tf_type;
-				let old_gc_count = ctx.gc_local_count in
-				let old_has_gc_ctx = ctx.has_gc_ctx in
-				ctx.has_gc_ctx <- true;
-				(* Protect GC pointer parameters as temp roots *)
-				let gc_param_count = List.fold_left (fun count (v, _) ->
-					if needs_gc_root ctx v.v_type then begin
-						print ctx "gc_push_temp_root_ctx(FIB_CTX, (void**)&%s);" (ident v.v_name);
-						newline ctx;
-						count + 1
-					end else
-						count
-				) 0 filtered_args in
-				(* Also protect _closure parameter *)
-				spr ctx "gc_push_temp_root_ctx(FIB_CTX, (void**)&_closure);";
-				newline ctx;
-				ctx.gc_local_count <- gc_param_count + 1;
-				if captured = [] then begin
-					spr ctx "(void)_closure;";
-					newline ctx
-				end;
-				List.iteri (fun i v ->
-					(* For TFun types, use FibClosure* since all closures are FibClosure in Fiberus *)
-					let vtype = match follow v.v_type with
-						| TFun _ -> "FibClosure*"
-						| _ -> s_type ctx v.v_type
-					in
-					print ctx "%s %s = " vtype (ident v.v_name);
-					if vtype = "int32_t" then
-						print ctx "_closure->captures[%d].data.intVal;" i
-					else if vtype = "double" then
-						print ctx "_closure->captures[%d].data.floatVal;" i
-					else if vtype = "bool" then
-						print ctx "_closure->captures[%d].data.boolVal;" i
-					else if vtype = "FibString*" then
-						print ctx "_closure->captures[%d].data.stringVal;" i
-					else
-						print ctx "(%s)_closure->captures[%d].data.ptrVal;" vtype i;
-					newline ctx
-				) captured;
-				(match f.tf_expr.eexpr with
-				| TBlock el ->
-					List.iter (fun e ->
-						gen_expr ctx e;
-						spr ctx ";";
-						newline ctx
-					) el
-				| _ ->
-					if ret_type <> "void" then spr ctx "return ";
-					gen_expr ctx f.tf_expr;
-					spr ctx ";";
-					newline ctx);
-				if ctx.gc_local_count > 0 then begin
-					print ctx "gc_pop_temp_roots_ctx(FIB_CTX, %d);" ctx.gc_local_count;
-					newline ctx
-				end;
-				ctx.gc_local_count <- old_gc_count;
-				ctx.has_gc_ctx <- old_has_gc_ctx;
-				ctx.tabs <- "";
-				spr ctx "}";
-				newline ctx;
-				newline ctx;
-				
-				(* Generate the dynamic thunk that takes FibDynamic params and calls the impl *)
-				(* This thunk is what gets stored in the FibClosure and called via fib_closure_call_dynamic *)
-				let num_args = List.length filtered_args in
-				let dyn_args = List.mapi (fun i _ -> Printf.sprintf "FibDynamic _arg%d" i) filtered_args in
-				let all_dyn_args = "FibClosure* _closure" :: dyn_args in
-				let dyn_args_str = String.concat ", " all_dyn_args in
-				let dyn_ret = if ret_type = "void" then "FibDynamic" else "FibDynamic" in
-				print ctx "static %s %s(%s) {" dyn_ret name dyn_args_str;
-				newline ctx;
-				ctx.tabs <- "\t";
-				(* Convert each FibDynamic arg to the typed parameter *)
-				List.iteri (fun i (v, _) ->
-					let vtype = match follow v.v_type with
-						| TFun _ -> "FibClosure*"
-						| _ -> s_type ctx v.v_type
-					in
-					let conv = 
-						if vtype = "int32_t" then Printf.sprintf "fib_dynamic_to_int(_arg%d)" i
-						else if vtype = "double" then Printf.sprintf "fib_dynamic_to_float(_arg%d)" i
-						else if vtype = "bool" then Printf.sprintf "fib_dynamic_to_bool(_arg%d)" i
-						else if vtype = "FibString*" then Printf.sprintf "fib_dynamic_to_string(_arg%d)" i
-						else if vtype = "int64_t" then Printf.sprintf "fib_dynamic_to_int64(_arg%d)" i
-						else if vtype = "FibClosure*" then Printf.sprintf "(FibClosure*)fib_dynamic_to_object(_arg%d)" i
-						else if vtype = "FibDynamic" then Printf.sprintf "_arg%d" i  (* Pass through unchanged *)
-						else Printf.sprintf "(%s)fib_dynamic_to_object(_arg%d)" vtype i
-					in
-					print ctx "%s _typed%d = %s;" vtype i conv;
-					newline ctx
-				) filtered_args;
-				(* Call the impl function *)
-				let typed_call_args = List.mapi (fun i _ -> Printf.sprintf "_typed%d" i) filtered_args in
-				let call_args_str = String.concat ", " ("_closure" :: typed_call_args) in
-				if ret_type = "void" then begin
-					print ctx "%s(%s);" impl_name call_args_str;
-					newline ctx;
-					spr ctx "return fib_dynamic_null();";
-					newline ctx
-				end else begin
-					(* Convert return value to FibDynamic *)
-					let ret_conv = 
-						if ret_type = "int32_t" then Printf.sprintf "fib_dynamic_int(%s(%s))" impl_name call_args_str
-						else if ret_type = "double" then Printf.sprintf "fib_dynamic_float(%s(%s))" impl_name call_args_str
-						else if ret_type = "bool" then Printf.sprintf "fib_dynamic_bool(%s(%s))" impl_name call_args_str
-						else if ret_type = "FibString*" then Printf.sprintf "fib_dynamic_string(%s(%s))" impl_name call_args_str
-						else if ret_type = "int64_t" then Printf.sprintf "fib_dynamic_int64(%s(%s))" impl_name call_args_str
-						else if ret_type = "FibClosure*" then Printf.sprintf "fib_dynamic_object((FibObject*)%s(%s))" impl_name call_args_str
-						else if ret_type = "FibDynamic" then Printf.sprintf "%s(%s)" impl_name call_args_str
-						else Printf.sprintf "fib_dynamic_object((FibObject*)%s(%s))" impl_name call_args_str
-					in
-					print ctx "return %s;" ret_conv;
-					newline ctx
-				end;
-				ctx.tabs <- "";
-				spr ctx "}";
-				newline ctx;
-				newline ctx
-			) (List.rev ctx.closures);
-			ctx.in_closure_impl <- false;
+			
+			(* Use FiberusSourceWriter to generate implementations *)
+			let w2 = FiberusSourceWriter.create () in
+			FiberusSourceWriter.write_closures w2 (List.rev ctx.closures) ~debug_level:ctx.debug_level;
+			spr ctx (FiberusSourceWriter.contents w2);
+			
 			ctx.closures <- []
 		end;
 
@@ -3001,12 +2844,13 @@ let gen_header ctx com =
 	spr ctx "}\n\n";
 	spr ctx "/* Memory allocation - GC-tracked objects (inline fast path) */\n";
 	spr ctx "/* NOTE: For object allocation, prefer gc_alloc_object_with_class() to avoid race conditions */\n";
+	spr ctx "/* Uses ThreadBlockCache via tls_thread_cache (not tls_current_alloc) */\n";
 	spr ctx "static inline void* fib_alloc(size_t size) {\n";
-	spr ctx "\treturn gc_alloc_ctx(tls_current_alloc, size);\n";
+	spr ctx "\treturn fibrix_alloc(size, true);  /* isContainer=true for objects with refs */\n";
 	spr ctx "}\n\n";
-	spr ctx "/* Context-based allocation (preferred - avoids repeated TLS access) */\n";
-	spr ctx "static inline void* fib_alloc_ctx(FibrixLocalAlloc* ctx, size_t size) {\n";
-	spr ctx "\treturn gc_alloc_ctx(ctx, size);\n";
+	spr ctx "/* Atomic allocation - no references to track */\n";
+	spr ctx "static inline void* fib_alloc_atomic(size_t size) {\n";
+	spr ctx "\treturn fibrix_alloc(size, false);  /* isContainer=false for raw data */\n";
 	spr ctx "}\n\n";
 	spr ctx "/* String comparison */\n";
 	spr ctx "static inline bool fib_string_eq(FibString* a, FibString* b) {\n";
@@ -3039,6 +2883,64 @@ let gen_header ctx com =
 	spr ctx "\t\tfield = field->next;\n";
 	spr ctx "\t}\n";
 	spr ctx "\treturn fib_dynamic_null();\n";
+	spr ctx "}\n\n";
+	spr ctx "/* Anonymous object creation helpers (standard C, no GCC extensions) */\n";
+	spr ctx "static inline FibAnonField* _fib_anon_field(const char* name, FibDynamic value, FibAnonField* next) {\n";
+	spr ctx "\tFibAnonField* f = (FibAnonField*)malloc(sizeof(FibAnonField));\n";
+	spr ctx "\tf->name = name; f->value = value; f->next = next;\n";
+	spr ctx "\treturn f;\n";
+	spr ctx "}\n";
+	spr ctx "static inline FibDynamic _fib_anon_wrap(FibAnonField* fields) {\n";
+	spr ctx "\treturn (FibDynamic){ .type = FIB_TYPE_OBJECT, .data.ptrVal = fields };\n";
+	spr ctx "}\n";
+	spr ctx "/* FIB_ANON_NEW - create anonymous object with N fields (standard C) */\n";
+	spr ctx "#define FIB_ANON_NEW_0() _fib_anon_wrap(NULL)\n";
+	spr ctx "#define FIB_ANON_NEW_1(n1, v1) \\\n";
+	spr ctx "\t_fib_anon_wrap(_fib_anon_field(n1, v1, NULL))\n";
+	spr ctx "#define FIB_ANON_NEW_2(n1, v1, n2, v2) \\\n";
+	spr ctx "\t_fib_anon_wrap(_fib_anon_field(n1, v1, _fib_anon_field(n2, v2, NULL)))\n";
+	spr ctx "#define FIB_ANON_NEW_3(n1, v1, n2, v2, n3, v3) \\\n";
+	spr ctx "\t_fib_anon_wrap(_fib_anon_field(n1, v1, _fib_anon_field(n2, v2, _fib_anon_field(n3, v3, NULL))))\n";
+	spr ctx "#define FIB_ANON_NEW_4(n1, v1, n2, v2, n3, v3, n4, v4) \\\n";
+	spr ctx "\t_fib_anon_wrap(_fib_anon_field(n1, v1, _fib_anon_field(n2, v2, _fib_anon_field(n3, v3, _fib_anon_field(n4, v4, NULL)))))\n";
+	spr ctx "#define FIB_ANON_NEW_5(n1, v1, n2, v2, n3, v3, n4, v4, n5, v5) \\\n";
+	spr ctx "\t_fib_anon_wrap(_fib_anon_field(n1, v1, _fib_anon_field(n2, v2, _fib_anon_field(n3, v3, _fib_anon_field(n4, v4, _fib_anon_field(n5, v5, NULL))))))\n";
+	spr ctx "#define FIB_ANON_NEW_6(n1, v1, n2, v2, n3, v3, n4, v4, n5, v5, n6, v6) \\\n";
+	spr ctx "\t_fib_anon_wrap(_fib_anon_field(n1, v1, _fib_anon_field(n2, v2, _fib_anon_field(n3, v3, _fib_anon_field(n4, v4, _fib_anon_field(n5, v5, _fib_anon_field(n6, v6, NULL)))))))\n";
+	spr ctx "/* Note: FIB_ANON_NEW_N macros are called directly with the field count */\n\n";
+	spr ctx "/* FIB_STACK_ALLOC - zero-initialized stack allocation (standard C) */\n";
+	spr ctx "/* Usage: type* ptr = FIB_STACK_ALLOC(type, varname); */\n";
+	spr ctx "/* Note: This expands to a comma expression that declares + returns ptr */\n";
+	spr ctx "#define FIB_STACK_ALLOC(type, name) \\\n";
+	spr ctx "\t((type*)memset(&(type){0}, 0, sizeof(type)))\n\n";
+	spr ctx "/* Dynamic closure call helpers (standard C, no GCC extensions) */\n";
+	spr ctx "/* These functions wrap fib_closure_call_dynamic with fixed argument counts */\n";
+	spr ctx "static inline FibDynamic _fib_dyn_call_0(FibDynamic c) {\n";
+	spr ctx "\treturn fib_closure_call_dynamic((FibClosure*)fib_dynamic_to_object(c), NULL, 0);\n";
+	spr ctx "}\n";
+	spr ctx "static inline FibDynamic _fib_dyn_call_1(FibDynamic c, FibDynamic a0) {\n";
+	spr ctx "\tFibDynamic args[1] = {a0};\n";
+	spr ctx "\treturn fib_closure_call_dynamic((FibClosure*)fib_dynamic_to_object(c), args, 1);\n";
+	spr ctx "}\n";
+	spr ctx "static inline FibDynamic _fib_dyn_call_2(FibDynamic c, FibDynamic a0, FibDynamic a1) {\n";
+	spr ctx "\tFibDynamic args[2] = {a0, a1};\n";
+	spr ctx "\treturn fib_closure_call_dynamic((FibClosure*)fib_dynamic_to_object(c), args, 2);\n";
+	spr ctx "}\n";
+	spr ctx "static inline FibDynamic _fib_dyn_call_3(FibDynamic c, FibDynamic a0, FibDynamic a1, FibDynamic a2) {\n";
+	spr ctx "\tFibDynamic args[3] = {a0, a1, a2};\n";
+	spr ctx "\treturn fib_closure_call_dynamic((FibClosure*)fib_dynamic_to_object(c), args, 3);\n";
+	spr ctx "}\n";
+	spr ctx "static inline FibDynamic _fib_dyn_call_4(FibDynamic c, FibDynamic a0, FibDynamic a1, FibDynamic a2, FibDynamic a3) {\n";
+	spr ctx "\tFibDynamic args[4] = {a0, a1, a2, a3};\n";
+	spr ctx "\treturn fib_closure_call_dynamic((FibClosure*)fib_dynamic_to_object(c), args, 4);\n";
+	spr ctx "}\n";
+	spr ctx "static inline FibDynamic _fib_dyn_call_5(FibDynamic c, FibDynamic a0, FibDynamic a1, FibDynamic a2, FibDynamic a3, FibDynamic a4) {\n";
+	spr ctx "\tFibDynamic args[5] = {a0, a1, a2, a3, a4};\n";
+	spr ctx "\treturn fib_closure_call_dynamic((FibClosure*)fib_dynamic_to_object(c), args, 5);\n";
+	spr ctx "}\n";
+	spr ctx "static inline FibDynamic _fib_dyn_call_6(FibDynamic c, FibDynamic a0, FibDynamic a1, FibDynamic a2, FibDynamic a3, FibDynamic a4, FibDynamic a5) {\n";
+	spr ctx "\tFibDynamic args[6] = {a0, a1, a2, a3, a4, a5};\n";
+	spr ctx "\treturn fib_closure_call_dynamic((FibClosure*)fib_dynamic_to_object(c), args, 6);\n";
 	spr ctx "}\n\n";
 	spr ctx "/* Fiber API bridge - maps Haxe Fiber class to runtime functions */\n";
 	spr ctx "#define Fiber_yield() scheduler_yield()\n";
@@ -3592,8 +3494,8 @@ let generate com =
 		closure_counter = 0;
 		closures = [];
 		in_closure_impl = false;
-		closure_fwd_decls = Buffer.create 256;
 		in_fiber_spawn = false;
+		spawn_counter = 0;
 		gc_local_count = 0;
 		loop_depth = 0;
 		has_gc_ctx = false;

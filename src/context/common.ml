@@ -995,6 +995,9 @@ let init_platform com =
 		raw_define com "java"
 	| Hl ->
 		if Path.file_extension com.file = "c" then define com Define.Hlc;
+	| Fiberus ->
+		(* Enable analyzer optimization by default for expression flattening *)
+		define com Define.AnalyzerOptimize;
 	| _ ->
 		()
 	end;

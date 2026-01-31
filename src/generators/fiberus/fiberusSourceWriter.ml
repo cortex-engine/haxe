@@ -276,14 +276,15 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
       ) args;
       write w "))"
   | TCEDynamicCall { closure; args } ->
-      write w "({ FibClosure* _dc = ";
+      (* Use helper functions instead of GCC statement expressions *)
+      let n = List.length args in
+      writef w "_fib_dyn_call_%d(" n;
       write_expr w closure;
-      writef w "; FibDynamic _args[%d] = {" (List.length args);
-      List.iteri (fun i arg ->
-        if i > 0 then write w ", ";
+      List.iter (fun arg ->
+        write w ", ";
         write_expr w arg
       ) args;
-      writef w "}; fib_closure_call_dynamic(_dc, _args, %d); })" (List.length args)
+      write w ")"
   
   (* Memory *)
   | TCEAlloc (cls, size_opt) ->
@@ -297,8 +298,11 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
   | TCEAllocCtx cls ->
       writef w "gc_alloc_ctx(FIB_CTX, \"%s\", sizeof(%s))" cls cls
   | TCEStackAlloc (name, typ) ->
-      writef w "({ %s %s; memset(&%s, 0, sizeof(%s)); &%s; })"
-        (tc_type_to_string typ) name name name name
+      (* Stack allocation should be lifted to statement level via pending_stmts.
+       * This macro provides a fallback.
+       * Macro: FIB_STACK_ALLOC(type, name) returns pointer to zeroed stack var *)
+      writef w "FIB_STACK_ALLOC(%s, %s)"
+        (tc_type_to_string typ) name
   
   (* Arrays *)
   | TCEArrayGet { arr; idx; arr_kind; elem_type = _ } ->
@@ -413,14 +417,23 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
       write_expr w e;
       writef w ", &%s_class)" cls
   | TCEAnonObject fields ->
-      (* ({ FibDynamic _anon = fib_anon_new(); fib_anon_set(&_anon, "name", value); ... _anon; }) *)
-      write w "({ FibDynamic _anon = fib_anon_new(); ";
-      List.iter (fun (name, value) ->
-        writef w "fib_anon_set(&_anon, \"%s\", " name;
-        write_expr w value;
-        write w "); "
-      ) fields;
-      write w "_anon; })"
+      (* Use numbered helper macro to create anonymous object.
+       * This avoids GCC statement expressions.
+       * Macro: FIB_ANON_NEW_N("name1", val1, "name2", val2, ...) *)
+      let n = List.length fields in
+      if n = 0 then
+        write w "FIB_ANON_NEW_0()"
+      else begin
+        writef w "FIB_ANON_NEW_%d(" n;
+        let first = ref true in
+        List.iter (fun (name, value) ->
+          if not !first then write w ", ";
+          first := false;
+          writef w "\"%s\", " name;
+          write_expr w value
+        ) fields;
+        write w ")"
+      end
   
   (* String operations *)
   | TCEStringConcat (lhs, rhs) ->
@@ -440,18 +453,73 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
       write_expr w str;
       write w ")"
   
-  (* Compound expressions *)
+  (* Compound expressions - TCEBlock should now be rare; we use pending_stmts instead.
+   * If we still encounter a block, emit it as standard C (not GCC extension).
+   * This can only work if the block is in statement context. *)
   | TCEBlock (stmts, result) ->
-      write w "({";
-      newline w;
-      indent w;
-      List.iter (fun s -> write_stmt w s) stmts;
+      (* DEPRECATED: TCEBlock as expression should be avoided.
+       * The new model uses pending_stmts on expressions instead.
+       * This is here for backwards compatibility only. *)
       (match result with
-      | Some e -> write_expr w e; write w ";"
-      | None -> ());
-      newline w;
-      dedent w;
-      write w "})"
+      | Some e when stmts = [] ->
+          (* Just the result expression *)
+          write_expr w e
+      | Some e ->
+          (* Block with result - emit as comma expression if simple, else error *)
+          write w "(";
+          List.iter (fun s ->
+            (* Can only handle TCSExpr as comma operands *)
+            match s with
+            | TCSExpr stmt_e -> 
+                write_expr w stmt_e;
+                write w ", "
+            | _ -> 
+                (* Complex statement in expression block - emit placeholder *)
+                write w "/* complex stmt in block expr */ 0, "
+          ) stmts;
+          write_expr w e;
+          write w ")"
+      | None ->
+          (* Block without result - shouldn't be in expression context *)
+          write w "/* void block in expr context */ ((void)0)")
+  
+  (* Closure creation - emitted as a simple call when no captures, 
+   * or with comma operator for captures (avoiding GCC statement expressions).
+   * Complex closures should be lifted to statement level via pending_stmts. *)
+  | TCEClosureCreate cc ->
+      if cc.cc_captures = [] then begin
+        (* No captures - simple call *)
+        if cc.cc_for_fiber then
+          write w "fib_closure_create_for_fiber"
+        else
+          write w "fib_closure_create";
+        writef w "((void*)%s, (void*)%s, 0, %d)" 
+          cc.cc_impl_name cc.cc_name cc.cc_arg_count
+      end else begin
+        (* With captures - this should ideally be in pending_stmts.
+         * For now, emit a helper macro call that handles the creation.
+         * The macro is: FIB_CLOSURE_CREATE(impl, thunk, n_caps, n_args, cap0, cap1, ...) *)
+        if cc.cc_for_fiber then
+          write w "FIB_CLOSURE_CREATE_FOR_FIBER("
+        else
+          write w "FIB_CLOSURE_CREATE(";
+        writef w "(void*)%s, (void*)%s, %d, %d" 
+          cc.cc_impl_name cc.cc_name (List.length cc.cc_captures) cc.cc_arg_count;
+        (* Emit capture values *)
+        List.iter (fun (var_name, var_type) ->
+          write w ", ";
+          (* Box the captured value appropriately *)
+          match var_type with
+          | TCInt32 -> writef w "fib_dynamic_int(%s)" var_name
+          | TCInt64 -> writef w "fib_dynamic_int64(%s)" var_name
+          | TCFloat64 -> writef w "fib_dynamic_float(%s)" var_name
+          | TCBool -> writef w "fib_dynamic_bool(%s)" var_name
+          | TCFibString -> writef w "fib_dynamic_string(%s)" var_name
+          | _ -> writef w "(FibDynamic){.type=FIB_TYPE_OBJECT, .data.ptrVal=%s}" var_name
+        ) cc.cc_captures;
+        write w ")"
+      end
+  
   | TCERaw s ->
       write w s
 
@@ -466,13 +534,24 @@ and write_call_target (w : writer) (target : tc_call_target) : unit =
  * Statement Emission
  * ============================================================================ *)
 
+(* Emit any pending statements from an expression.
+ * This handles the lifting of sub-expressions to statement level. *)
+and emit_pending_stmts (w : writer) (e : tc_expr) : unit =
+  List.iter (write_stmt w) e.pending_stmts
+
 and write_stmt (w : writer) (s : tc_stmt) : unit =
   match s with
   | TCSExpr e ->
+      (* Emit pending statements first (lifted from sub-expressions) *)
+      emit_pending_stmts w e;
       write_expr w e;
       write w ";";
       newline w
   | TCSVar vd ->
+      (* Emit pending statements from initializer first *)
+      (match vd.vd_init with
+      | Some init_e -> emit_pending_stmts w init_e
+      | None -> ());
       write_var_decl w vd;
       write w ";";
       newline w
@@ -487,6 +566,8 @@ and write_stmt (w : writer) (s : tc_stmt) : unit =
   
   (* Control flow *)
   | TCSIf (cond, then_stmts, else_stmts) ->
+      (* Emit pending statements from condition first *)
+      emit_pending_stmts w cond;
       write w "if (";
       write_expr w cond;
       write w ") ";
@@ -507,11 +588,15 @@ and write_stmt (w : writer) (s : tc_stmt) : unit =
         with_block w (fun () ->
           List.iter (write_stmt w) body
         );
+        (* Emit pending statements from condition - rare but possible *)
+        emit_pending_stmts w cond;
         write w " while (";
         write_expr w cond;
         write w ");";
         newline w
       end else begin
+        (* Emit pending statements from condition - rare but possible *)
+        emit_pending_stmts w cond;
         write w "while (";
         write_expr w cond;
         write w ") ";
@@ -536,6 +621,8 @@ and write_stmt (w : writer) (s : tc_stmt) : unit =
       );
       newline w
   | TCSSwitch sw ->
+      (* Emit pending statements from switch expression *)
+      emit_pending_stmts w sw.sw_expr;
       write w "switch (";
       write_expr w sw.sw_expr;
       write w ") ";
@@ -564,6 +651,8 @@ and write_stmt (w : writer) (s : tc_stmt) : unit =
       );
       newline w
   | TCSReturn (Some e) ->
+      (* Emit pending statements first (lifted from sub-expressions) *)
+      emit_pending_stmts w e;
       write w "return ";
       write_expr w e;
       write w ";";
@@ -603,6 +692,8 @@ and write_stmt (w : writer) (s : tc_stmt) : unit =
       write w " FIB_END_TRY";
       newline w
   | TCSThrow e ->
+      (* Emit pending statements from thrown expression *)
+      emit_pending_stmts w e;
       (* Exception throw: begin unwinding, then throw boxed FibDynamic *)
       write w "fib_exception_begin(); fib_throw(";
       write_expr w e;
@@ -628,13 +719,14 @@ and write_stmt (w : writer) (s : tc_stmt) : unit =
       newline w
   | TCSGCRootCheck expected ->
       (* Debug assertion for GC root count verification.
-       * Only emitted under FIBERUS_DEBUG to catch push/pop imbalances. *)
+       * Only emitted under FIBERUS_DEBUG to catch push/pop imbalances.
+       * Note: _fib_gc_ctx is FiberGCContext*, uses tempRootCount (not mTempRootCount) *)
       write w "#ifdef FIBERUS_DEBUG";
       newline w;
-      writef w "if (_fib_ctx && _fib_ctx->mTempRootCount != _gc_base_count + %d) {" expected;
+      writef w "if (_fib_gc_ctx && _fib_gc_ctx->tempRootCount != _gc_base_count + %d) {" expected;
       newline w;
       write w "  fprintf(stderr, \"[GC ROOT MISMATCH] expected %%zu got %%zu\\n\", ";
-      writef w "(size_t)(_gc_base_count + %d), (size_t)_fib_ctx->mTempRootCount);" expected;
+      writef w "(size_t)(_gc_base_count + %d), (size_t)_fib_gc_ctx->tempRootCount);" expected;
       newline w;
       write w "  __builtin_trap();";
       newline w;
@@ -791,6 +883,194 @@ let write_decl (w : writer) (d : tc_decl) : unit =
   | TCDRaw s ->
       write w s;
       newline w
+
+(* ============================================================================
+ * Closure Implementation Generation
+ * ============================================================================ *)
+
+(* Helper: get C string for extracting capture from FibDynamic based on type *)
+let capture_extract_expr (cap : tc_capture) : string =
+  let idx = cap.cap_index in
+  match cap.cap_type with
+  | TCInt32 -> Printf.sprintf "_closure->captures[%d].data.intVal" idx
+  | TCInt64 -> Printf.sprintf "_closure->captures[%d].data.int64Val" idx
+  | TCFloat64 -> Printf.sprintf "_closure->captures[%d].data.floatVal" idx
+  | TCBool -> Printf.sprintf "_closure->captures[%d].data.boolVal" idx
+  | TCFibString -> Printf.sprintf "_closure->captures[%d].data.stringVal" idx
+  | TCFibClosure -> Printf.sprintf "(FibClosure*)_closure->captures[%d].data.ptrVal" idx
+  | t -> Printf.sprintf "(%s)_closure->captures[%d].data.ptrVal" (tc_type_to_string t) idx
+
+(* Helper: get C expression for boxing value to FibDynamic based on type *)
+let box_to_dynamic (var_name : string) (t : tc_type) : string =
+  match t with
+  | TCInt32 -> Printf.sprintf "fib_dynamic_int(%s)" var_name
+  | TCInt64 -> Printf.sprintf "fib_dynamic_int64(%s)" var_name
+  | TCFloat64 -> Printf.sprintf "fib_dynamic_float(%s)" var_name
+  | TCBool -> Printf.sprintf "fib_dynamic_bool(%s)" var_name
+  | TCFibString -> Printf.sprintf "fib_dynamic_string(%s)" var_name
+  | TCVoid -> "fib_dynamic_null()"
+  | _ -> Printf.sprintf "(FibDynamic){.type=FIB_TYPE_OBJECT, .data.ptrVal=%s}" var_name
+
+(* Helper: get C expression for unboxing FibDynamic to typed value *)
+let unbox_from_dynamic (arg_name : string) (t : tc_type) : string =
+  match t with
+  | TCInt32 -> Printf.sprintf "fib_dynamic_to_int(%s)" arg_name
+  | TCInt64 -> Printf.sprintf "fib_dynamic_to_int64(%s)" arg_name
+  | TCFloat64 -> Printf.sprintf "fib_dynamic_to_float(%s)" arg_name
+  | TCBool -> Printf.sprintf "fib_dynamic_to_bool(%s)" arg_name
+  | TCFibString -> Printf.sprintf "fib_dynamic_to_string(%s)" arg_name
+  | TCFibClosure -> Printf.sprintf "(FibClosure*)fib_dynamic_to_object(%s)" arg_name
+  | TCFibDynamic -> arg_name  (* Pass through unchanged *)
+  | t -> Printf.sprintf "(%s)fib_dynamic_to_object(%s)" (tc_type_to_string t) arg_name
+
+(* Generate forward declarations for a closure *)
+let write_closure_forward_decls (w : writer) (cl : tc_closure) : unit =
+  (* Forward declaration for typed impl function *)
+  write w "static ";
+  write_type w cl.cl_ret;
+  writef w " %s(FibClosure* _closure" cl.cl_impl_name;
+  List.iter (fun arg ->
+    write w ", ";
+    write_type_with_name w arg.fa_type arg.fa_name
+  ) cl.cl_args;
+  write w ");";
+  newline w;
+  
+  (* Forward declaration for dynamic thunk *)
+  writef w "static FibDynamic %s(FibClosure* _closure" cl.cl_name;
+  List.iteri (fun i _ ->
+    writef w ", FibDynamic _arg%d" i
+  ) cl.cl_args;
+  write w ");";
+  newline w
+
+(* Generate the typed implementation function for a closure *)
+let write_closure_impl (w : writer) (cl : tc_closure) ~(debug_level : int) : unit =
+  (* Function signature *)
+  write w "static ";
+  write_type w cl.cl_ret;
+  writef w " %s(FibClosure* _closure" cl.cl_impl_name;
+  List.iter (fun arg ->
+    write w ", ";
+    write_type_with_name w arg.fa_type arg.fa_name
+  ) cl.cl_args;
+  write w ") {";
+  newline w;
+  indent w;
+  
+  (* GC context *)
+  write w "FIB_GC_CTX;";
+  newline w;
+  
+  (* Debug stack frame *)
+  if debug_level > 0 then begin
+    writef w "FIB_LOCAL_STACK_FRAME(_fib_pos_%s, \"<closure>\", \"%s\", \"<closure>.%s\", \"generated\", 0);"
+      cl.cl_impl_name cl.cl_name cl.cl_name;
+    newline w;
+    writef w "FIB_STACKFRAME(&_fib_pos_%s);" cl.cl_impl_name;
+    newline w
+  end;
+  
+  (* GC root the _closure parameter *)
+  write w "gc_push_temp_root_ctx(FIB_CTX, (void**)&_closure);";
+  newline w;
+  let gc_count = ref 1 in
+  
+  (* GC root other GC-typed parameters *)
+  List.iter (fun arg ->
+    if needs_gc_root arg.fa_type then begin
+      writef w "gc_push_temp_root_ctx(FIB_CTX, (void**)&%s);" arg.fa_name;
+      newline w;
+      incr gc_count
+    end
+  ) cl.cl_args;
+  
+  (* Suppress unused _closure warning if no captures *)
+  if cl.cl_captures = [] then begin
+    write w "(void)_closure;";
+    newline w
+  end;
+  
+  (* Extract captured variables *)
+  List.iter (fun cap ->
+    write_type w cap.cap_type;
+    writef w " %s = %s;" cap.cap_var (capture_extract_expr cap);
+    newline w
+  ) cl.cl_captures;
+  
+  (* Body statements *)
+  List.iter (write_stmt w) cl.cl_body;
+  
+  (* GC cleanup *)
+  if !gc_count > 0 then begin
+    writef w "gc_pop_temp_roots_ctx(FIB_CTX, %d);" !gc_count;
+    newline w
+  end;
+  
+  dedent w;
+  write w "}";
+  newline w;
+  newline w
+
+(* Generate the dynamic thunk for a closure *)
+let write_closure_thunk (w : writer) (cl : tc_closure) : unit =
+  (* Function signature *)
+  writef w "static FibDynamic %s(FibClosure* _closure" cl.cl_name;
+  List.iteri (fun i _ ->
+    writef w ", FibDynamic _arg%d" i
+  ) cl.cl_args;
+  write w ") {";
+  newline w;
+  indent w;
+  
+  (* Convert FibDynamic args to typed *)
+  List.iteri (fun i arg ->
+    write_type w arg.fa_type;
+    writef w " _typed%d = %s;" i (unbox_from_dynamic (Printf.sprintf "_arg%d" i) arg.fa_type);
+    newline w
+  ) cl.cl_args;
+  
+  (* Call the impl function *)
+  let call_args = String.concat ", " (
+    "_closure" :: List.mapi (fun i _ -> Printf.sprintf "_typed%d" i) cl.cl_args
+  ) in
+  
+  if cl.cl_ret = TCVoid then begin
+    writef w "%s(%s);" cl.cl_impl_name call_args;
+    newline w;
+    write w "return fib_dynamic_null();";
+    newline w
+  end else begin
+    writef w "return %s;" (box_to_dynamic (Printf.sprintf "%s(%s)" cl.cl_impl_name call_args) cl.cl_ret);
+    newline w
+  end;
+  
+  dedent w;
+  write w "}";
+  newline w;
+  newline w
+
+(* Generate all code for a closure (forward decls + impl + thunk) *)
+let write_closure (w : writer) (cl : tc_closure) ~(debug_level : int) : unit =
+  write_closure_impl w cl ~debug_level;
+  write_closure_thunk w cl
+
+(* Generate forward declarations for multiple closures *)
+let write_closures_forward_decls (w : writer) (closures : tc_closure list) : unit =
+  if closures <> [] then begin
+    write w "/* Closure forward declarations */";
+    newline w;
+    List.iter (write_closure_forward_decls w) closures;
+    newline w
+  end
+
+(* Generate implementations for multiple closures *)
+let write_closures (w : writer) (closures : tc_closure list) ~(debug_level : int) : unit =
+  if closures <> [] then begin
+    write w "/* Closure implementations */";
+    newline w;
+    List.iter (fun cl -> write_closure w cl ~debug_level) closures
+  end
 
 (* ============================================================================
  * Compilation Unit Emission

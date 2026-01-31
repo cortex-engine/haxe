@@ -114,7 +114,7 @@ let target_handles_assign_ops com e2 = match com.platform with
 
 let target_handles_side_effect_order com = match com.platform with
 	| Cpp -> Define.defined com.defines Define.Cppia
-	| Php -> false
+	| Php | Fiberus -> false
 	| _ -> true
 
 let can_be_used_as_value com e =
