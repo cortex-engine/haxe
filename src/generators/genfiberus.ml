@@ -1974,7 +1974,25 @@ let gen_function ctx name f c is_static =
 	(* Cache GC context at function entry - avoids TLS reads in hot path *)
 	spr ctx "FIB_GC_CTX;";
 	newline ctx;
-	(* Inject GC safe point at function entry - stack is clean here *)
+	(* Protect GC pointer parameters as temp roots BEFORE any safe point.
+	   This is CRITICAL: if GC runs at the safe point below, parameters
+	   must already be protected so they get updated during evacuation.
+	   The caller protects their local variables, but parameters are copies. *)
+	let gc_param_count = List.fold_left (fun count (v, _) ->
+		if needs_gc_root ctx v.v_type then begin
+			print ctx "gc_push_temp_root_ctx(FIB_CTX, (void**)&%s);" (ident v.v_name);
+			newline ctx;
+			count + 1
+		end else
+			count
+	) 0 filtered_args in
+	(* Also protect 'this' for non-static methods *)
+	let gc_param_count = if not is_static then begin
+		spr ctx "gc_push_temp_root_ctx(FIB_CTX, (void**)&this);";
+		newline ctx;
+		gc_param_count + 1
+	end else gc_param_count in
+	(* NOW inject GC safe point - parameters are protected *)
 	spr ctx "GC_SAFE_POINT();";
 	newline ctx;
 	(* Debug: save base root count for verification at return *)
@@ -1988,7 +2006,8 @@ let gen_function ctx name f c is_static =
 	let old_gc_count = ctx.gc_local_count in
 	let old_has_gc_ctx = ctx.has_gc_ctx in
 	let old_stack_alloc_vars = ctx.stack_alloc_vars in
-	ctx.gc_local_count <- 0;
+	(* Start with parameter count - these were pushed above *)
+	ctx.gc_local_count <- gc_param_count;
 	ctx.has_gc_ctx <- true;
 	(* Run escape analysis to find stack-allocatable variables *)
 	ctx.stack_alloc_vars <- analyze_escapes f;
@@ -2116,16 +2135,30 @@ let gen_constructor ctx c =
 				let old_gc_count = ctx.gc_local_count in
 				let old_has_gc_ctx = ctx.has_gc_ctx in
 				let old_stack_alloc_vars = ctx.stack_alloc_vars in
-				ctx.gc_local_count <- 0;
 				(* Run escape analysis for constructor body *)
 				ctx.stack_alloc_vars <- analyze_escapes f;
 				(* Only emit FIB_GC_CTX if constructor body needs it *)
 				if init_needs_gc_ctx then begin
 					spr ctx "FIB_GC_CTX;";
 					newline ctx;
-					ctx.has_gc_ctx <- true
-				end else
+					ctx.has_gc_ctx <- true;
+					(* Protect GC pointer parameters as temp roots *)
+					let gc_param_count = List.fold_left (fun count (v, _) ->
+						if needs_gc_root ctx v.v_type then begin
+							print ctx "gc_push_temp_root_ctx(FIB_CTX, (void**)&%s);" (ident v.v_name);
+							newline ctx;
+							count + 1
+						end else
+							count
+					) 0 filtered_args in
+					(* Also protect 'this' *)
+					spr ctx "gc_push_temp_root_ctx(FIB_CTX, (void**)&this);";
+					newline ctx;
+					ctx.gc_local_count <- gc_param_count + 1
+				end else begin
 					ctx.has_gc_ctx <- false;
+					ctx.gc_local_count <- 0
+				end;
 				(* Generate constructor body *)
 				ctx.current_ret_type <- None;  (* Constructors don't return values *)
 				(match f.tf_expr.eexpr with
@@ -2157,6 +2190,20 @@ let gen_constructor ctx c =
 				spr ctx " {";
 				newline ctx;
 				ctx.tabs <- "\t";
+				(* CRITICAL: Protect GC pointer parameters BEFORE allocation.
+				   gc_alloc_object_with_class can trigger GC, which would evacuate
+				   any nursery objects. Parameters are copies on the stack, so if
+				   they're not protected, they become stale after evacuation. *)
+				let gc_param_args = List.filter (fun (v, _) -> needs_gc_root ctx v.v_type) filtered_args in
+				let has_gc_params = gc_param_args <> [] in
+				if has_gc_params then begin
+					spr ctx "FIB_GC_CTX;";
+					newline ctx;
+					List.iter (fun (v, _) ->
+						print ctx "gc_push_temp_root_ctx(FIB_CTX, (void**)&%s);" (ident v.v_name);
+						newline ctx
+					) gc_param_args
+				end;
 				(* Use gc_alloc_object_with_class - sets clazz atomically before allocStart *)
 				print ctx "%s* this = gc_alloc_object_with_class(sizeof(%s), &%s_class);" class_name class_name class_name;
 				newline ctx;
@@ -2165,6 +2212,11 @@ let gen_constructor ctx c =
 				print ctx "%s_init(this%s);" class_name
 					(if arg_names = [] then "" else ", " ^ String.concat ", " arg_names);
 				newline ctx;
+				(* Pop GC roots before return *)
+				if has_gc_params then begin
+					print ctx "gc_pop_temp_roots_ctx(FIB_CTX, %d);" (List.length gc_param_args);
+					newline ctx
+				end;
 				spr ctx "return this;";
 				newline ctx;
 				ctx.tabs <- "";
@@ -2700,8 +2752,20 @@ let gen_class_impl ctx c =
 				ctx.current_ret_type <- Some f.tf_type;
 				let old_gc_count = ctx.gc_local_count in
 				let old_has_gc_ctx = ctx.has_gc_ctx in
-				ctx.gc_local_count <- 0;
 				ctx.has_gc_ctx <- true;
+				(* Protect GC pointer parameters as temp roots *)
+				let gc_param_count = List.fold_left (fun count (v, _) ->
+					if needs_gc_root ctx v.v_type then begin
+						print ctx "gc_push_temp_root_ctx(FIB_CTX, (void**)&%s);" (ident v.v_name);
+						newline ctx;
+						count + 1
+					end else
+						count
+				) 0 filtered_args in
+				(* Also protect _closure parameter *)
+				spr ctx "gc_push_temp_root_ctx(FIB_CTX, (void**)&_closure);";
+				newline ctx;
+				ctx.gc_local_count <- gc_param_count + 1;
 				if captured = [] then begin
 					spr ctx "(void)_closure;";
 					newline ctx
@@ -3644,30 +3708,36 @@ let generate com =
 
 	spr ctx "int main(int argc, char** argv) {\n";
 	spr ctx "\t(void)argc; (void)argv;\n";
-	spr ctx "\tvolatile int _gc_stack_base_marker;\n";
-	spr ctx "\tgc_set_stack_base((void*)&_gc_stack_base_marker);\n";
-	spr ctx "\tscheduler_init();\n";
+	spr ctx "\tvolatile int _gc_stack_base_marker;\n\n";
+	spr ctx "\t/* 1. Initialize GC (data structures only, no allocation yet) */\n";
+	spr ctx "\tgc_init();\n\n";
+	spr ctx "\t/* 2. Initialize scheduler (creates ThreadBlockCache + FiberGCContext for main)\n";
+	spr ctx "\t *    Main thread becomes fiber 0 with proper context */\n";
+	spr ctx "\tscheduler_init((void*)&_gc_stack_base_marker);\n\n";
+	spr ctx "\t/* 3. Register permanent GC roots (static fields) */\n";
 	spr ctx "\tfiberus_register_gc_roots();\n\n";
-	(* Call boot functions to initialize static fields - must happen before main fiber *)
+	(* Call boot functions to initialize static fields - must happen after scheduler_init *)
 	if boot_classes <> [] then begin
-		spr ctx "\t/* Static field initialization (before main fiber) */\n";
+		spr ctx "\t/* 4. Boot all classes (static field initialization)\n";
+		spr ctx "\t *    Now safe to allocate - we have ThreadBlockCache and FiberGCContext */\n";
 		List.iter (fun class_name ->
 			print ctx "\t%s___boot();\n" class_name
 		) boot_classes;
 		spr ctx "\n"
 	end;
 	(* Spawn main as a fiber on thread 0 (main thread's queue) *)
-	spr ctx "\t/* Spawn main code as fiber on thread 0 (main thread's queue) */\n";
+	spr ctx "\t/* 5. Spawn main code as fiber on thread 0 (main thread's queue) */\n";
 	spr ctx "\tscheduler_spawn(_fiberus_main_entry, NULL);\n\n";
 	(* Tracy zone wraps scheduler_run which includes main fiber execution *)
 	spr ctx "#ifdef FIBERUS_TRACY\n";
 	spr ctx "\tTracyCZoneN(_main_zone, \"main\", 1);\n";
 	spr ctx "#endif\n\n";
-	spr ctx "\t/* Run fibers until all complete (main thread participates in work-stealing) */\n";
+	spr ctx "\t/* 6. Run fibers until all complete (main thread participates in work-stealing) */\n";
 	spr ctx "\tscheduler_run();\n\n";
 	spr ctx "#ifdef FIBERUS_TRACY\n";
 	spr ctx "\tTracyCZoneEnd(_main_zone);\n";
-	spr ctx "#endif\n";
+	spr ctx "#endif\n\n";
+	spr ctx "\t/* 7. Cleanup */\n";
 	spr ctx "\tscheduler_shutdown();\n";
 	spr ctx "\tgc_shutdown();\n";
 	spr ctx "\treturn 0;\n";
