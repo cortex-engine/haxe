@@ -998,11 +998,137 @@ let write_closure_impl (w : writer) (cl : tc_closure) ~(debug_level : int) : uni
     newline w
   ) cl.cl_captures;
   
-  (* Body statements *)
-  List.iter (write_stmt w) cl.cl_body;
+  (* Helper to write statements, transforming returns to include gc_pop.
+   * This fixes the bug where gc_pop was placed after return statements. *)
+  let rec write_stmt_with_gc_cleanup stmt =
+    match stmt with
+    | TCSReturn (Some e) when !gc_count > 0 ->
+        (* For non-void returns: evaluate to temp, pop roots, return temp *)
+        emit_pending_stmts w e;
+        write w "{ ";
+        write_type w cl.cl_ret;
+        write w " _ret = ";
+        write_expr w e;
+        writef w "; gc_pop_temp_roots_ctx(FIB_CTX, %d); return _ret; }" !gc_count;
+        newline w
+    | TCSReturn None when !gc_count > 0 ->
+        (* For void returns: pop roots, then return *)
+        writef w "gc_pop_temp_roots_ctx(FIB_CTX, %d); return;" !gc_count;
+        newline w
+    | TCSReturn _ ->
+        (* No GC roots to pop, emit normally *)
+        write_stmt w stmt
+    | TCSBlock stmts ->
+        (* Recurse into blocks to find nested returns *)
+        write w "{";
+        newline w;
+        indent w;
+        List.iter write_stmt_with_gc_cleanup stmts;
+        dedent w;
+        write w "}";
+        newline w
+    | TCSIf (cond, then_stmts, else_opt) ->
+        (* Recurse into if branches *)
+        emit_pending_stmts w cond;
+        write w "if (";
+        write_expr w cond;
+        write w ") {";
+        newline w;
+        indent w;
+        List.iter write_stmt_with_gc_cleanup then_stmts;
+        dedent w;
+        write w "}";
+        (match else_opt with
+        | Some else_stmts ->
+            write w " else {";
+            newline w;
+            indent w;
+            List.iter write_stmt_with_gc_cleanup else_stmts;
+            dedent w;
+            write w "}"
+        | None -> ());
+        newline w
+    | TCSWhile (cond, body, is_do_while) ->
+        (* Recurse into while loops *)
+        if is_do_while then begin
+          write w "do {";
+          newline w;
+          indent w;
+          List.iter write_stmt_with_gc_cleanup body;
+          dedent w;
+          write w "} while (";
+          write_expr w cond;
+          write w ");";
+          newline w
+        end else begin
+          write w "while (";
+          write_expr w cond;
+          write w ") {";
+          newline w;
+          indent w;
+          List.iter write_stmt_with_gc_cleanup body;
+          dedent w;
+          write w "}";
+          newline w
+        end
+    | TCSSwitch sw ->
+        (* Recurse into switch cases *)
+        write w "switch (";
+        write_expr w sw.sw_expr;
+        write w ") {";
+        newline w;
+        List.iter (fun (values, stmts) ->
+          List.iter (fun v ->
+            write w "case ";
+            write_expr w v;
+            write w ":";
+            newline w
+          ) values;
+          indent w;
+          List.iter write_stmt_with_gc_cleanup stmts;
+          write w "break;";
+          newline w;
+          dedent w
+        ) sw.sw_cases;
+        (match sw.sw_default with
+        | Some stmts ->
+            write w "default:";
+            newline w;
+            indent w;
+            List.iter write_stmt_with_gc_cleanup stmts;
+            dedent w
+        | None -> ());
+        newline w
+    | TCSTry tr ->
+        (* Recurse into try/catch blocks *)
+        write w "FIB_TRY {";
+        newline w;
+        indent w;
+        List.iter write_stmt_with_gc_cleanup tr.try_body;
+        dedent w;
+        write w "}";
+        List.iter (fun catch ->
+          writef w " FIB_CATCH(%s, " catch.catch_var;
+          write_type w catch.catch_type;
+          write w ") {";
+          newline w;
+          indent w;
+          List.iter write_stmt_with_gc_cleanup catch.catch_body;
+          dedent w;
+          write w "}"
+        ) tr.try_catches;
+        write w " FIB_END_TRY";
+        newline w
+    | _ ->
+        (* All other statements: emit normally *)
+        write_stmt w stmt
+  in
   
-  (* GC cleanup *)
-  if !gc_count > 0 then begin
+  (* Body statements with GC cleanup transformation *)
+  List.iter write_stmt_with_gc_cleanup cl.cl_body;
+  
+  (* Fall-through cleanup for void closures that don't explicitly return *)
+  if !gc_count > 0 && cl.cl_ret = TCVoid then begin
     writef w "gc_pop_temp_roots_ctx(FIB_CTX, %d);" !gc_count;
     newline w
   end;
