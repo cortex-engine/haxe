@@ -1330,7 +1330,19 @@ and gen_value ctx e =
 				in
 				gen_call_args ctx args param_types gen_value
 			| _ -> ());
-			spr ctx ")"
+			spr ctx ");";
+			newline ctx;
+			(* CRITICAL: Push temp roots for each GC-pointer field of the stack-allocated object.
+			 * This enables eliminating conservative stack scanning in minor GC, since all
+			 * GC pointers are now precisely tracked via temp roots. *)
+			List.iter (fun cf ->
+				match cf.cf_kind with
+				| Var _ when needs_gc_root ctx cf.cf_type ->
+					print ctx "gc_push_temp_root_ctx(FIB_CTX, (void**)&%s->%s);" (ident v.v_name) (ident cf.cf_name);
+					newline ctx;
+					ctx.gc_local_count <- ctx.gc_local_count + 1
+				| _ -> ()
+			) c.cl_ordered_fields
 		end else begin
 			(* Normal heap allocation path *)
 			(* Special handling for function types - use FibClosure* *)
@@ -1583,8 +1595,19 @@ and gen_expr ctx e =
 				in
 				gen_call_args ctx args param_types gen_value
 			| _ -> ());
-			spr ctx ")"
-			(* Stack-allocated objects don't need gc_push_temp_root - they're on the stack *)
+			spr ctx ");";
+			newline ctx;
+			(* CRITICAL: Push temp roots for each GC-pointer field of the stack-allocated object.
+			 * This enables eliminating conservative stack scanning in minor GC, since all
+			 * GC pointers are now precisely tracked via temp roots. *)
+			List.iter (fun cf ->
+				match cf.cf_kind with
+				| Var _ when needs_gc_root ctx cf.cf_type ->
+					print ctx "gc_push_temp_root_ctx(FIB_CTX, (void**)&%s->%s);" (ident v.v_name) (ident cf.cf_name);
+					newline ctx;
+					ctx.gc_local_count <- ctx.gc_local_count + 1
+				| _ -> ()
+			) c.cl_ordered_fields
 		end else begin
 			(* Normal heap allocation path *)
 			(* Get type string to check if it's a GC pointer *)
@@ -1625,19 +1648,24 @@ and gen_expr ctx e =
 					(* Need coercion - emit via coerce function *)
 					gen_coerce_with_expr ctx e.etype v.v_type (Some e) (fun () -> emit_cexpr ctx cexpr));
 			(* For GC pointer types:
-			 * 1. FIRST push the variable as a root - this protects the value
-			 * 2. THEN pop expression-level roots from the initializer
-			 * This order is critical: gc_pop may trigger GC, and at that point
-			 * the value must already be rooted. If we pop first, the value in
-			 * the variable could be relocated without updating the variable. *)
+			 * 1. FIRST pop expression-level roots from the initializer
+			 * 2. THEN push the variable as a root - this protects the value
+			 * 
+			 * This order is critical because temp roots are a LIFO stack:
+			 * - If we push first then pop, we pop the variable we just pushed!
+			 * - By popping first, we remove the temp var (e.g., _gc_tmp90)
+			 * - Then push the real variable (e.g., html) which stays protected
+			 * 
+			 * The object is briefly unprotected between pop and push, but since
+			 * gc_push_temp_root_ctx doesn't allocate, no GC can trigger. *)
 			if is_gc_ptr then begin
+				if !init_gc_roots > 0 then begin
+					print ctx "; gc_pop_temp_roots_ctx(FIB_CTX, %d)" !init_gc_roots
+				end;
 				spr ctx "; gc_push_temp_root_ctx(FIB_CTX, (void**)&";
 				spr ctx (ident v.v_name);
 				spr ctx ")";
-				ctx.gc_local_count <- ctx.gc_local_count + 1;
-				if !init_gc_roots > 0 then begin
-					print ctx "; gc_pop_temp_roots_ctx(FIB_CTX, %d)" !init_gc_roots
-				end
+				ctx.gc_local_count <- ctx.gc_local_count + 1
 			end else if !init_gc_roots > 0 then begin
 				(* Non-GC pointer type but init had gc_roots - still need to pop *)
 				print ctx "; gc_pop_temp_roots_ctx(FIB_CTX, %d)" !init_gc_roots
