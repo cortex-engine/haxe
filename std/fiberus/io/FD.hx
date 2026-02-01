@@ -43,7 +43,7 @@ class FD {
      * @return Bytes read on success, negative errno on failure, 0 on EOF
      */
     public static function read(fd:Int, buffer:haxe.io.Bytes, offset:Int, length:Int):Int {
-        return untyped __fiberus__("(int32_t)fib_io_read(", fd, ", fib_bytes_data(", buffer, "->b) + ", offset, ", ", length, ", -1)");
+        return untyped __fiberus__("(int32_t)fib_io_read_managed(", fd, ", ", buffer, "->b, ", offset, ", ", length, ", -1)");
     }
     
     /**
@@ -55,7 +55,7 @@ class FD {
      * @return Bytes written on success, negative errno on failure
      */
     public static function write(fd:Int, buffer:haxe.io.Bytes, offset:Int, length:Int):Int {
-        return untyped __fiberus__("(int32_t)fib_io_write(", fd, ", fib_bytes_data(", buffer, "->b) + ", offset, ", ", length, ", -1)");
+        return untyped __fiberus__("(int32_t)fib_io_write_managed(", fd, ", ", buffer, "->b, ", offset, ", ", length, ", -1)");
     }
     
     /**
@@ -63,7 +63,7 @@ class FD {
      * @param fileOffset Offset in file to read from
      */
     public static function pread(fd:Int, buffer:haxe.io.Bytes, offset:Int, length:Int, fileOffset:haxe.Int64):Int {
-        return untyped __fiberus__("(int32_t)fib_io_pread(", fd, ", fib_bytes_data(", buffer, "->b) + ", offset, ", ", length, ", (off_t)", fileOffset, ")");
+        return untyped __fiberus__("(int32_t)fib_io_read_managed(", fd, ", ", buffer, "->b, ", offset, ", ", length, ", (off_t)", fileOffset, ")");
     }
     
     /**
@@ -71,7 +71,7 @@ class FD {
      * @param fileOffset Offset in file to write to
      */
     public static function pwrite(fd:Int, buffer:haxe.io.Bytes, offset:Int, length:Int, fileOffset:haxe.Int64):Int {
-        return untyped __fiberus__("(int32_t)fib_io_pwrite(", fd, ", fib_bytes_data(", buffer, "->b) + ", offset, ", ", length, ", (off_t)", fileOffset, ")");
+        return untyped __fiberus__("(int32_t)fib_io_write_managed(", fd, ", ", buffer, "->b, ", offset, ", ", length, ", (off_t)", fileOffset, ")");
     }
     
     /**
@@ -154,7 +154,7 @@ class FD {
      * @return Bytes received on success, negative errno on failure, 0 on connection closed
      */
     public static function recv(fd:Int, buffer:haxe.io.Bytes, offset:Int, length:Int, flags:Int):Int {
-        return untyped __fiberus__("(int32_t)fib_io_recv(", fd, ", fib_bytes_data(", buffer, "->b) + ", offset, ", ", length, ", ", flags, ")");
+        return untyped __fiberus__("(int32_t)fib_io_recv_managed(", fd, ", ", buffer, "->b, ", offset, ", ", length, ", ", flags, ")");
     }
     
     /**
@@ -162,7 +162,7 @@ class FD {
      * @return Bytes sent on success, negative errno on failure
      */
     public static function send(fd:Int, buffer:haxe.io.Bytes, offset:Int, length:Int, flags:Int):Int {
-        return untyped __fiberus__("(int32_t)fib_io_send(", fd, ", fib_bytes_data(", buffer, "->b) + ", offset, ", ", length, ", ", flags, ")");
+        return untyped __fiberus__("(int32_t)fib_io_send_managed(", fd, ", ", buffer, "->b, ", offset, ", ", length, ", ", flags, ")");
     }
     
     /**
@@ -170,7 +170,7 @@ class FD {
      */
     public static function recvfrom(fd:Int, buffer:haxe.io.Bytes, offset:Int, length:Int, flags:Int):RecvFromResult {
         var result = new RecvFromResult(0, "", 0);
-        untyped __fiberus__("{ FibAddrInfo addr = {0}; ssize_t r = fib_io_recvfrom(", fd, ", fib_bytes_data(", buffer, "->b) + ", offset, ", ", length, ", ", flags, ", &addr); ",
+        untyped __fiberus__("{ FibAddrInfo addr = {0}; ssize_t r = fib_io_recvfrom_managed(", fd, ", ", buffer, "->b, ", offset, ", ", length, ", ", flags, ", &addr); ",
             result, "->bytesRead = (int32_t)r; ", result, "->host = fib_string_new(addr.host); ", result, "->port = addr.port; }");
         return result;
     }
@@ -179,7 +179,7 @@ class FD {
      * Send datagram to address (UDP).
      */
     public static function sendto(fd:Int, buffer:haxe.io.Bytes, offset:Int, length:Int, flags:Int, host:String, port:Int):Int {
-        return untyped __fiberus__("(int32_t)fib_io_sendto(", fd, ", fib_bytes_data(", buffer, "->b) + ", offset, ", ", length, ", ", flags, ", fib_string_data(", host, "), ", port, ")");
+        return untyped __fiberus__("(int32_t)fib_io_sendto_managed(", fd, ", ", buffer, "->b, ", offset, ", ", length, ", ", flags, ", fib_string_data(", host, "), ", port, ")");
     }
     
     /**
