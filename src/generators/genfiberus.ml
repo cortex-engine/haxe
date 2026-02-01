@@ -3110,6 +3110,13 @@ let gen_header ctx com =
 	spr ctx "static inline int GC_getThreshold(void) {\n";
 	spr ctx "\treturn (int)gc_get_threshold();\n";
 	spr ctx "}\n";
+	spr ctx "#define GC_minorCollect() gc_minor_collect()\n";
+	spr ctx "static inline void GC_setMinorThreshold(int bytes) {\n";
+	spr ctx "\tgc_set_minor_threshold((size_t)bytes);\n";
+	spr ctx "}\n";
+	spr ctx "static inline int GC_getMinorThreshold(void) {\n";
+	spr ctx "\treturn (int)gc_get_minor_threshold();\n";
+	spr ctx "}\n";
 	spr ctx "/* GC_stats returns an anonymous object with GC statistics */\n";
 	spr ctx "static inline FibDynamic GC_stats(void) {\n";
 	spr ctx "\tconst GCStats* s = gc_get_stats();\n";

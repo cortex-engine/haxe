@@ -1264,19 +1264,32 @@ and convert_field_assign ctx e1 e2 pos =
       let rhs = box_if_needed lhs_tc val_expr in
       (* Check if write barrier needed - object pointers need barriers *)
       let needs_barrier = is_instance_field && needs_write_barrier_tc rhs_tc in
-      if needs_barrier then
+      if needs_barrier then begin
         (* Emit: (FIBRIX_WRITE_BARRIER(obj, value), obj->field = value) *)
         let barrier = mk_expr (TCECall (TCTMacro "FIBRIX_WRITE_BARRIER", [obj_expr; rhs])) TCVoid in
         let assign = mk_expr (TCEAssign (lhs_expr, rhs)) lhs_tc in
-        mk_expr_pos (TCEComma [barrier; assign]) lhs_tc pos
-      else
-        mk_expr_pos (TCEAssign (lhs_expr, rhs)) lhs_tc pos
+        let result = mk_expr_pos (TCEComma [barrier; assign]) lhs_tc pos in
+        (* Propagate pending_stmts from all sub-expressions *)
+        { result with 
+          pending_stmts = obj_expr.pending_stmts @ lhs_expr.pending_stmts @ rhs.pending_stmts @ result.pending_stmts;
+          gc_roots = obj_expr.gc_roots + lhs_expr.gc_roots + rhs.gc_roots }
+      end else begin
+        let result = mk_expr_pos (TCEAssign (lhs_expr, rhs)) lhs_tc pos in
+        (* Propagate pending_stmts from sub-expressions *)
+        { result with 
+          pending_stmts = lhs_expr.pending_stmts @ rhs.pending_stmts @ result.pending_stmts;
+          gc_roots = lhs_expr.gc_roots + rhs.gc_roots }
+      end
   | _ ->
       (* Fallback - regular assignment *)
       let e1_expr = convert_expr ctx e1 in
       let e2_expr = convert_expr ctx e2 in
       let rhs = box_if_needed e1_expr.ctype e2_expr in
-      mk_expr_pos (TCEAssign (e1_expr, rhs)) e1_expr.ctype pos
+      let result = mk_expr_pos (TCEAssign (e1_expr, rhs)) e1_expr.ctype pos in
+      (* Propagate pending_stmts from sub-expressions *)
+      { result with 
+        pending_stmts = e1_expr.pending_stmts @ rhs.pending_stmts @ result.pending_stmts;
+        gc_roots = e1_expr.gc_roots + rhs.gc_roots }
 
 (* Convert array compound assignment: arr[i] op= value *)
 and convert_array_compound_assign ctx inner_op e1 e2 pos =

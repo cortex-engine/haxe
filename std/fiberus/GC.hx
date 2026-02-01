@@ -143,4 +143,31 @@ extern class GC {
 	 * @return Threshold in bytes
 	 */
 	public static function getThreshold():Int;
+
+	/**
+	 * Triggers a minor (nursery) collection.
+	 *
+	 * This is normally called automatically when the nursery fills up,
+	 * but can be called explicitly for testing or to ensure objects
+	 * are promoted to mature space.
+	 */
+	public static function minorCollect():Void;
+
+	/**
+	 * Sets the nursery collection threshold.
+	 *
+	 * When nursery allocations exceed this threshold, a minor collection
+	 * is triggered. Default is 6.8 MiB (85% of 8 MiB nursery).
+	 * Useful for testing with smaller thresholds.
+	 *
+	 * @param bytes Threshold in bytes
+	 */
+	public static function setMinorThreshold(bytes:Int):Void;
+
+	/**
+	 * Gets the current nursery collection threshold.
+	 *
+	 * @return Threshold in bytes
+	 */
+	public static function getMinorThreshold():Int;
 }
