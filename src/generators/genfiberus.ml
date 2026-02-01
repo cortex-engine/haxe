@@ -3123,11 +3123,7 @@ let gen_header ctx com =
 	spr ctx "#define GC_collect() gc_collect()\n";
 	spr ctx "#define GC_printStats() gc_print_stats()\n";
 	spr ctx "static inline FibString* GC_statsString(void) {\n";
-	spr ctx "\tchar* cstr = gc_stats_string();\n";
-	spr ctx "\tif (!cstr) return fib_string_new(\"\");\n";
-	spr ctx "\tFibString* result = fib_string_new(cstr);\n";
-	spr ctx "\tfree(cstr);\n";
-	spr ctx "\treturn result;\n";
+	spr ctx "\treturn gc_stats_string_gc();  /* Returns GC-managed string directly - no malloc */\n";
 	spr ctx "}\n";
 	spr ctx "static inline void GC_setDebug(bool enabled) {\n";
 	spr ctx "\tgc_set_debug(enabled);\n";
