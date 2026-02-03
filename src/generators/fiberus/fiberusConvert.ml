@@ -214,11 +214,65 @@ let rec is_allocating_expr (e : tc_expr) : bool =
   (* These don't allocate *)
   | TCELocal _ | TCEInt _ | TCEInt64 _ | TCEFloat _ | TCEBool _ | TCENull -> false
   | TCEUnop _ | TCEBinop _ -> false
-  | TCEDot _ | TCEArrow _ | TCEArrayGet _ -> false
-  | TCECast _ | TCEUnbox _ -> false
   | TCEEnumIndex _ | TCEEnumParam _ | TCEEnumConst _ -> false
   | TCEStringEq _ | TCEStringLength _ -> false
   | TCEInstanceOf _ -> false
+  
+  (* Field/array access and casts don't allocate themselves, but may contain
+   * allocating sub-expressions that need extraction. Check recursively. *)
+  | TCEDot (sub, _) | TCEArrow (sub, _) -> is_allocating_expr sub
+  | TCEArrayGet { arr; idx; _ } -> is_allocating_expr arr || is_allocating_expr idx
+  | TCECast (_, sub) | TCEUnbox (sub, _) -> is_allocating_expr sub
+  
+  | _ -> false
+
+(* Check if an expression yields a GC pointer from a "volatile" source that
+ * could become invalid if GC runs. This is used to determine if we need to
+ * extract the expression to a rooted temp variable before dereferencing it.
+ * 
+ * Key cases:
+ * - Array element access returning an object - the object pointer in FibDynamic
+ *   is not rooted and can become stale if GC evacuates the object
+ * - Method/function calls returning objects - result may be in a register
+ * - Casts/unboxes of the above - propagate the volatility
+ * - Field access on volatile objects - the object itself may move
+ *)
+let rec needs_extraction_before_deref (e : tc_expr) : bool =
+  if not (needs_gc_root_tc e.ctype) then false
+  else match e.cexpr with
+  (* Local variables are already rooted on the stack *)
+  | TCELocal _ -> false
+  (* Static fields are in global memory, stable *)
+  | TCEStatic _ -> false
+  (* 'this' pointer is rooted *)
+  | TCEThis -> false
+  (* Literals don't need rooting *)
+  | TCENull -> false
+  
+  (* Array element access returning GC type - VOLATILE! The object pointer
+   * extracted from FibDynamic.data.objectVal is not rooted. *)
+  | TCEArrayGet _ -> true
+  
+  (* Calls returning GC type - result may be in register only *)
+  | TCECall _ | TCEVtableCall _ | TCEClosureCall _ | TCEDynamicCall _ -> true
+  
+  (* New allocations are volatile until rooted *)
+  | TCENew _ -> true
+  
+  (* Casts/unboxes propagate volatility from their inner expression *)
+  | TCECast (_, sub) | TCEUnbox (sub, _) -> needs_extraction_before_deref sub
+  
+  (* Field access on volatile object - the object may move *)
+  | TCEDot (sub, _) | TCEArrow (sub, _) -> needs_extraction_before_deref sub
+  
+  (* Ternary - volatile if either branch is volatile *)
+  | TCETernary (_, t, f) -> needs_extraction_before_deref t || needs_extraction_before_deref f
+  
+  (* Block - check the result expression *)
+  | TCEBlock (_, Some result) -> needs_extraction_before_deref result
+  | TCEBlock (_, None) -> false
+  
+  (* Everything else - conservatively say not volatile *)
   | _ -> false
 
 (* Extract an allocating sub-expression to a temp variable with GC rooting.
@@ -438,6 +492,116 @@ let wrap_call_with_gc_extraction (make_call : tc_expr list -> tc_expr) (args : t
       result_type 
       pending
       result_roots
+  end
+
+(* Wrap a single expression with GC-safe extraction if it needs extraction
+ * before being dereferenced. This is used when we need to ensure an 
+ * intermediate pointer is rooted before being dereferenced (e.g., field 
+ * access on array element).
+ * 
+ * If the expression needs extraction (is volatile/allocating and returns a 
+ * GC type), it's extracted to a temp variable which is rooted. The make_final 
+ * function is then applied to the temp variable reference.
+ * 
+ * The returned expression has gc_roots set appropriately so callers can
+ * clean up at statement boundaries.
+ *)
+let wrap_single_gc_extraction (make_final : tc_expr -> tc_expr) (e : tc_expr) : tc_expr =
+  (* Use needs_extraction_before_deref to check if we need to root the object
+   * before accessing its fields. This catches cases like:
+   * - Array element access returning an object (volatile! not rooted)
+   * - Method calls returning objects  
+   * - Casts/unboxes of the above
+   * 
+   * NOTE: This is different from is_allocating_expr. An expression like
+   * data[i] doesn't allocate, but the resulting pointer IS volatile because
+   * it's extracted from FibDynamic and not rooted. If GC runs before we use
+   * it, the object could be evacuated and the pointer becomes stale.
+   *)
+  let needs_extract = needs_extraction_before_deref e in
+  
+  if not needs_extract then begin
+    (* No extraction needed - just apply make_final directly *)
+    let final = make_final e in
+    { final with 
+      pending_stmts = e.pending_stmts @ final.pending_stmts;
+      gc_roots = e.gc_roots }
+  end else begin
+    (* Expression yields a volatile GC pointer that must be rooted before use.
+     * We directly create a rooted temp variable, bypassing extract_if_allocating
+     * which would check is_allocating_expr (wrong check for this case). *)
+    let tmp_name = gen_gc_temp_name () in
+    let tmp_type = e.ctype in
+    
+    (* Create variable declaration to capture the volatile expression *)
+    let var_decl = TCSVar {
+      vd_name = tmp_name;
+      vd_type = tmp_type;
+      vd_init = Some e;
+      vd_static = false;
+      vd_const = false;
+    } in
+    
+    (* Handle any existing gc_roots from nested expressions *)
+    let cleanup_stmts = 
+      if e.gc_roots > 0 then [TCSGCPop e.gc_roots]
+      else []
+    in
+    
+    (* Push the temp variable as a GC root *)
+    let gc_push = TCSGCPush (mk_expr (TCELocal tmp_name) tmp_type) in
+    
+    (* Now apply make_final to the safe (rooted) reference *)
+    let tmp_ref = mk_expr (TCELocal tmp_name) tmp_type in
+    let final_expr = make_final tmp_ref in
+    let result_type = final_expr.ctype in
+    
+    (* Check if result also needs rooting *)
+    let result_needs_gc = needs_gc_root_tc result_type in
+    
+    if not result_needs_gc then begin
+      (* Result is not a GC type - compute result, then pop input root *)
+      let result_name = gen_gc_temp_name () in
+      let result_var = TCSVar {
+        vd_name = result_name;
+        vd_type = result_type;
+        vd_init = Some final_expr;
+        vd_static = false;
+        vd_const = false;
+      } in
+      let gc_pop = TCSGCPop 1 in  (* Pop the one root we pushed *)
+      let pending = e.pending_stmts @ [var_decl] @ cleanup_stmts @ [gc_push; result_var; gc_pop] in
+      mk_expr_lifted_gc (TCELocal result_name) result_type pending 0
+    end else begin
+      (* Result is GC type - save to temp and push result root.
+       * IMPORTANT: We keep BOTH the input and result rooted until the caller
+       * finishes using the result. The caller is responsible for popping all
+       * roots at the statement boundary.
+       *
+       * The sequence is:
+       *   1. Push input root (e)
+       *   2. Save result (derived from input) to temp
+       *   3. Push result root
+       *   4. Caller uses result
+       *   5. Caller pops gc_roots (which we set to 2 = input + result)
+       *)
+      let result_name = gen_gc_temp_name () in
+      let result_var = TCSVar {
+        vd_name = result_name;
+        vd_type = result_type;
+        vd_init = Some final_expr;
+        vd_static = false;
+        vd_const = false;
+      } in
+      
+      (* Push result root, keep input root - caller pops both *)
+      let result_gc_push = TCSGCPush (mk_expr (TCELocal result_name) result_type) in
+      
+      let pending = e.pending_stmts @ [var_decl] @ cleanup_stmts @ [gc_push; result_var; result_gc_push] in
+      
+      (* Return gc_roots = 2: one for input, one for result *)
+      mk_expr_lifted_gc (TCELocal result_name) result_type pending 2
+    end
   end
 
 (* ============================================================================
@@ -1581,39 +1745,49 @@ and convert_field_access ctx obj fa result_tc pos =
       (* Array.length -> fib_*_array_length() *)
       if FiberusBuiltins.is_array_type obj.Type.etype && cf.cf_name = "length" then begin
         let arr_kind = get_array_kind obj.Type.etype in
-        (* If object came from dynamic field, need to convert from FibDynamic first *)
-        let arr_expr = 
-          if is_dynamic_field_expr obj then
-            mk_expr (TCECall (TCTFunc "fib_dynamic_to_array", [obj_expr])) (TCFibArray TCArrGeneric)
-          else
-            obj_expr
-        in
-        mk_expr_pos (TCEArrayLength (arr_expr, arr_kind)) TCInt32 pos
+        (* Wrap with GC-safe extraction if array is volatile *)
+        wrap_single_gc_extraction (fun safe_arr ->
+          (* If object came from dynamic field, need to convert from FibDynamic first *)
+          let arr_expr = 
+            if is_dynamic_field_expr obj then
+              mk_expr (TCECall (TCTFunc "fib_dynamic_to_array", [safe_arr])) (TCFibArray TCArrGeneric)
+            else
+              safe_arr
+          in
+          mk_expr_pos (TCEArrayLength (arr_expr, arr_kind)) TCInt32 pos
+        ) obj_expr
       end
       (* String.length -> fib_string_length() *)
       else if FiberusBuiltins.is_string_type obj.Type.etype && cf.cf_name = "length" then begin
-        (* If object came from dynamic field, need to convert from FibDynamic first *)
-        let str_expr = 
-          if is_dynamic_field_expr obj then
-            mk_expr (TCECall (TCTFunc "fib_dynamic_to_string", [obj_expr])) TCFibString
-          else
-            obj_expr
-        in
-        mk_expr_pos (TCEStringLength str_expr) TCInt32 pos
+        (* Wrap with GC-safe extraction if string is volatile *)
+        wrap_single_gc_extraction (fun safe_str ->
+          (* If object came from dynamic field, need to convert from FibDynamic first *)
+          let str_expr = 
+            if is_dynamic_field_expr obj then
+              mk_expr (TCECall (TCTFunc "fib_dynamic_to_string", [safe_str])) TCFibString
+            else
+              safe_str
+          in
+          mk_expr_pos (TCEStringLength str_expr) TCInt32 pos
+        ) obj_expr
       end
       else begin
-        (* Regular instance field access - check for inherited field cast *)
+        (* Regular instance field access - use GC-safe extraction if obj is volatile.
+         * This ensures that if obj came from an array element access or method call,
+         * the intermediate pointer is rooted before we dereference it. *)
         let needs_cast = match obj.Type.etype with
           | Type.TInst (obj_class, _) -> obj_class.cl_path <> c.cl_path
           | _ -> false
         in
-        if needs_cast then begin
-          (* Cast to parent class type for inherited field access *)
-          let class_name = flat_path c.cl_path in
-          let cast_expr = mk_expr (TCECast (TCFibClass class_name, obj_expr)) (TCFibClass class_name) in
-          mk_expr_pos (TCEArrow (cast_expr, ident cf.cf_name)) result_tc pos
-        end else
-          mk_expr_pos (TCEArrow (obj_expr, ident cf.cf_name)) result_tc pos
+        wrap_single_gc_extraction (fun safe_obj ->
+          if needs_cast then begin
+            (* Cast to parent class type for inherited field access *)
+            let class_name = flat_path c.cl_path in
+            let cast_expr = mk_expr (TCECast (TCFibClass class_name, safe_obj)) (TCFibClass class_name) in
+            mk_expr_pos (TCEArrow (cast_expr, ident cf.cf_name)) result_tc pos
+          end else
+            mk_expr_pos (TCEArrow (safe_obj, ident cf.cf_name)) result_tc pos
+        ) obj_expr
       end
   
   (* Enum field *)
@@ -1622,14 +1796,19 @@ and convert_field_access ctx obj fa result_tc pos =
       mk_expr_pos (TCEEnumConst (enum_name, ident ef.ef_name)) result_tc pos
   
   (* Anonymous/dynamic field access - always returns FibDynamic *)
+  (* Wrap with GC-safe extraction since obj may be volatile *)
   | FAnon cf ->
-      (* Access via fib_field_get returns FibDynamic, regardless of declared type *)
       let field_name = mk_raw_string cf.cf_name in
-      mk_expr_pos (TCECall (TCTFunc "fib_field_get", [obj_expr; field_name])) TCFibDynamic pos
+      wrap_single_gc_extraction (fun safe_obj ->
+        (* Access via fib_field_get returns FibDynamic, regardless of declared type *)
+        mk_expr_pos (TCECall (TCTFunc "fib_field_get", [safe_obj; field_name])) TCFibDynamic pos
+      ) obj_expr
   
   | FDynamic name ->
       let field_name = mk_raw_string name in
-      mk_expr_pos (TCECall (TCTFunc "fib_field_get", [obj_expr; field_name])) TCFibDynamic pos
+      wrap_single_gc_extraction (fun safe_obj ->
+        mk_expr_pos (TCECall (TCTFunc "fib_field_get", [safe_obj; field_name])) TCFibDynamic pos
+      ) obj_expr
   
   (* Closure field - method as value *)
   | FClosure (_, cf) ->
@@ -2346,19 +2525,30 @@ and convert_call ctx callee args result_tc pos =
   | Some FiberusBuiltins.IFiberus ->
       (* Build raw C code by iterating through arguments:
          - String constants are emitted directly
-         - Other expressions are converted to C-AST and serialized *)
+         - Other expressions are converted to C-AST and serialized
+         
+         IMPORTANT: We need to collect pending_stmts from arguments that may
+         have been extracted for GC safety (e.g., field access on array elements).
+         These pending_stmts declare temp variables that must be emitted BEFORE
+         the raw code that uses them. *)
       let buf = Buffer.create 64 in
+      let all_pending = ref [] in
+      let total_gc_roots = ref 0 in
       List.iter (fun arg ->
         match arg.Type.eexpr with
         | Type.TConst (Type.TString s) -> Buffer.add_string buf s
         | _ ->
             (* Convert expression to C-AST and serialize via SourceWriter *)
             let arg_expr = convert_expr ctx arg in
+            (* Collect pending_stmts for later emission *)
+            all_pending := !all_pending @ arg_expr.pending_stmts;
+            total_gc_roots := !total_gc_roots + arg_expr.gc_roots;
             let w = FiberusSourceWriter.create () in
             FiberusSourceWriter.write_expr w arg_expr;
             Buffer.add_string buf (FiberusSourceWriter.contents w)
       ) args;
-      mk_expr_pos (TCERaw (Buffer.contents buf)) result_tc pos
+      let result = mk_expr_pos (TCERaw (Buffer.contents buf)) result_tc pos in
+      { result with pending_stmts = !all_pending; gc_roots = !total_gc_roots }
   
   | None ->
   
@@ -2418,24 +2608,33 @@ and convert_call ctx callee args result_tc pos =
       let method_name = ident cf.cf_name in
       let param_types = get_param_tc_types cf.cf_type in
       let coerced_args = coerce_args arg_exprs param_types in
-      mk_expr_pos (TCECall (TCTMethod (class_name, method_name), coerced_args)) result_tc pos
+      (* Collect pending_stmts from arguments *)
+      let args_pending = collect_pending coerced_args in
+      let call = mk_expr_pos (TCECall (TCTMethod (class_name, method_name), coerced_args)) result_tc pos in
+      { call with pending_stmts = args_pending @ call.pending_stmts }
   
-  (* Array method call *)
+  (* Array method call - wrap with GC-safe extraction if array is volatile *)
   | TField (arr, FInstance (_, _, cf)) when FiberusBuiltins.is_array_type arr.Type.etype ->
       let arr_expr = convert_expr ctx arr in
-      convert_array_call ctx arr arr_expr args arg_exprs cf.cf_name result_tc pos
+      wrap_single_gc_extraction (fun safe_arr ->
+        convert_array_call ctx arr safe_arr args arg_exprs cf.cf_name result_tc pos
+      ) arr_expr
   
-  (* String method call *)
+  (* String method call - wrap with GC-safe extraction if string is volatile *)
   | TField (str, FInstance (_, _, cf)) when FiberusBuiltins.is_string_type str.Type.etype ->
       let str_expr = convert_expr ctx str in
-      convert_string_call ctx str_expr args arg_exprs cf.cf_name result_tc pos
+      wrap_single_gc_extraction (fun safe_str ->
+        convert_string_call ctx safe_str args arg_exprs cf.cf_name result_tc pos
+      ) str_expr
   
-  (* Map method call (IntMap, StringMap, Int64Map, ObjectMap) *)
+  (* Map method call (IntMap, StringMap, Int64Map, ObjectMap) - wrap with GC-safe extraction *)
   | TField (map, FInstance (_, _, cf)) when FiberusBuiltins.map_kind_of_type map.Type.etype <> None ->
       let map_expr = convert_expr ctx map in
       let kind = match FiberusBuiltins.map_kind_of_type map.Type.etype with Some k -> k | None -> FiberusBuiltins.MapInt in
       let value_type = get_map_value_type map.Type.etype kind in
-      convert_map_call ctx map_expr args arg_exprs kind cf.cf_name value_type result_tc pos
+      wrap_single_gc_extraction (fun safe_map ->
+        convert_map_call ctx safe_map args arg_exprs kind cf.cf_name value_type result_tc pos
+      ) map_expr
   
   (* Instance method call *)
   | TField (obj, FInstance (c, _, cf)) ->
@@ -2445,61 +2644,84 @@ and convert_call ctx callee args result_tc pos =
       let param_types = get_param_tc_types cf.cf_type in
       let coerced_args = coerce_args arg_exprs param_types in
       let is_interface_call = FiberusVtable.is_interface c in
-      (* Check if this needs vtable dispatch *)
-      (match ctx.vtable_ctx with
-      | Some vtctx ->
-          if is_interface_call then begin
-            (* Interface calls ALWAYS need vtable dispatch *)
-            match FiberusVtable.get_interface_slot vtctx c cf with
-            | Some slot ->
-                (* Interface calls use FibObject as this type since we don't know concrete class *)
-                mk_expr_pos (TCEVtableCall {
-                  obj = obj_expr;
-                  slot = slot;
-                  this_type = TCFibObject;
-                  ret_type = result_tc;
-                  args = coerced_args;
-                }) result_tc pos
-            | None ->
-                mk_expr_pos (TCERaw (Printf.sprintf "/* ERROR: Interface method %s has no vtable slot */" cf.cf_name)) result_tc pos
-          end else begin
-            match FiberusVtable.get_vtable_slot vtctx c cf with
-            | Some slot_info ->
-                (* Virtual dispatch through vtable *)
-                mk_expr_pos (TCEVtableCall {
-                  obj = obj_expr;
-                  slot = slot_info.FiberusVtable.slot_index;
-                  this_type = TCFibClass class_name;
-                  ret_type = result_tc;
-                  args = coerced_args;
-                }) result_tc pos
-            | None ->
-                (* Direct call *)
-                mk_expr_pos (TCECall (TCTMethod (class_name, method_name), obj_expr :: coerced_args)) result_tc pos
-          end
-      | None ->
-          (* No vtable context - direct call *)
-          mk_expr_pos (TCECall (TCTMethod (class_name, method_name), obj_expr :: coerced_args)) result_tc pos)
+      (* Collect pending_stmts from arguments - these must be emitted before the call *)
+      let args_pending = collect_pending coerced_args in
+      
+      (* Wrap the method call generation with GC-safe extraction of the object.
+       * This ensures that if the object came from an array element access or
+       * method call, it's rooted before we evaluate arguments or call the method. *)
+      let call_result = wrap_single_gc_extraction (fun safe_obj ->
+        (* Check if this needs vtable dispatch *)
+        match ctx.vtable_ctx with
+        | Some vtctx ->
+            if is_interface_call then begin
+              (* Interface calls ALWAYS need vtable dispatch *)
+              match FiberusVtable.get_interface_slot vtctx c cf with
+              | Some slot ->
+                  (* Interface calls use FibObject as this type since we don't know concrete class *)
+                  mk_expr_pos (TCEVtableCall {
+                    obj = safe_obj;
+                    slot = slot;
+                    this_type = TCFibObject;
+                    ret_type = result_tc;
+                    args = coerced_args;
+                  }) result_tc pos
+              | None ->
+                  mk_expr_pos (TCERaw (Printf.sprintf "/* ERROR: Interface method %s has no vtable slot */" cf.cf_name)) result_tc pos
+            end else begin
+              match FiberusVtable.get_vtable_slot vtctx c cf with
+              | Some slot_info ->
+                  (* Virtual dispatch through vtable *)
+                  mk_expr_pos (TCEVtableCall {
+                    obj = safe_obj;
+                    slot = slot_info.FiberusVtable.slot_index;
+                    this_type = TCFibClass class_name;
+                    ret_type = result_tc;
+                    args = coerced_args;
+                  }) result_tc pos
+              | None ->
+                  (* Direct call *)
+                  mk_expr_pos (TCECall (TCTMethod (class_name, method_name), safe_obj :: coerced_args)) result_tc pos
+            end
+        | None ->
+            (* No vtable context - direct call *)
+            mk_expr_pos (TCECall (TCTMethod (class_name, method_name), safe_obj :: coerced_args)) result_tc pos
+      ) obj_expr in
+      (* Prepend arguments' pending_stmts to ensure temp vars are declared before call *)
+      { call_result with pending_stmts = args_pending @ call_result.pending_stmts }
   
   (* Constructor call - TNew handles this, but might appear as call too *)
   | TField (_, FEnum (e, ef)) ->
       let enum_name = flat_path e.e_path in
       let constr_name = ident ef.ef_name in
-      mk_expr_pos (TCEEnumConstruct (enum_name, constr_name, arg_exprs)) (TCFibEnum enum_name) pos
+      (* Collect pending_stmts from arguments *)
+      let args_pending = collect_pending arg_exprs in
+      let call = mk_expr_pos (TCEEnumConstruct (enum_name, constr_name, arg_exprs)) (TCFibEnum enum_name) pos in
+      { call with pending_stmts = args_pending @ call.pending_stmts }
   
-  (* Dynamic/anonymous field call *)
+  (* Dynamic/anonymous field call - wrap with GC-safe extraction *)
   | TField (obj, FAnon cf) ->
       let obj_expr = convert_expr ctx obj in
       let field_name = mk_raw_string cf.cf_name in
-      (* Get closure from dynamic field, then call it *)
-      let closure = mk_expr (TCECall (TCTFunc "fib_dynamic_get_field", [obj_expr; field_name])) TCFibClosure in
-      mk_expr_pos (TCEDynamicCall { closure; args = arg_exprs }) result_tc pos
+      (* Collect pending_stmts from arguments *)
+      let args_pending = collect_pending arg_exprs in
+      let call_result = wrap_single_gc_extraction (fun safe_obj ->
+        (* Get closure from dynamic field, then call it *)
+        let closure = mk_expr (TCECall (TCTFunc "fib_dynamic_get_field", [safe_obj; field_name])) TCFibClosure in
+        mk_expr_pos (TCEDynamicCall { closure; args = arg_exprs }) result_tc pos
+      ) obj_expr in
+      { call_result with pending_stmts = args_pending @ call_result.pending_stmts }
   
   | TField (obj, FDynamic name) ->
       let obj_expr = convert_expr ctx obj in
       let field_name = mk_raw_string name in
-      let closure = mk_expr (TCECall (TCTFunc "fib_dynamic_get_field", [obj_expr; field_name])) TCFibClosure in
-      mk_expr_pos (TCEDynamicCall { closure; args = arg_exprs }) result_tc pos
+      (* Collect pending_stmts from arguments *)
+      let args_pending = collect_pending arg_exprs in
+      let call_result = wrap_single_gc_extraction (fun safe_obj ->
+        let closure = mk_expr (TCECall (TCTFunc "fib_dynamic_get_field", [safe_obj; field_name])) TCFibClosure in
+        mk_expr_pos (TCEDynamicCall { closure; args = arg_exprs }) result_tc pos
+      ) obj_expr in
+      { call_result with pending_stmts = args_pending @ call_result.pending_stmts }
   
   (* Super constructor call: super(args) -> ParentClass_init(this, args) *)
   | TConst TSuper ->
@@ -2514,9 +2736,12 @@ and convert_call ctx callee args result_tc pos =
                 | None -> []
               in
               let coerced_args = coerce_args arg_exprs param_types in
+              (* Collect pending_stmts from arguments *)
+              let args_pending = collect_pending coerced_args in
               (* Cast this to parent type - TCFibClass already represents ClassName* *)
               let parent_this = mk_expr (TCECast (TCFibClass parent_name, mk_expr TCEThis (TCPointer TCVoid))) (TCFibClass parent_name) in
-              mk_expr_pos (TCECall (TCTMethod (parent_name, "init"), parent_this :: coerced_args)) TCVoid pos
+              let call = mk_expr_pos (TCECall (TCTMethod (parent_name, "init"), parent_this :: coerced_args)) TCVoid pos in
+              { call with pending_stmts = args_pending @ call.pending_stmts }
           | None ->
               mk_expr_pos (TCERaw "/* super() with no parent class */") TCVoid pos)
       | None ->
@@ -2525,7 +2750,9 @@ and convert_call ctx callee args result_tc pos =
   (* Closure call - callee is already a closure value *)
   | _ ->
       let callee_expr = convert_expr ctx callee in
-      (match callee_expr.ctype with
+      (* Collect pending_stmts from arguments *)
+      let args_pending = collect_pending arg_exprs in
+      let call = (match callee_expr.ctype with
       | TCFibClosure ->
           (* Get arg types from the function type *)
           let arg_types = List.map (fun e -> e.ctype) arg_exprs in
@@ -2537,7 +2764,8 @@ and convert_call ctx callee args result_tc pos =
           }) result_tc pos
       | _ ->
           (* Unknown callable - use dynamic call *)
-          mk_expr_pos (TCEDynamicCall { closure = callee_expr; args = arg_exprs }) result_tc pos)
+          mk_expr_pos (TCEDynamicCall { closure = callee_expr; args = arg_exprs }) result_tc pos) in
+      { call with pending_stmts = callee_expr.pending_stmts @ args_pending @ call.pending_stmts }
 
 (* ============================================================================
  * Statement Conversion
