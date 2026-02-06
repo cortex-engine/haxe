@@ -80,9 +80,15 @@ extern class Fiber {
 
 	/**
 	 * Spawns a fiber on a specific thread.
-	 * If the thread ID is invalid, spawns on the current thread.
+	 * 
+	 * The fiber is pushed to the target thread's inbox and will be drained
+	 * to its local work queue on the next scheduler iteration. This guarantees
+	 * initial execution on the target thread, but the fiber may be stolen later.
+	 * 
+	 * If the thread ID is invalid or equals the current thread, falls back
+	 * to local spawn for efficiency.
 	 *
-	 * @param threadId Target thread ID (0 = main thread)
+	 * @param threadId Target thread ID (0 = main thread, 1+ = workers)
 	 * @param fn The function to execute
 	 * @return The newly created fiber
 	 */
@@ -90,12 +96,49 @@ extern class Fiber {
 
 	/**
 	 * Spawns a fiber on the least-loaded thread.
-	 * Provides automatic load balancing across worker threads.
+	 * 
+	 * Uses Power of Two Choices algorithm: picks two random threads and
+	 * spawns on the one with the smaller queue. This achieves near-optimal
+	 * load distribution with O(1) overhead regardless of thread count.
+	 * 
+	 * In single-threaded mode, behaves identically to spawn().
 	 *
 	 * @param fn The function to execute
 	 * @return The newly created fiber
 	 */
 	public static function spawnAny(fn:Dynamic->Void):Fiber;
+
+	/**
+	 * Returns the ID of the thread currently executing this code.
+	 * 
+	 * Thread IDs are:
+	 * - 0 = main thread
+	 * - 1+ = worker threads
+	 * - -1 = scheduler not initialized
+	 *
+	 * Useful for debugging load distribution and implementing thread-local caches.
+	 *
+	 * @return Current thread ID
+	 */
+	public static function getThreadId():Int;
+
+	/**
+	 * Spawns multiple fibers with automatic round-robin distribution across threads.
+	 * 
+	 * More efficient than calling spawnAny in a loop for large batches because:
+	 * - Single load-balance decision window (avoids stale samples)
+	 * - Reduced per-fiber overhead
+	 * - Better cache locality during creation
+	 * 
+	 * Each fiber's body receives its index (0 to count-1) as the first argument
+	 * and the shared args value as the second argument.
+	 *
+	 * @param count Number of fibers to spawn
+	 * @param body Function to execute in each fiber (receives index and args)
+	 * @param args Shared argument passed to every fiber
+	 * @return Number of fibers actually spawned (may be less on OOM)
+	 */
+	public static function spawnMany(count:Int, body:(index:Int, args:Dynamic) -> Void, args:Dynamic):Int;
 }
 
 /**
