@@ -76,9 +76,63 @@ class OpenFlags {
     /** SO_KEEPALIVE option */
     public static inline var SO_KEEPALIVE:Int = 9;
     
+    /** SO_REUSEPORT option (allow multiple sockets to bind to the same port) */
+    public static inline var SO_REUSEPORT:Int = 15;
+    
     /** TCP_NODELAY option (disable Nagle) */
     public static inline var TCP_NODELAY:Int = 1;
     
+    // ========================================================================
+    // Send/Recv flags
+    // ========================================================================
+    
+    /** Non-blocking send/recv */
+    public static inline var MSG_DONTWAIT:Int = 64;
+    
+    /** Peek at incoming data without consuming */
+    public static inline var MSG_PEEK:Int = 2;
+    
+    /** Wait for full request or error */
+    public static inline var MSG_WAITALL:Int = 256;
+    
+    // ========================================================================
+    // Poll event masks
+    // ========================================================================
+    
+    /** Data available for reading */
+    public static inline var POLLIN:Int = 1;
+    
+    /** Writing possible */
+    public static inline var POLLOUT:Int = 4;
+    
+    /** Error condition */
+    public static inline var POLLERR:Int = 8;
+    
+    /** Hang up */
+    public static inline var POLLHUP:Int = 16;
+    
+    // ========================================================================
+    // Errno values (returned as negative from I/O operations)
+    // ========================================================================
+    
+    /** Resource temporarily unavailable (try again) */
+    public static inline var EAGAIN:Int = 11;
+    
+    /** Operation would block (same as EAGAIN on Linux) */
+    public static inline var EWOULDBLOCK:Int = 11;
+    
+    /** Connection reset by peer */
+    public static inline var ECONNRESET:Int = 104;
+    
+    /** Broken pipe */
+    public static inline var EPIPE:Int = 32;
+    
+    /** Connection refused */
+    public static inline var ECONNREFUSED:Int = 111;
+    
+    /** Operation timed out */
+    public static inline var ETIMEDOUT:Int = 110;
+
     // ========================================================================
     // Shutdown how values
     // ========================================================================

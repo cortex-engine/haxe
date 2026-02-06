@@ -183,6 +183,18 @@ class FD {
     }
     
     /**
+     * Poll fd for readability/writability. Suspends fiber until ready or timeout.
+     * Uses io_uring IORING_OP_POLL_ADD internally.
+     * @param fd File descriptor to poll
+     * @param events Event mask (OpenFlags.POLLIN, OpenFlags.POLLOUT, or both OR'd)
+     * @param timeoutMs Timeout in milliseconds (-1 = infinite, 0 = non-blocking)
+     * @return Positive revents mask on success, 0 on timeout, negative errno on error
+     */
+    public static function poll(fd:Int, events:Int, timeoutMs:Int):Int {
+        return untyped __fiberus__("fib_io_poll_fd(", fd, ", ", events, ", ", timeoutMs, ")");
+    }
+
+    /**
      * Shutdown socket.
      * @param how 0=read, 1=write, 2=both
      */
