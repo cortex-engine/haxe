@@ -259,6 +259,7 @@ and tc_stmt =
   
   (* Fiber integration *)
   | TCSYieldPoint                           (* FIBER_YIELD_POINT(); *)
+  | TCSForceMature of tc_stmt              (* gc_force_mature_begin(); stmt; gc_force_mature_end(); *)
   
   (* Debug/profiling *)
   | TCSStackFrame of tc_stack_frame         (* FIB_STACKFRAME(...) *)

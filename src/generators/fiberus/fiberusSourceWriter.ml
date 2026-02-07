@@ -739,6 +739,12 @@ and write_stmt (w : writer) (s : tc_stmt) : unit =
   | TCSYieldPoint ->
       write w "FIBER_YIELD_POINT();";
       newline w
+  | TCSForceMature inner ->
+      write w "gc_force_mature_begin();";
+      newline w;
+      write_stmt w inner;
+      write w "gc_force_mature_end();";
+      newline w
   
   (* Debug/profiling *)
   | TCSStackFrame sf ->
@@ -991,11 +997,20 @@ let write_closure_impl (w : writer) (cl : tc_closure) ~(debug_level : int) : uni
     newline w
   end;
   
-  (* Extract captured variables *)
+  (* Extract captured variables and GC root pointer-type captures.
+   * Without rooting, if GC evacuates objects during this closure's execution,
+   * local copies of captured pointers become stale (point to old/freed memory).
+   * The closure itself is rooted, so its captures get updated, but we also need
+   * the extracted local variables to be GC roots so they get updated too. *)
   List.iter (fun cap ->
     write_type w cap.cap_type;
     writef w " %s = %s;" cap.cap_var (capture_extract_expr cap);
-    newline w
+    newline w;
+    if needs_gc_root cap.cap_type then begin
+      writef w "gc_push_temp_root_ctx(FIB_CTX, (void**)&%s);" cap.cap_var;
+      newline w;
+      incr gc_count
+    end
   ) cl.cl_captures;
   
   (* Helper to write statements, transforming returns to include gc_pop.

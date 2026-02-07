@@ -185,17 +185,111 @@ let extract_param_field_mapping (f : tfunc) : (int * string) list =
   find_mapping f.tf_expr;
   !mappings
 
+(* ============================================================================
+ * Fiber-Capture Analysis: Mature Allocation for Cross-Thread Safety
+ * ============================================================================
+ *
+ * Identifies variables whose allocations must go to mature space because they
+ * are captured by Fiber.spawn* closures and will be accessed from other threads.
+ *
+ * Thread-local minor GC can evacuate nursery objects without stopping other
+ * threads. If a fiber on Thread 1 holds a pointer to a nursery object on
+ * Thread 0, and Thread 0's minor GC evacuates it, Thread 1 gets a dangling
+ * pointer. Allocating in mature space avoids this entirely.
+ *
+ * This is a single-pass dataflow analysis over the function body:
+ * 1. Track all local variables initialized from allocations (TNew, TCall)
+ * 2. When a Fiber.spawn* call is found, check which tracked variables
+ *    are referenced inside the closure argument
+ * 3. Those variables are marked as needing mature allocation
+ *)
+
+(* Check if a callee expression is a Fiber.spawn/spawnAny/spawnOn/spawnWithStack call *)
+let is_fiber_spawn_call callee =
+  match callee.eexpr with
+  | TField (_, FStatic ({ cl_path = ([], "Fiber") }, { cf_name = ("spawn"|"spawnAny"|"spawnOn"|"spawnWithStack") }))
+  | TField (_, FStatic ({ cl_path = (["fiberus"], "Fiber") }, { cf_name = ("spawn"|"spawnAny"|"spawnOn"|"spawnWithStack") })) ->
+      true
+  | _ -> false
+
+(* Analyze which variables need mature allocation due to fiber-spawn capture.
+ * Returns (fiber_mature_vars, this_needs_mature):
+ * - fiber_mature_vars: set of var_ids whose allocation sites need gc_force_mature brackets
+ * - this_needs_mature: true if `this` (via _gthis alias) is fiber-captured, meaning
+ *   the _new() function should use gc_alloc_mature_object_with_class *)
+let analyze_fiber_captures (f : tfunc) : (int, unit) Hashtbl.t * bool =
+  let alloc_vars = Hashtbl.create 16 in      (* var_id -> unit: vars initialized from allocations *)
+  let this_aliases = Hashtbl.create 4 in     (* var_id -> unit: vars initialized from TConst TThis *)
+  let fiber_mature = Hashtbl.create 16 in    (* result: vars needing mature allocation *)
+  let this_needs_mature = ref false in
+
+  let rec scan e =
+    match e.eexpr with
+    (* Track variable initialized from an allocation *)
+    | TVar (v, Some init) ->
+        (match init.eexpr with
+        | TNew _ ->
+            Hashtbl.replace alloc_vars v.v_id ()
+        | TCall _ ->
+            (* Runtime type constructors: Counter.create(), fib_array_new, etc. *)
+            Hashtbl.replace alloc_vars v.v_id ()
+        | TArrayDecl _ ->
+            (* Array literal: var a = []; or var a = [1,2,3]; *)
+            Hashtbl.replace alloc_vars v.v_id ()
+        | TObjectDecl _ ->
+            (* Anonymous object literal *)
+            Hashtbl.replace alloc_vars v.v_id ()
+        | TConst TThis ->
+            (* _gthis = this — track as this-alias so we can propagate to _new() *)
+            Hashtbl.replace alloc_vars v.v_id ();
+            Hashtbl.replace this_aliases v.v_id ()
+        | _ -> ());
+        scan init
+
+    (* Detect Fiber.spawn*(function(...) { body }) calls *)
+    | TCall (callee, args) when is_fiber_spawn_call callee ->
+        (* Check which alloc_vars are referenced inside the closure arguments *)
+        List.iter (fun arg ->
+          match arg.eexpr with
+          | TFunction tf ->
+              let rec find_refs e =
+                match e.eexpr with
+                | TLocal v when Hashtbl.mem alloc_vars v.v_id ->
+                    Hashtbl.replace fiber_mature v.v_id ();
+                    (* If this is a this-alias, flag this_needs_mature *)
+                    if Hashtbl.mem this_aliases v.v_id then
+                      this_needs_mature := true
+                | _ -> Type.iter find_refs e
+              in
+              find_refs tf.tf_expr
+          | _ -> ()
+        ) args;
+        (* Also recurse into callee and args normally *)
+        scan callee;
+        List.iter scan args
+
+    (* Default: recurse into sub-expressions *)
+    | _ -> Type.iter scan e
+  in
+  scan f.tf_expr;
+  (fiber_mature, !this_needs_mature)
+
 (* Result type for escape analysis of a function *)
 type escape_result = {
   stack_allocatable : (int, tclass) Hashtbl.t;  (* var_id -> class that can be stack allocated *)
   param_field_map : (int * string) list;        (* param_id -> field_name for constructor optimization *)
+  fiber_mature_vars : (int, unit) Hashtbl.t;    (* var_id set: must allocate in mature space *)
+  this_needs_mature : bool;                     (* constructor's this must be mature-allocated *)
 }
 
 (* Perform full escape analysis on a function *)
 let analyze_function (f : tfunc) : escape_result =
+  let (fiber_mature, this_mature) = analyze_fiber_captures f in
   {
     stack_allocatable = analyze_escapes f;
     param_field_map = extract_param_field_mapping f;
+    fiber_mature_vars = fiber_mature;
+    this_needs_mature = this_mature;
   }
 
 (* ============================================================================

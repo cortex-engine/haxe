@@ -34,6 +34,8 @@ type conv_ctx = {
   mutable closures: tc_closure list;  (* Closures created during conversion *)
   mutable in_fiber_spawn: bool;       (* True if inside Fiber.spawn context *)
   mutable spawn_counter: int;         (* Counter for unique Fiber.spawn temp variable names *)
+  (* Fiber-escape analysis *)
+  fiber_mature_vars: (int, unit) Hashtbl.t;  (* var_ids needing mature allocation *)
   (* Debug/codegen options *)
   debug_level: int;                   (* 0=none, 1=function, 2=line *)
 }
@@ -50,6 +52,7 @@ let empty_ctx = {
   closures = [];
   in_fiber_spawn = false;
   spawn_counter = 0;
+  fiber_mature_vars = Hashtbl.create 0;
   debug_level = 0;
 }
 
@@ -1609,6 +1612,12 @@ and convert_expr_as_stmt ctx (e : texpr) : tc_stmt list =
       let vtype = tc_type_of v.v_type in
       let init = Option.map (convert_expr ctx) init_opt in
       let var_stmt = TCSVar { vd_name = name; vd_type = vtype; vd_init = init; vd_static = false; vd_const = false } in
+      (* Wrap with gc_force_mature if this variable is fiber-captured *)
+      let var_stmt =
+        if Hashtbl.mem ctx.fiber_mature_vars v.v_id then
+          TCSForceMature var_stmt
+        else var_stmt
+      in
       (* Add GC push for pointer types *)
       let gc_stmts = gc_push_if_needed ctx name vtype in
       var_stmt :: gc_stmts
@@ -1622,9 +1631,15 @@ and convert_expr_as_stmt ctx (e : texpr) : tc_stmt list =
       [TCSIf (cond_expr, then_stmts, else_stmts)]
   | TWhile (cond, body, flag) ->
       let cond_expr = convert_expr ctx cond in
+      let saved_gc_count = gc_save_count ctx in
       let body_stmts = convert_expr_as_stmt ctx body in
+      let to_pop = gc_roots_to_pop ctx saved_gc_count in
+      let body_with_pop = if to_pop > 0 then begin
+        ctx.gc_local_count <- saved_gc_count;
+        body_stmts @ [TCSGCPop to_pop]
+      end else body_stmts in
       let is_do_while = (flag = DoWhile) in
-      [TCSWhile (cond_expr, body_stmts, is_do_while)]
+      [TCSWhile (cond_expr, body_with_pop, is_do_while)]
   | TReturn expr_opt ->
       let ret_expr = match expr_opt with
         | None -> None
@@ -2779,6 +2794,12 @@ and convert_stmt (ctx : conv_ctx) (e : texpr) : tc_stmt list =
       let vtype = tc_type_of v.v_type in
       let init = Option.map (convert_expr ctx) init_opt in
       let var_stmt = TCSVar { vd_name = name; vd_type = vtype; vd_init = init; vd_static = false; vd_const = false } in
+      (* Wrap with gc_force_mature if this variable is fiber-captured *)
+      let var_stmt =
+        if Hashtbl.mem ctx.fiber_mature_vars v.v_id then
+          TCSForceMature var_stmt
+        else var_stmt
+      in
       (* Add GC push for pointer types *)
       let gc_stmts = gc_push_if_needed ctx name vtype in
       var_stmt :: gc_stmts
@@ -2794,12 +2815,19 @@ and convert_stmt (ctx : conv_ctx) (e : texpr) : tc_stmt list =
       let else_stmts = Option.map (convert_stmt ctx) eelse_opt in
       [TCSIf (cond_expr, then_stmts, else_stmts)]
   
-  (* While loop *)
+  (* While loop - save/restore GC roots around loop body to prevent
+   * unbounded temp root accumulation from loop-scoped GC pointer variables *)
   | TWhile (cond, body, flag) ->
       let cond_expr = convert_expr ctx cond in
+      let saved_gc_count = gc_save_count ctx in
       let body_stmts = convert_stmt ctx body in
+      let to_pop = gc_roots_to_pop ctx saved_gc_count in
+      let body_with_pop = if to_pop > 0 then begin
+        ctx.gc_local_count <- saved_gc_count;
+        body_stmts @ [TCSGCPop to_pop]
+      end else body_stmts in
       let is_do_while = (flag = DoWhile) in
-      [TCSWhile (cond_expr, body_stmts, is_do_while)]
+      [TCSWhile (cond_expr, body_with_pop, is_do_while)]
   
   (* Return statement *)
   | TReturn expr_opt ->

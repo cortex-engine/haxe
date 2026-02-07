@@ -49,6 +49,9 @@ type ctx = {
 	mutable has_gc_ctx : bool;
 	(* Escape analysis: set of variable IDs that can be stack-allocated *)
 	mutable stack_alloc_vars : (int, tclass) Hashtbl.t;
+	(* Fiber-escape analysis: variables needing mature allocation *)
+	mutable fiber_mature_vars : (int, unit) Hashtbl.t;
+	mutable this_needs_mature : bool;
 	(* Vtable context for virtual method dispatch *)
 	mutable vtable_ctx : FiberusVtable.vtable_context option;
 	(* Method thunks: methods that are used as values and need closure wrappers *)
@@ -98,6 +101,7 @@ let make_conv_ctx ctx =
     FiberusConvert.closures = [];
     FiberusConvert.in_fiber_spawn = ctx.in_fiber_spawn;
     FiberusConvert.spawn_counter = ctx.spawn_counter;
+    FiberusConvert.fiber_mature_vars = ctx.fiber_mature_vars;
     FiberusConvert.debug_level = ctx.debug_level;
   }
 
@@ -1307,6 +1311,12 @@ and gen_value ctx e =
 		ctx.closures <- new_closures @ ctx.closures;
 		emit_cexpr ctx cexpr
 	| TVar (v, eo) ->
+		(* Check if this variable needs mature allocation for fiber cross-thread safety *)
+		let is_fiber_mature = Hashtbl.mem ctx.fiber_mature_vars v.v_id in
+		if is_fiber_mature then begin
+			spr ctx "gc_force_mature_begin();";
+			newline ctx
+		end;
 		(* Check if this variable can be stack-allocated *)
 		let is_stack_alloc = Hashtbl.mem ctx.stack_alloc_vars v.v_id in
 		if is_stack_alloc then begin
@@ -1362,6 +1372,11 @@ and gen_value ctx e =
 			| Some e ->
 				spr ctx " = ";
 				gen_coerce_with_expr ctx e.etype v.v_type (Some e) (fun () -> gen_value ctx e))
+		end;
+		if is_fiber_mature then begin
+			spr ctx ";";
+			newline ctx;
+			spr ctx "gc_force_mature_end()"
 		end
 	| TBlock el ->
 		(* Block used as value - use C-AST pipeline with GC tracking *)
@@ -1572,6 +1587,12 @@ and gen_expr ctx e =
 	| TFunction _ ->
 		()  (* Function expressions handled elsewhere *)
 	| TVar (v, eo) ->
+		(* Check if this variable needs mature allocation for fiber cross-thread safety *)
+		let is_fiber_mature = Hashtbl.mem ctx.fiber_mature_vars v.v_id in
+		if is_fiber_mature then begin
+			spr ctx "gc_force_mature_begin();";
+			newline ctx
+		end;
 		(* Check if this variable can be stack-allocated *)
 		let is_stack_alloc = Hashtbl.mem ctx.stack_alloc_vars v.v_id in
 		if is_stack_alloc then begin
@@ -1670,6 +1691,11 @@ and gen_expr ctx e =
 				(* Non-GC pointer type but init had gc_roots - still need to pop *)
 				print ctx "; gc_pop_temp_roots_ctx(FIB_CTX, %d)" !init_gc_roots
 			end
+		end;
+		if is_fiber_mature then begin
+			spr ctx ";";
+			newline ctx;
+			spr ctx "gc_force_mature_end()"
 		end
 	| TBlock el ->
 		let b = open_block_for_exprs ctx el in
@@ -2109,11 +2135,17 @@ let gen_function ctx name f c is_static =
 	let old_gc_count = ctx.gc_local_count in
 	let old_has_gc_ctx = ctx.has_gc_ctx in
 	let old_stack_alloc_vars = ctx.stack_alloc_vars in
+	let old_fiber_mature_vars = ctx.fiber_mature_vars in
+	let old_this_needs_mature = ctx.this_needs_mature in
 	(* Start with parameter count - these were pushed above *)
 	ctx.gc_local_count <- gc_param_count;
 	ctx.has_gc_ctx <- true;
 	(* Run escape analysis to find stack-allocatable variables *)
 	ctx.stack_alloc_vars <- analyze_escapes f;
+	(* Run fiber-capture analysis to find variables needing mature allocation *)
+	let (fiber_mature, this_mature) = analyze_fiber_captures f in
+	ctx.fiber_mature_vars <- fiber_mature;
+	ctx.this_needs_mature <- this_mature;
 	(* Stack frame for source mapping *)
 	gen_stack_push ctx class_name name f.tf_expr.epos;
 	(* Set return type for coercion in return statements *)
@@ -2143,6 +2175,8 @@ let gen_function ctx name f c is_static =
 	ctx.gc_local_count <- old_gc_count;
 	ctx.has_gc_ctx <- old_has_gc_ctx;
 	ctx.stack_alloc_vars <- old_stack_alloc_vars;
+	ctx.fiber_mature_vars <- old_fiber_mature_vars;
+	ctx.this_needs_mature <- old_this_needs_mature;
 	ctx.tabs <- String.sub ctx.tabs 0 (String.length ctx.tabs - 1);
 	spr ctx "}";
 	newline ctx;
@@ -2238,8 +2272,14 @@ let gen_constructor ctx c =
 				let old_gc_count = ctx.gc_local_count in
 				let old_has_gc_ctx = ctx.has_gc_ctx in
 				let old_stack_alloc_vars = ctx.stack_alloc_vars in
+				let old_fiber_mature_vars = ctx.fiber_mature_vars in
+				let old_this_needs_mature = ctx.this_needs_mature in
 				(* Run escape analysis for constructor body *)
 				ctx.stack_alloc_vars <- analyze_escapes f;
+				(* Run fiber-capture analysis for constructor body *)
+				let (fiber_mature, this_mature) = analyze_fiber_captures f in
+				ctx.fiber_mature_vars <- fiber_mature;
+				ctx.this_needs_mature <- this_mature;
 				(* Only emit FIB_GC_CTX if constructor body needs it *)
 				if init_needs_gc_ctx then begin
 					spr ctx "FIB_GC_CTX;";
@@ -2280,9 +2320,13 @@ let gen_constructor ctx c =
 					print ctx "gc_pop_temp_roots_ctx(FIB_CTX, %d);" ctx.gc_local_count;
 					newline ctx
 				end;
+				(* Save this_needs_mature before restoring — needed for _new() generation *)
+				let ctor_this_needs_mature = ctx.this_needs_mature in
 				ctx.gc_local_count <- old_gc_count;
 				ctx.has_gc_ctx <- old_has_gc_ctx;
 				ctx.stack_alloc_vars <- old_stack_alloc_vars;
+				ctx.fiber_mature_vars <- old_fiber_mature_vars;
+				ctx.this_needs_mature <- old_this_needs_mature;
 				ctx.tabs <- "";
 				spr ctx "}";
 				newline ctx;
@@ -2307,13 +2351,25 @@ let gen_constructor ctx c =
 						newline ctx
 					) gc_param_args
 				end;
-				(* Use gc_alloc_object_with_class - sets clazz atomically before allocStart *)
-				print ctx "%s* this = gc_alloc_object_with_class(sizeof(%s), &%s_class);" class_name class_name class_name;
-				newline ctx;
 				(* Call _init with args - use filtered args for consistency *)
 				let arg_names = List.map (fun (v, _) -> ident v.v_name) filtered_args in
-				print ctx "%s_init(this%s);" class_name
-					(if arg_names = [] then "" else ", " ^ String.concat ", " arg_names);
+				(* Allocate 'this' — use mature space if constructor captures this in fiber closures *)
+				if ctor_this_needs_mature then begin
+					print ctx "%s* this = gc_alloc_mature_object_with_class(sizeof(%s), &%s_class);" class_name class_name class_name;
+					newline ctx;
+					(* Wrap _init with gc_force_mature so all nested allocations
+					   (arrays, counters, etc. that the constructor creates) also
+					   go to mature space while the TLS flag covers them individually *)
+					print ctx "%s_init(this%s);" class_name
+						(if arg_names = [] then "" else ", " ^ String.concat ", " arg_names);
+				end else begin
+					(* Use gc_alloc_object_with_class - sets clazz atomically before allocStart *)
+					print ctx "%s* this = gc_alloc_object_with_class(sizeof(%s), &%s_class);" class_name class_name class_name;
+					newline ctx;
+					(* Call _init with args - use filtered args for consistency *)
+					print ctx "%s_init(this%s);" class_name
+						(if arg_names = [] then "" else ", " ^ String.concat ", " arg_names);
+				end;
 				newline ctx;
 				(* Pop GC roots before return *)
 				if has_gc_params then begin
@@ -3579,6 +3635,8 @@ let generate com =
 		loop_depth = 0;
 		has_gc_ctx = false;
 		stack_alloc_vars = Hashtbl.create 0;
+		fiber_mature_vars = Hashtbl.create 0;
+		this_needs_mature = false;
 		vtable_ctx = None;
 		method_thunks = Hashtbl.create 16;
 	} in
