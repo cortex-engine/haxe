@@ -235,6 +235,18 @@ and tc_expr_kind =
  * C Statements
  * ============================================================================ *)
 
+(* GCFrame information for shadow stack frame declaration *)
+and gc_frame_slot = {
+  gfs_name: string;      (* Slot name (e.g., "param_a", "_gc_tmp0") *)
+  gfs_type: tc_type;     (* Type of the slot (e.g., TCFibString) *)
+  gfs_init: tc_expr option;  (* Initial value (Some for params, None for temps) *)
+}
+
+and gc_frame_info = {
+  gfi_name: string;      (* Frame variable name (e.g., "_gc") *)
+  gfi_slots: gc_frame_slot list;  (* Ordered list of slots *)
+}
+
 and tc_stmt =
   (* Basic *)
   | TCSExpr of tc_expr                      (* expr; *)
@@ -257,12 +269,17 @@ and tc_stmt =
   | TCSTry of tc_try
   | TCSThrow of tc_expr
   
-  (* GC integration (explicit) *)
+  (* GC integration (explicit) - legacy push/pop for non-frame contexts *)
   | TCSGCPush of tc_expr                    (* gc_push_temp_root(&expr) *)
   | TCSGCPop of int                         (* gc_pop_temp_roots(n) *)
   | TCSGCCtx                                (* FIB_GC_CTX; *)
   | TCSGCSafePoint                          (* GC_SAFE_POINT(); *)
   | TCSGCRootCheck of int                   (* Debug assertion: check root count equals base + n *)
+  
+  (* GCFrame-based GC root tracking (shadow stack) *)
+  | TCSGCFrameDecl of gc_frame_info         (* Declare + link frame struct *)
+  | TCSGCFramePop of string                 (* Unlink frame: GC_FRAME_POP(ctx, name) *)
+  | TCSGCFrameAssign of string * string * tc_expr  (* _gc.slot = expr;  (frame_name, slot_name, value) *)
   
   (* Fiber integration *)
   | TCSYieldPoint                           (* FIBER_YIELD_POINT(); *)
@@ -282,6 +299,7 @@ and tc_var_decl = {
   vd_init: tc_expr option;
   vd_static: bool;
   vd_const: bool;
+  vd_volatile: bool;
 }
 
 and tc_for_init =
@@ -591,7 +609,7 @@ let mk_unbox expr target_type =
 
 (* Create a variable declaration statement *)
 let mk_var_stmt name typ init =
-  TCSVar { vd_name = name; vd_type = typ; vd_init = init; vd_static = false; vd_const = false }
+  TCSVar { vd_name = name; vd_type = typ; vd_init = init; vd_static = false; vd_const = false; vd_volatile = false }
 
 (* Create an expression statement *)
 let mk_expr_stmt expr =

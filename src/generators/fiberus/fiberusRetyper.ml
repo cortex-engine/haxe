@@ -218,7 +218,7 @@ let make_expr_stmt (expr : tc_expr) : tc_stmt =
 
 (* Create a variable declaration *)
 let make_var_decl (name : string) (typ : tc_type) (init : tc_expr option) : tc_stmt =
-  TCSVar { vd_name = name; vd_type = typ; vd_init = init; vd_static = false; vd_const = false }
+  TCSVar { vd_name = name; vd_type = typ; vd_init = init; vd_static = false; vd_const = false; vd_volatile = false }
 
 (* Create a return statement *)
 let make_return (expr : tc_expr option) : tc_stmt =

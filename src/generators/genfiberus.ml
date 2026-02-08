@@ -38,8 +38,7 @@ type ctx = {
 	mutable spawn_counter : int;  (* Counter for unique Fiber.spawn temp variable names *)
 	(* GC root tracking: count of gc_push_temp_root calls in current function *)
 	mutable gc_local_count : int;
-	(* GC context: has FIB_GC_CTX been emitted in this function? *)
-	mutable has_gc_ctx : bool;
+
 	(* Escape analysis: set of variable IDs that can be stack-allocated *)
 	mutable stack_alloc_vars : (int, tclass) Hashtbl.t;
 	(* Fiber-escape analysis: variables needing mature allocation *)
@@ -54,10 +53,6 @@ type ctx = {
 (* Escape analysis functions (can_stack_alloc_class, analyze_escapes, 
    filter_void_args, extract_param_field_mapping) now imported from FiberusEscape *)
 
-(* is_void_type now imported from FiberusGenEnum *)
-
-(* ident, flat_path, s_path, escape_string now imported from FiberusStrings *)
-
 let spr ctx s =
 	Buffer.add_string ctx.buf s
 
@@ -67,14 +62,9 @@ let print ctx =
 let newline ctx =
 	print ctx "\n%s" ctx.tabs
 
-(* ends_with_return now imported from FiberusEscape *)
-
 (* ===========================================================================
- * C-AST Pipeline Helper
- * ===========================================================================
- * Converts a Haxe expression to C-AST and emits it via FiberusSourceWriter.
- * This is used during the migration from direct string emission to C-AST.
- *)
+ * C-AST Pipeline Helpers
+ * =========================================================================== *)
 
 (* Create a conversion context from the genfiberus context *)
 let make_conv_ctx ctx =
@@ -86,6 +76,10 @@ let make_conv_ctx ctx =
     FiberusConvert.gc_local_count = ctx.gc_local_count;
     FiberusConvert.loop_depth = 0;
     FiberusConvert.func_gc_root_count = -1;
+    FiberusConvert.gc_frame_name = "_gc";
+    FiberusConvert.gc_frame_slots = [];
+    FiberusConvert.gc_frame_rooted_vars = Hashtbl.create 0;
+    FiberusConvert.in_gc_frame = false;
     FiberusConvert.closure_counter = ctx.closure_counter;
     FiberusConvert.closures = [];
     FiberusConvert.in_fiber_spawn = ctx.in_fiber_spawn;
@@ -102,50 +96,6 @@ let sync_closures_from_conv ctx conv_ctx =
   ctx.spawn_counter <- conv_ctx.FiberusConvert.spawn_counter;
   FiberusConvert.get_closures conv_ctx
 
-(* Emit a C-AST expression directly to the buffer.
- * NOTE: pending_stmts are NOT emitted here - they must be emitted by the caller
- * at statement level before this expression is evaluated. Use emit_cexpr_as_stmt
- * if you need pending_stmts to be emitted. *)
-let emit_cexpr ctx (cexpr : tc_expr) =
-  let w = FiberusSourceWriter.create () in
-  FiberusSourceWriter.write_expr w cexpr;
-  spr ctx (FiberusSourceWriter.contents w)
-
-(* Emit pending_stmts from an expression, then the expression itself.
- * This is for statement-level contexts where pending_stmts can be emitted. *)
-let emit_cexpr_with_pending ctx (cexpr : tc_expr) =
-  let w = FiberusSourceWriter.create () in
-  (* Emit any pending statements first *)
-  List.iter (FiberusSourceWriter.write_stmt w) cexpr.pending_stmts;
-  (* Emit the expression *)
-  FiberusSourceWriter.write_expr w cexpr;
-  spr ctx (FiberusSourceWriter.contents w)
-
-(* Emit a C-AST statement directly to the buffer (without trailing newline) *)
-let emit_cstmt_inline ctx (cstmt : tc_stmt) =
-  let w = FiberusSourceWriter.create () in
-  FiberusSourceWriter.write_stmt w cstmt;
-  (* Remove trailing newline that write_stmt adds *)
-  let s = FiberusSourceWriter.contents w in
-  let s = if String.length s > 0 && s.[String.length s - 1] = '\n' 
-          then String.sub s 0 (String.length s - 1) else s in
-  spr ctx s
-
-(* Emit multiple C-AST statements, compatible with gen_expr context where
- * the caller will add a trailing "; newline" after the last one.
- * All statements except the last get their own "; newline".
- * The last statement is emitted without trailing newline so the caller can add ";". *)
-let emit_cstmts_for_gen_expr ctx stmts =
-  let rec emit = function
-    | [] -> ()
-    | [stmt] -> emit_cstmt_inline ctx stmt
-    | stmt :: rest ->
-        emit_cstmt_inline ctx stmt;
-        newline ctx;
-        emit rest
-  in
-  emit stmts
-
 (* Get or assign a unique class ID *)
 let get_class_id ctx path =
 	try Hashtbl.find ctx.class_ids path
@@ -154,11 +104,6 @@ let get_class_id ctx path =
 		ctx.class_id_counter <- ctx.class_id_counter + 1;
 		Hashtbl.add ctx.class_ids path id;
 		id
-
-(* s_path, flat_path, strip_file, escape_string now imported from FiberusStrings *)
-(* Note: s_path is available as s_type_path in FiberusStrings *)
-
-(* DELETED: gen_stack_push, gen_line — now handled by C-AST pipeline (TCSStackFrame, TCSLine) *)
 
 (* Convert Haxe type to C type string - delegates to FiberusTypeUtils *)
 let s_type _ctx t =
@@ -181,17 +126,6 @@ let s_func_decl ctx ret_type func_name func_args =
 	(* s_type returns FibClosure* for TFun, so use standard format *)
 	Printf.sprintf "%s %s(%s)" (s_type ctx ret_type) func_name func_args
 
-(* is_simple_constructor now imported from FiberusGenClass *)
-
-(* DELETED: gen_binop — stack-alloc reassignment now handled by C-AST pipeline *)
-
-(* Type predicates (is_string_type, is_dynamic_type, is_array_type) 
-   now imported from FiberusBuiltins *)
-
-(* tc_type-based predicates *)
-
-(* DELETED: is_class_pointer_tc, is_enum_struct_tc — dead code *)
-
 (* Check if type ends with '*' (is a pointer that needs GC marking) *)
 let needs_gc_marking_tc = function
 	| TCFibString | TCFibArray _ | TCFibClass _ | TCFibClosure 
@@ -201,86 +135,9 @@ let needs_gc_marking_tc = function
 	(* Note: FibDynamic is NOT a pointer (struct), so excluded *)
 	| _ -> false
 
-(* String-based wrappers removed - all callers now use tc_type versions *)
-
-(* DELETED: gen_box_to_fib_dynamic_tc — enum boxing now handled by C-AST pipeline (FiberusGenEnum) *)
-(* DELETED: get_actual_tc_type, get_expr_tc_type, needs_write_barrier_tc, is_fiberus_call — dead code *)
-
-(* is_enum_type now imported from FiberusTypeUtils *)
-
-(* DELETED: gen_coerce_with_expr, gen_call_args, gen_trace_value,
- * gen_fiber_spawn_closure, extract_closure_for_spawn, gen_builtin_call,
- * gen_array_call, gen_string_call, gen_map_call, gen_instance_call, gen_call
- * — All call generation now handled by C-AST pipeline (FiberusConvert.convert_call).
- *)
-
-let rec gen_expr ctx e =
-	match e.eexpr with
-	| TConst _ | TLocal _ | TArray _ | TBinop _ | TField _
-	| TTypeExpr _ | TParenthesis _ | TObjectDecl _ | TArrayDecl _
-	| TNew _ | TUnop _ | TCast _ | TMeta _
-	| TEnumParameter _ | TEnumIndex _ | TIdent _ ->
-		(* For value expressions used as statements, we need to:
-		 * 1. Emit any pending_stmts from the expression
-		 * 2. Emit the expression
-		 * 3. Pop any gc_roots the expression leaves on the stack
-		 * Convert to C-AST to check gc_roots and pending_stmts *)
-		let conv_ctx = make_conv_ctx ctx in
-		let cexpr = FiberusConvert.convert_expr conv_ctx e in
-		emit_cexpr_with_pending ctx cexpr;
-		if cexpr.gc_roots > 0 then
-			print ctx "; gc_pop_temp_roots_ctx(FIB_CTX, %d)" cexpr.gc_roots
-	| TCall _ ->
-		(* Convert call to C-AST to properly handle pending_stmts from complex arguments.
-		 * This handles trace(), Fiber.spawn, and all other calls that may have
-		 * string concatenation or other GC-allocating expressions as arguments. *)
-		let conv_ctx = make_conv_ctx ctx in
-		let cexpr = FiberusConvert.convert_expr conv_ctx e in
-		(* Sync closures back if any were created *)
-		let new_closures = sync_closures_from_conv ctx conv_ctx in
-		if new_closures <> [] then ctx.closures <- new_closures @ ctx.closures;
-		(* Emit pending statements first, then the expression *)
-		emit_cexpr_with_pending ctx cexpr;
-		if cexpr.gc_roots > 0 then
-			print ctx "; gc_pop_temp_roots_ctx(FIB_CTX, %d)" cexpr.gc_roots
-	| TFunction _ ->
-		()  (* Function expressions handled elsewhere *)
-	| TVar _ ->
-		(* Route through C-AST pipeline for variable declarations *)
-		let conv_ctx = make_conv_ctx ctx in
-		let stmts = FiberusConvert.convert_stmt conv_ctx e in
-		(* Sync closures and GC count back to main context *)
-		let new_closures = sync_closures_from_conv ctx conv_ctx in
-		if new_closures <> [] then ctx.closures <- new_closures @ ctx.closures;
-		ctx.gc_local_count <- conv_ctx.gc_local_count;
-		emit_cstmts_for_gen_expr ctx stmts
-	| TBlock _ | TIf _ | TWhile _ | TSwitch _ ->
-		(* Route control flow through C-AST pipeline *)
-		let conv_ctx = make_conv_ctx ctx in
-		let stmts = FiberusConvert.convert_stmt conv_ctx e in
-		(* Sync closures and GC count back to main context *)
-		let new_closures = sync_closures_from_conv ctx conv_ctx in
-		if new_closures <> [] then ctx.closures <- new_closures @ ctx.closures;
-		ctx.gc_local_count <- conv_ctx.gc_local_count;
-		emit_cstmts_for_gen_expr ctx stmts
-	| TTry _ ->
-		(* Route through C-AST pipeline for try/catch *)
-		let conv_ctx = make_conv_ctx ctx in
-		let stmts = FiberusConvert.convert_stmt conv_ctx e in
-		List.iter (fun stmt -> emit_cstmt_inline ctx stmt) stmts
-	| TReturn _ ->
-		(* GC cleanup for return is now handled by the converter when func_gc_root_count >= 0.
-		 * This path is only reached from non-function contexts (main entry, __boot). *)
-		let conv_ctx = make_conv_ctx ctx in
-		let stmts = FiberusConvert.convert_stmt conv_ctx e in
-		List.iter (fun stmt -> emit_cstmt_inline ctx stmt) stmts
-	| TBreak -> emit_cstmt_inline ctx TCSBreak
-	| TContinue -> emit_cstmt_inline ctx TCSContinue
-	| TThrow _ ->
-		(* Use C-AST pipeline for throw - handles boxing to FibDynamic *)
-		let conv_ctx = make_conv_ctx ctx in
-		let stmts = FiberusConvert.convert_stmt conv_ctx e in
-		List.iter (fun stmt -> emit_cstmt_inline ctx stmt) stmts
+(* ===========================================================================
+ * Class / Function Generation (via C-AST pipeline)
+ * =========================================================================== *)
 
 let gen_function ctx name f c is_static =
 	let class_name = flat_path c.cl_path in
@@ -332,6 +189,7 @@ let gen_static_var ctx c cf =
 		vd_init = init;
 		vd_static = is_local_static;
 		vd_const = false;
+		vd_volatile = false;
 	} in
 	let w = FiberusSourceWriter.create () in
 	FiberusSourceWriter.write_decl w decl;
@@ -959,7 +817,6 @@ let generate com =
 		in_fiber_spawn = false;
 		spawn_counter = 0;
 		gc_local_count = 0;
-		has_gc_ctx = false;
 		stack_alloc_vars = Hashtbl.create 0;
 		fiber_mature_vars = Hashtbl.create 0;
 		vtable_ctx = None;
@@ -1054,21 +911,31 @@ let generate com =
 	spr ctx "#include \"fiberus_generated.h\"\n";
 	spr ctx "#include \"telemetry.h\"\n\n";
 
-	(* Generate the main fiber entry function - runs the Haxe main code as a fiber *)
-	spr ctx "/* Main fiber entry - runs the Haxe main code as a fiber.\n";
-	spr ctx " * This allows the main thread to participate in work-stealing\n";
-	spr ctx " * and provides a uniform execution model where all code runs in fibers. */\n";
-	spr ctx "static void _fiberus_main_entry(void* arg) {\n";
-	spr ctx "\t(void)arg;\n";
-	(match com.main.main_expr with
-	| Some e ->
-		ctx.tabs <- "\t";
-		gen_expr ctx e;
-		spr ctx ";";
-		ctx.tabs <- ""
-	| None ->
-		spr ctx "\t/* No main expression */");
-	spr ctx "\n}\n\n";
+	(* Generate the main fiber entry function via C-AST pipeline *)
+	let main_body = match com.main.main_expr with
+		| Some e ->
+			let conv_ctx = make_conv_ctx ctx in
+			let stmts = FiberusConvert.convert_stmt conv_ctx e in
+			(* Sync closures back *)
+			let new_closures = sync_closures_from_conv ctx conv_ctx in
+			if new_closures <> [] then ctx.closures <- new_closures @ ctx.closures;
+			[TCSRaw "(void)arg;"] @ stmts
+		| None ->
+			[TCSRaw "(void)arg;"; TCSComment "No main expression"]
+	in
+	let main_entry_func = {
+		fd_name = "_fiberus_main_entry";
+		fd_ret = TCVoid;
+		fd_args = [{ fa_name = "arg"; fa_type = TCPointer TCVoid }];
+		fd_body = main_body;
+		fd_static = true;
+		fd_inline = false;
+		fd_attrs = [];
+	} in
+	let w = FiberusSourceWriter.create () in
+	FiberusSourceWriter.write_decl w (TCDRaw "/* Main fiber entry - runs the Haxe main code as a fiber.\n * This allows the main thread to participate in work-stealing\n * and provides a uniform execution model where all code runs in fibers. */");
+	FiberusSourceWriter.write_decl w (TCDFunc main_entry_func);
+	spr ctx (FiberusSourceWriter.contents w);
 
 	spr ctx "int main(int argc, char** argv) {\n";
 	spr ctx "\t(void)argc; (void)argv;\n";

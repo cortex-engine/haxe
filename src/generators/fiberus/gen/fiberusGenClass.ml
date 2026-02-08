@@ -245,7 +245,7 @@ let gen_mark_function_body (c : tclass) : tc_stmt list =
       vd_type = TCPointer (TCStruct class_name);
       vd_init = Some (mk_expr (TCECast (TCPointer (TCStruct class_name), obj_local)) (TCPointer (TCStruct class_name)));
       vd_static = false;
-      vd_const = false;
+      vd_const = false; vd_volatile = false;
     } in
     let mark_stmts = List.map (fun sfi ->
       let ctx_local = mk_expr (TCELocal "ctx") (TCPointer (TCStruct "MarkContext")) in

@@ -165,7 +165,7 @@ let gen_enum_constructor_func (info : enum_info) (ci : enum_constr_info) : tc_fu
       vd_type = enum_type;
       vd_init = Some (mk_expr (TCERaw (Printf.sprintf "{ .index = %d }" ci.eci_index)) enum_type);
       vd_static = false;
-      vd_const = false;
+      vd_const = false; vd_volatile = false;
     } in
     
     (* Assign each parameter: _e.params[i] = box(param); *)
@@ -200,7 +200,7 @@ let gen_enum_const_decl (info : enum_info) (ci : enum_constr_info) : tc_decl =
     vd_type = enum_type;
     vd_init = Some (mk_expr (TCERaw (Printf.sprintf "{ .index = %d }" ci.eci_index)) enum_type);
     vd_static = false;
-    vd_const = true;
+    vd_const = true; vd_volatile = false;
   }
 
 (* ============================================================================

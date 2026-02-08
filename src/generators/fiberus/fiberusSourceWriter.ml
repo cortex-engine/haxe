@@ -182,11 +182,20 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
   
   (* Operations *)
   | TCEBinop (op, lhs, rhs) ->
-      write w "(";
-      write_expr w lhs;
-      writef w " %s " (binop_to_string op);
-      write_expr w rhs;
-      write w ")"
+      (match op with
+      | TCOpUShr ->
+          (* Unsigned right shift: cast LHS to unsigned before shifting *)
+          write w "((int32_t)((uint32_t)";
+          write_expr w lhs;
+          write w " >> ";
+          write_expr w rhs;
+          write w "))"
+      | _ ->
+          write w "(";
+          write_expr w lhs;
+          writef w " %s " (binop_to_string op);
+          write_expr w rhs;
+          write w ")")
   | TCEUnop (op, e) ->
       if is_postfix_unop op then begin
         write w "(";
@@ -797,6 +806,46 @@ and write_stmt (w : writer) (s : tc_stmt) : unit =
       write w "#endif";
       newline w
   
+  (* GCFrame-based shadow stack *)
+  | TCSGCFrameDecl info ->
+      (* Emit: struct { GCFrame _hdr; Type1 slot1; Type2 slot2; ... } _gc = {
+       *     { FIB_CTX ? FIB_CTX->topFrame : NULL, N }, init1, init2, ...
+       * };
+       * GC_FRAME_PUSH(FIB_CTX, _gc); *)
+      let n = List.length info.gfi_slots in
+      if n > 0 then begin
+        writef w "struct { GCFrame _hdr;";
+        List.iter (fun slot ->
+          write w " ";
+          write_type w slot.gfs_type;
+          writef w " %s;" slot.gfs_name
+        ) info.gfi_slots;
+        writef w " } %s = { { FIB_CTX ? FIB_CTX->topFrame : NULL, %d }" info.gfi_name n;
+        List.iter (fun slot ->
+          write w ", ";
+          (match slot.gfs_init with
+          | Some e -> write_expr w e
+          | None ->
+            (* Emit type-appropriate zero initializer *)
+            if is_fib_dynamic slot.gfs_type then
+              write w "(FibDynamic){0}"
+            else
+              write w "NULL")
+        ) info.gfi_slots;
+        write w " };";
+        newline w;
+        writef w "GC_FRAME_PUSH(FIB_CTX, %s);" info.gfi_name;
+        newline w
+      end
+  | TCSGCFramePop frame_name ->
+      writef w "GC_FRAME_POP(FIB_CTX, %s);" frame_name;
+      newline w
+  | TCSGCFrameAssign (frame_name, slot_name, value) ->
+      writef w "%s.%s = " frame_name slot_name;
+      write_expr w value;
+      write w ";";
+      newline w
+  
   (* Fiber integration *)
   | TCSYieldPoint ->
       write w "FIBER_YIELD_POINT();";
@@ -830,6 +879,7 @@ and write_stmt (w : writer) (s : tc_stmt) : unit =
 and write_var_decl (w : writer) (vd : tc_var_decl) : unit =
   if vd.vd_static then write w "static ";
   if vd.vd_const then write w "const ";
+  if vd.vd_volatile then write w "volatile ";
   write_type_with_name w vd.vd_type vd.vd_name;
   match vd.vd_init with
   | Some e -> write w " = "; write_expr w e
@@ -1039,19 +1089,47 @@ let write_closure_impl (w : writer) (cl : tc_closure) ~(debug_level : int) : uni
     newline w
   end;
   
-  (* GC root the _closure parameter *)
-  write w "gc_push_temp_root_ctx(FIB_CTX, (void**)&_closure);";
-  newline w;
-  let gc_count = ref 1 in
-  
-  (* GC root other GC-typed parameters *)
+  (* Build GCFrame with _closure + GC-typed args + GC-typed captures *)
+  let frame_slots = ref [] in
+  (* Always root _closure *)
+  frame_slots := ("_closure", TCFibClosure) :: !frame_slots;
+  (* GC-typed parameters *)
   List.iter (fun arg ->
-    if needs_gc_root arg.fa_type then begin
-      writef w "gc_push_temp_root_ctx(FIB_CTX, (void**)&%s);" arg.fa_name;
-      newline w;
-      incr gc_count
-    end
+    if needs_gc_root arg.fa_type then
+      frame_slots := (arg.fa_name, arg.fa_type) :: !frame_slots
   ) cl.cl_args;
+  (* GC-typed captures - will be extracted from closure and assigned later *)
+  List.iter (fun cap ->
+    if needs_gc_root cap.cap_type then
+      frame_slots := (cap.cap_var, cap.cap_type) :: !frame_slots
+  ) cl.cl_captures;
+  let frame_slots = List.rev !frame_slots in
+  let n_slots = List.length frame_slots in
+  
+  (* Emit frame declaration *)
+  if n_slots > 0 then begin
+    write w "struct { GCFrame _hdr;";
+    List.iter (fun (name, typ) ->
+      write w " ";
+      write_type w typ;
+      writef w " %s;" name
+    ) frame_slots;
+    writef w " } _gc = { { FIB_CTX ? FIB_CTX->topFrame : NULL, %d }" n_slots;
+    (* Initial values: _closure and GC-typed params get their values, captures get NULL *)
+    List.iter (fun (name, _typ) ->
+      write w ", ";
+      (* Check if this is a capture (to be initialized later) *)
+      let is_capture = List.exists (fun cap -> cap.cap_var = name) cl.cl_captures in
+      if is_capture then
+        write w "NULL"
+      else
+        write w name  (* param or _closure *)
+    ) frame_slots;
+    write w " };";
+    newline w;
+    write w "GC_FRAME_PUSH(FIB_CTX, _gc);";
+    newline w
+  end;
   
   (* Suppress unused _closure warning if no captures *)
   if cl.cl_captures = [] then begin
@@ -1059,44 +1137,36 @@ let write_closure_impl (w : writer) (cl : tc_closure) ~(debug_level : int) : uni
     newline w
   end;
   
-  (* Extract captured variables and GC root pointer-type captures.
-   * Without rooting, if GC evacuates objects during this closure's execution,
-   * local copies of captured pointers become stale (point to old/freed memory).
-   * The closure itself is rooted, so its captures get updated, but we also need
-   * the extracted local variables to be GC roots so they get updated too. *)
+  (* Extract captured variables into locals, then assign to frame if GC-typed *)
   List.iter (fun cap ->
     write_type w cap.cap_type;
     writef w " %s = %s;" cap.cap_var (capture_extract_expr cap);
     newline w;
     if needs_gc_root cap.cap_type then begin
-      writef w "gc_push_temp_root_ctx(FIB_CTX, (void**)&%s);" cap.cap_var;
-      newline w;
-      incr gc_count
+      writef w "_gc.%s = %s;" cap.cap_var cap.cap_var;
+      newline w
     end
   ) cl.cl_captures;
   
-  (* Helper to write statements, transforming returns to include gc_pop.
-   * This fixes the bug where gc_pop was placed after return statements. *)
+  (* Helper to write statements, transforming returns to include GC_FRAME_POP.
+   * For GCFrame closures, returns need to pop the frame before returning. *)
   let rec write_stmt_with_gc_cleanup stmt =
     match stmt with
-    | TCSReturn (Some e) when !gc_count > 0 ->
-        (* For non-void returns: evaluate to temp, pop roots, return temp *)
+    | TCSReturn (Some e) when n_slots > 0 ->
+        (* For non-void returns: evaluate to temp, pop frame, return temp *)
         emit_pending_stmts w e;
         write w "{ ";
         write_type w cl.cl_ret;
         write w " _ret = ";
         write_expr w e;
-        writef w "; gc_pop_temp_roots_ctx(FIB_CTX, %d); return _ret; }" !gc_count;
+        write w "; GC_FRAME_POP(FIB_CTX, _gc); return _ret; }";
         newline w
-    | TCSReturn None when !gc_count > 0 ->
-        (* For void returns: pop roots, then return *)
-        writef w "gc_pop_temp_roots_ctx(FIB_CTX, %d); return;" !gc_count;
+    | TCSReturn None when n_slots > 0 ->
+        write w "GC_FRAME_POP(FIB_CTX, _gc); return;";
         newline w
     | TCSReturn _ ->
-        (* No GC roots to pop, emit normally *)
         write_stmt w stmt
     | TCSBlock stmts ->
-        (* Recurse into blocks to find nested returns *)
         write w "{";
         newline w;
         indent w;
@@ -1105,7 +1175,6 @@ let write_closure_impl (w : writer) (cl : tc_closure) ~(debug_level : int) : uni
         write w "}";
         newline w
     | TCSIf (cond, then_stmts, else_opt) ->
-        (* Recurse into if branches *)
         emit_pending_stmts w cond;
         write w "if (";
         write_expr w cond;
@@ -1126,7 +1195,6 @@ let write_closure_impl (w : writer) (cl : tc_closure) ~(debug_level : int) : uni
         | None -> ());
         newline w
     | TCSWhile (cond, body, is_do_while) ->
-        (* Recurse into while loops *)
         if is_do_while then begin
           write w "do {";
           newline w;
@@ -1149,7 +1217,6 @@ let write_closure_impl (w : writer) (cl : tc_closure) ~(debug_level : int) : uni
           newline w
         end
     | TCSSwitch sw ->
-        (* Recurse into switch cases *)
         write w "switch (";
         write_expr w sw.sw_expr;
         write w ") {";
@@ -1177,10 +1244,8 @@ let write_closure_impl (w : writer) (cl : tc_closure) ~(debug_level : int) : uni
         | None -> ());
         newline w
     | TCSTry _ ->
-        (* Try/catch: delegate to write_stmt which handles full FIB_TRY emission *)
         write_stmt w stmt
     | _ ->
-        (* All other statements: emit normally *)
         write_stmt w stmt
   in
   
@@ -1188,8 +1253,8 @@ let write_closure_impl (w : writer) (cl : tc_closure) ~(debug_level : int) : uni
   List.iter write_stmt_with_gc_cleanup cl.cl_body;
   
   (* Fall-through cleanup for void closures that don't explicitly return *)
-  if !gc_count > 0 && cl.cl_ret = TCVoid then begin
-    writef w "gc_pop_temp_roots_ctx(FIB_CTX, %d);" !gc_count;
+  if n_slots > 0 && cl.cl_ret = TCVoid then begin
+    write w "GC_FRAME_POP(FIB_CTX, _gc);";
     newline w
   end;
   
