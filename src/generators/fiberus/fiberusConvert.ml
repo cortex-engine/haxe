@@ -29,6 +29,8 @@ type conv_ctx = {
   (* GC tracking for statement conversion *)
   mutable gc_local_count: int;        (* Current temp roots pushed in this scope *)
   mutable loop_depth: int;            (* Nesting depth for yield points *)
+  (* Function-level GC root tracking for return cleanup *)
+  mutable func_gc_root_count: int;    (* Roots pushed by function prologue (params + this); -1 = not in function *)
   (* Closure support *)
   mutable closure_counter: int;       (* Counter for unique closure names *)
   mutable closures: tc_closure list;  (* Closures created during conversion *)
@@ -38,6 +40,8 @@ type conv_ctx = {
   fiber_mature_vars: (int, unit) Hashtbl.t;  (* var_ids needing mature allocation *)
   (* Stack allocation escape analysis *)
   stack_alloc_vars: (int, tclass) Hashtbl.t;  (* var_ids eligible for stack allocation *)
+  (* Method thunks for FClosure (method-as-value) *)
+  method_thunks: (string, tc_method_thunk) Hashtbl.t;  (* thunk_name -> thunk info *)
   (* Debug/codegen options *)
   debug_level: int;                   (* 0=none, 1=function, 2=line *)
 }
@@ -50,12 +54,14 @@ let empty_ctx = {
   current_ret_type = None;
   gc_local_count = 0;
   loop_depth = 0;
+  func_gc_root_count = -1;
   closure_counter = 0;
   closures = [];
   in_fiber_spawn = false;
   spawn_counter = 0;
   fiber_mature_vars = Hashtbl.create 0;
   stack_alloc_vars = Hashtbl.create 0;
+  method_thunks = Hashtbl.create 0;
   debug_level = 0;
 }
 
@@ -96,6 +102,16 @@ let fresh_spawn_vars _ctx =
 
 (* Get all closures registered during conversion *)
 let get_closures ctx = List.rev ctx.closures
+
+(* Get all method thunks registered during conversion *)
+let get_method_thunks ctx =
+  Hashtbl.fold (fun _name thunk acc -> thunk :: acc) ctx.method_thunks []
+
+(* Render a tc_expr to its C source string via FiberusSourceWriter *)
+let render_expr (cexpr : tc_expr) : string =
+  let w = FiberusSourceWriter.create () in
+  FiberusSourceWriter.write_expr w cexpr;
+  FiberusSourceWriter.contents w
 
 (* ============================================================================
  * GC-Aware Conversion Helpers
@@ -883,7 +899,10 @@ let rec convert_expr (ctx : conv_ctx) (e : texpr) : tc_expr =
       ) free_vars in
       
       (* Convert the function body to C-AST for later emission *)
-      let body_ctx = { (ctx_for_scope ctx) with current_ret_type = Some (tc_type_of f.tf_type) } in
+      let body_ctx = { (ctx_for_scope ctx) with 
+        current_ret_type = Some (tc_type_of f.tf_type);
+        closures = [];  (* Start with empty closures - only collect NEW closures from body *)
+      } in
       let body_stmts = convert_stmt body_ctx f.tf_expr in
       (* Sync any nested closures from body back to outer context *)
       ctx.closures <- body_ctx.closures @ ctx.closures;
@@ -1006,6 +1025,50 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
   (* Field assignment - may need write barrier *)
   | OpAssign when (match e1.Type.eexpr with Type.TField (_, Type.FInstance _) -> true | _ -> false) ->
       convert_field_assign ctx e1 e2 pos
+  
+  (* Stack-allocated variable reassignment: reinitialize struct in-place via compound literal *)
+  | OpAssign when (match e1.Type.eexpr with
+      | Type.TLocal v -> Hashtbl.mem ctx.stack_alloc_vars v.v_id
+      | _ -> false) ->
+      let v = (match e1.Type.eexpr with Type.TLocal v -> v | _ -> assert false) in
+      let name = ident v.v_name in
+      let c = Hashtbl.find ctx.stack_alloc_vars v.v_id in
+      let class_name = flat_path c.cl_path in
+      let result_type = TCFibClass class_name in
+      (match e2.Type.eexpr with
+      | Type.TNew (tc, _, args) ->
+          (* Build compound literal: _stack_v = (ClassName){ ._obj.clazz = &ClassName_class, .f1 = a1, ... } *)
+          let field_inits = match tc.cl_constructor with
+            | Some cf ->
+                (match cf.cf_expr with
+                | Some { eexpr = TFunction f } ->
+                    let filtered_args = filter_void_args f.tf_args in
+                    let param_field_map = extract_param_field_mapping f in
+                    let buf = Buffer.create 64 in
+                    List.iter2 (fun (param_v, _) arg ->
+                      let field_name = try List.assoc param_v.v_id param_field_map
+                                       with Not_found -> param_v.v_name in
+                      let carg = convert_expr ctx arg in
+                      Buffer.add_string buf (Printf.sprintf ", .%s = %s" (ident field_name) (render_expr carg))
+                    ) filtered_args args;
+                    Buffer.contents buf
+                | _ -> "")
+            | None -> ""
+          in
+          let compound_lit = Printf.sprintf "_stack_%s = (%s){ ._obj.clazz = &%s_class%s }"
+            name class_name class_name field_inits in
+          mk_expr_pos (TCEComma [
+            mk_expr (TCERaw compound_lit) result_type;
+            mk_expr (TCELocal name) result_type
+          ]) result_type pos
+      | _ ->
+          (* Fallback: regular assignment (shouldn't normally happen for stack-alloc vars) *)
+          let e1_expr = convert_expr ctx e1 in
+          let e2_expr = convert_expr ctx e2 in
+          let assign = mk_expr_pos (TCEAssign (e1_expr, e2_expr)) e1_expr.ctype pos in
+          { assign with
+            pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts;
+            gc_roots = e1_expr.gc_roots + e2_expr.gc_roots })
   
   (* Regular assignment with FibDynamic boxing if needed *)
   | OpAssign ->
@@ -1619,18 +1682,45 @@ and convert_expr_as_stmt ctx (e : texpr) : tc_stmt list =
       List.concat_map (convert_expr_as_stmt ctx) exprs
   | TIf (cond, ethen, eelse_opt) ->
       let cond_expr = convert_expr ctx cond in
+      let saved_gc1 = gc_save_count ctx in
       let then_stmts = convert_expr_as_stmt ctx ethen in
-      let else_stmts = Option.map (convert_expr_as_stmt ctx) eelse_opt in
-      [TCSIf (cond_expr, then_stmts, else_stmts)]
+      let to_pop1 = gc_roots_to_pop ctx saved_gc1 in
+      let then_with_pop = if to_pop1 > 0 && not (ends_with_return ethen) then begin
+        ctx.gc_local_count <- saved_gc1;
+        then_stmts @ [TCSGCPop to_pop1]
+      end else begin
+        ctx.gc_local_count <- saved_gc1;
+        then_stmts
+      end in
+      let else_with_pop = match eelse_opt with
+        | None -> None
+        | Some eelse ->
+            let saved_gc2 = gc_save_count ctx in
+            let else_stmts = convert_expr_as_stmt ctx eelse in
+            let to_pop2 = gc_roots_to_pop ctx saved_gc2 in
+            if to_pop2 > 0 && not (ends_with_return eelse) then begin
+              ctx.gc_local_count <- saved_gc2;
+              Some (else_stmts @ [TCSGCPop to_pop2])
+            end else begin
+              ctx.gc_local_count <- saved_gc2;
+              Some else_stmts
+            end
+      in
+      [TCSIf (cond_expr, then_with_pop, else_with_pop)]
   | TWhile (cond, body, flag) ->
       let cond_expr = convert_expr ctx cond in
+      ctx.loop_depth <- ctx.loop_depth + 1;
       let saved_gc_count = gc_save_count ctx in
+      let yield_stmts = if ctx.loop_depth <= 1 then [TCSYieldPoint] else [] in
       let body_stmts = convert_expr_as_stmt ctx body in
       let to_pop = gc_roots_to_pop ctx saved_gc_count in
       let body_with_pop = if to_pop > 0 then begin
         ctx.gc_local_count <- saved_gc_count;
-        body_stmts @ [TCSGCPop to_pop]
-      end else body_stmts in
+        yield_stmts @ body_stmts @ [TCSGCPop to_pop]
+      end else
+        yield_stmts @ body_stmts
+      in
+      ctx.loop_depth <- ctx.loop_depth - 1;
       let is_do_while = (flag = DoWhile) in
       [TCSWhile (cond_expr, body_with_pop, is_do_while)]
   | TReturn expr_opt ->
@@ -1818,11 +1908,49 @@ and convert_field_access ctx obj fa result_tc pos =
         mk_expr_pos (TCECall (TCTFunc "fib_field_get", [safe_obj; field_name])) TCFibDynamic pos
       ) obj_expr
   
-  (* Closure field - method as value *)
-  | FClosure (_, cf) ->
-      (* This creates a closure wrapper around the method *)
-      (* For now, emit a TODO - this needs thunk generation *)
-      mk_expr_pos (TCERaw (Printf.sprintf "/* TODO: method closure %s */" cf.cf_name)) result_tc pos
+  (* Closure field - method as value (FClosure with known class) *)
+  | FClosure (Some (c, _), cf) ->
+      let class_name = flat_path c.cl_path in
+      let method_name = ident cf.cf_name in
+      let thunk_name = Printf.sprintf "__%s_%s_thunk" class_name method_name in
+      let dyn_thunk_name = thunk_name ^ "_dyn" in
+      (* Determine if this is a static method *)
+      let is_static = List.exists (fun scf -> scf.cf_name = cf.cf_name) c.cl_ordered_statics in
+      (* Get argument types and return type *)
+      let arg_types, ret_type = match Type.follow cf.cf_type with
+        | TFun (args, ret) -> 
+            (List.map (fun (n, _, t) -> (n, tc_type_of t)) args,
+             tc_type_of ret)
+        | _ -> ([], TCFibDynamic)
+      in
+      let arg_count = List.length arg_types in
+      (* Register the thunk for later generation *)
+      let thunk = {
+        mth_thunk_name = thunk_name;
+        mth_dyn_thunk_name = dyn_thunk_name;
+        mth_is_static = is_static;
+        mth_class_name = class_name;
+        mth_method_name = method_name;
+        mth_args = arg_types;
+        mth_ret_type = ret_type;
+      } in
+      Hashtbl.replace ctx.method_thunks thunk_name thunk;
+      (* Generate the method closure expression *)
+      let mc_obj = if is_static then None else Some obj_expr in
+      mk_expr_pos (TCEMethodClosure {
+        mc_thunk_name = thunk_name;
+        mc_dyn_thunk_name = dyn_thunk_name;
+        mc_is_static = is_static;
+        mc_arg_count = arg_count;
+        mc_obj = mc_obj;
+      }) TCFibClosure pos
+  
+  (* Closure field - method as value on dynamic/unknown object *)
+  | FClosure (None, cf) ->
+      (* Instance method reference on dynamic object - just access the field *)
+      wrap_single_gc_extraction (fun safe_obj ->
+        mk_expr_pos (TCEArrow (safe_obj, ident cf.cf_name)) result_tc pos
+      ) obj_expr
 
 (* ============================================================================
  * Array Access Conversion
@@ -2913,43 +3041,135 @@ and convert_stmt (ctx : conv_ctx) (e : texpr) : tc_stmt list =
   | TVar (v, init_opt) ->
       convert_tvar_stmt ctx v init_opt
   
-  (* Block of statements *)
+  (* Block of statements - flatten into parent scope to preserve variable lifetimes.
+   * We don't wrap in TCSBlock here because that creates C { } scopes which end
+   * variable lifetimes while GC roots still reference them. The caller (TWhile body,
+   * TIf branch, etc.) wraps in TCSBlock if scoping is needed. *)
   | TBlock exprs ->
-      [TCSBlock (List.concat_map (convert_stmt ctx) exprs)]
+      List.concat_map (convert_stmt ctx) exprs
   
-  (* If statement *)
+  (* If statement - save/restore GC roots around each branch to prevent
+   * roots from branch-scoped variables leaking into the enclosing scope.
+   * Skip pop if branch ends with return (return handles its own GC cleanup). *)
   | TIf (cond, ethen, eelse_opt) ->
       let cond_expr = convert_expr ctx cond in
+      (* Then branch with GC save/restore *)
+      let saved_gc1 = gc_save_count ctx in
       let then_stmts = convert_stmt ctx ethen in
-      let else_stmts = Option.map (convert_stmt ctx) eelse_opt in
-      [TCSIf (cond_expr, then_stmts, else_stmts)]
+      let to_pop1 = gc_roots_to_pop ctx saved_gc1 in
+      let then_with_pop = if to_pop1 > 0 && not (ends_with_return ethen) then begin
+        ctx.gc_local_count <- saved_gc1;
+        then_stmts @ [TCSGCPop to_pop1]
+      end else begin
+        ctx.gc_local_count <- saved_gc1;
+        then_stmts
+      end in
+      (* Else branch with GC save/restore *)
+      let else_with_pop = match eelse_opt with
+        | None -> None
+        | Some eelse ->
+            let saved_gc2 = gc_save_count ctx in
+            let else_stmts = convert_stmt ctx eelse in
+            let to_pop2 = gc_roots_to_pop ctx saved_gc2 in
+            if to_pop2 > 0 && not (ends_with_return eelse) then begin
+              ctx.gc_local_count <- saved_gc2;
+              Some (else_stmts @ [TCSGCPop to_pop2])
+            end else begin
+              ctx.gc_local_count <- saved_gc2;
+              Some else_stmts
+            end
+      in
+      [TCSIf (cond_expr, then_with_pop, else_with_pop)]
   
   (* While loop - save/restore GC roots around loop body to prevent
-   * unbounded temp root accumulation from loop-scoped GC pointer variables *)
+   * unbounded temp root accumulation from loop-scoped GC pointer variables.
+   * Also inject yield point for outer loops (depth <= 1) to allow fiber scheduling. *)
   | TWhile (cond, body, flag) ->
       let cond_expr = convert_expr ctx cond in
+      ctx.loop_depth <- ctx.loop_depth + 1;
       let saved_gc_count = gc_save_count ctx in
+      (* Yield point for outer loops - inner loops are short-lived *)
+      let yield_stmts = if ctx.loop_depth <= 1 then [TCSYieldPoint] else [] in
       let body_stmts = convert_stmt ctx body in
       let to_pop = gc_roots_to_pop ctx saved_gc_count in
       let body_with_pop = if to_pop > 0 then begin
         ctx.gc_local_count <- saved_gc_count;
-        body_stmts @ [TCSGCPop to_pop]
-      end else body_stmts in
+        yield_stmts @ body_stmts @ [TCSGCPop to_pop]
+      end else
+        yield_stmts @ body_stmts
+      in
+      ctx.loop_depth <- ctx.loop_depth - 1;
       let is_do_while = (flag = DoWhile) in
       [TCSWhile (cond_expr, body_with_pop, is_do_while)]
   
-  (* Return statement *)
+  (* Return statement - with GC root cleanup when inside a converted function.
+   * When func_gc_root_count >= 0, the function prologue pushed GC roots that
+   * must be popped before returning. gc_local_count tracks ALL roots (prologue +
+   * body locals). We evaluate the return expr, pop all roots, then return. *)
   | TReturn expr_opt ->
-      let ret_expr = match expr_opt with
-        | None -> None
+      if ctx.func_gc_root_count < 0 then begin
+        (* Legacy path — function prologue handled by gen_function in genfiberus.ml *)
+        let ret_expr = match expr_opt with
+          | None -> None
+          | Some inner ->
+              let inner_expr = convert_expr ctx inner in
+              match ctx.current_ret_type with
+              | Some ret_tc -> Some (coerce_to_type inner_expr ret_tc)
+              | None -> Some inner_expr
+        in
+        [TCSReturn ret_expr]
+      end else begin
+        (* C-AST function path — we own the GC cleanup *)
+        let total_to_pop = ctx.gc_local_count in
+        match expr_opt with
+        | None ->
+            if total_to_pop > 0 then
+              [TCSGCPop total_to_pop; TCSReturn None]
+            else
+              [TCSReturn None]
         | Some inner ->
             let inner_expr = convert_expr ctx inner in
-            (* Coerce to return type if known *)
-            match ctx.current_ret_type with
-            | Some ret_tc -> Some (coerce_to_type inner_expr ret_tc)
-            | None -> Some inner_expr
-      in
-      [TCSReturn ret_expr]
+            let cexpr = match ctx.current_ret_type with
+              | Some ret_tc -> coerce_to_type inner_expr ret_tc
+              | None -> inner_expr
+            in
+            let expr_gc_roots = cexpr.gc_roots in
+            let has_pending = cexpr.pending_stmts <> [] in
+            let all_to_pop = total_to_pop + expr_gc_roots in
+            (* For simple values with no cleanup needed, return directly *)
+            let is_simple = match inner.eexpr with
+              | TConst _ | TLocal _ -> true
+              | _ -> false
+            in
+            if is_simple && all_to_pop = 0 && not has_pending then
+              [TCSReturn (Some cexpr)]
+            else if is_simple && expr_gc_roots = 0 && not has_pending then begin
+              (* Simple value, only function-level roots to pop *)
+              if total_to_pop > 0 then
+                [TCSGCPop total_to_pop; TCSReturn (Some cexpr)]
+              else
+                [TCSReturn (Some cexpr)]
+            end else begin
+              (* Complex: store to temp, pop roots, return temp *)
+              let ret_type = cexpr.ctype in
+              let stmts = ref [] in
+              (* Emit pending statements *)
+              if has_pending then
+                stmts := !stmts @ cexpr.pending_stmts;
+              (* Declare __ret temp *)
+              stmts := !stmts @ [TCSVar {
+                vd_name = "__ret"; vd_type = ret_type;
+                vd_init = Some { cexpr with pending_stmts = [] };
+                vd_static = false; vd_const = false }];
+              (* Pop all roots *)
+              if all_to_pop > 0 then
+                stmts := !stmts @ [TCSGCPop all_to_pop];
+              (* Return temp *)
+              stmts := !stmts @ [TCSReturn (Some (mk_expr (TCELocal "__ret") ret_type))];
+              (* Wrap in block to scope __ret *)
+              [TCSBlock !stmts]
+            end
+      end
   
   (* Break *)
   | TBreak ->
@@ -2994,16 +3214,61 @@ and convert_stmt (ctx : conv_ctx) (e : texpr) : tc_stmt list =
       ) catches in
       [TCSTry { try_body = body_stmts; try_catches = catch_blocks }]
   
-  (* Switch *)
+  (* Switch - detect string switches and emit if/else chain instead of C switch *)
   | TSwitch sw ->
-      let cond_expr = convert_expr ctx sw.switch_subject in
-      let case_blocks = List.map (fun case ->
-        let value_exprs = List.map (convert_expr ctx) case.case_patterns in
-        let body_stmts = convert_stmt ctx case.case_expr in
-        (value_exprs, body_stmts)
-      ) sw.switch_cases in
-      let default_stmts = Option.map (convert_stmt ctx) sw.switch_default in
-      [TCSSwitch { sw_expr = cond_expr; sw_cases = case_blocks; sw_default = default_stmts }]
+      if is_string_type sw.switch_subject.etype then begin
+        (* String switch: emit if/else chain with fib_string_eq *)
+        let subj_expr = convert_expr ctx sw.switch_subject in
+        (* Store subject in a temp variable to avoid re-evaluation *)
+        let tmp_name = Printf.sprintf "_sw%d" (ctx.closure_counter) in
+        ctx.closure_counter <- ctx.closure_counter + 1;
+        let tmp_var = TCSVar { vd_name = tmp_name; vd_type = TCFibString;
+                               vd_init = Some { subj_expr with pending_stmts = [] };
+                               vd_static = false; vd_const = false } in
+        let tmp_ref = mk_expr (TCELocal tmp_name) TCFibString in
+        (* Build if/else chain *)
+        let cases = List.map (fun case ->
+          (* Join multiple patterns with || *)
+          let cond = match case.case_patterns with
+            | [pat] ->
+                let pat_expr = convert_expr ctx pat in
+                mk_expr (TCECall (TCTFunc "fib_string_eq", [tmp_ref; pat_expr])) TCBool
+            | pats ->
+                let pat_exprs = List.map (fun pat ->
+                  let pe = convert_expr ctx pat in
+                  mk_expr (TCECall (TCTFunc "fib_string_eq", [tmp_ref; pe])) TCBool
+                ) pats in
+                List.fold_left (fun acc e ->
+                  mk_expr (TCEBinop (TCOpBoolOr, acc, e)) TCBool
+                ) (List.hd pat_exprs) (List.tl pat_exprs)
+          in
+          let body = convert_stmt ctx case.case_expr in
+          (cond, body)
+        ) sw.switch_cases in
+        let default_stmts = Option.map (convert_stmt ctx) sw.switch_default in
+        (* Build nested if/else chain from cases *)
+        let rec build_chain = function
+          | [] -> (match default_stmts with
+                   | Some stmts -> stmts
+                   | None -> [])
+          | [(cond, body)] ->
+              [TCSIf (cond, body, default_stmts)]
+          | (cond, body) :: rest ->
+              let else_chain = build_chain rest in
+              [TCSIf (cond, body, Some else_chain)]
+        in
+        subj_expr.pending_stmts @ [tmp_var] @ build_chain cases
+      end else begin
+        (* Integer/enum switch - use C switch *)
+        let cond_expr = convert_expr ctx sw.switch_subject in
+        let case_blocks = List.map (fun case ->
+          let value_exprs = List.map (convert_expr ctx) case.case_patterns in
+          let body_stmts = convert_stmt ctx case.case_expr in
+          (value_exprs, body_stmts)
+        ) sw.switch_cases in
+        let default_stmts = Option.map (convert_stmt ctx) sw.switch_default in
+        [TCSSwitch { sw_expr = cond_expr; sw_cases = case_blocks; sw_default = default_stmts }]
+      end
   
   (* Expression statement *)
   | _ ->
@@ -3014,7 +3279,8 @@ and convert_stmt (ctx : conv_ctx) (e : texpr) : tc_stmt list =
  * Function Conversion
  * ============================================================================ *)
 
-(* Convert a Haxe function to C-AST function definition *)
+(* Convert a Haxe function to C-AST function definition (bare — no prologue/epilogue).
+   Used for closures and other contexts where the caller manages GC setup. *)
 let convert_function ctx name func is_static class_name_opt =
   let ret_type = tc_type_of func.tf_type in
   let args = List.map (fun (v, _) ->
@@ -3038,3 +3304,210 @@ let convert_function ctx name func is_static class_name_opt =
     fd_inline = false;
     fd_attrs = [];
   }
+
+(* Convert a Haxe class method to C-AST function definition WITH full prologue/epilogue.
+   Emits: FIB_GC_CTX, param root protection, GC safe point, debug assertions,
+   stack frame, escape analysis setup, and return-point GC cleanup.
+   This replaces gen_function in genfiberus.ml. *)
+let convert_class_method ctx name (func : tfunc) is_static class_name =
+  let ret_type = tc_type_of func.tf_type in
+  let filtered_args = filter_void_args func.tf_args in
+  let tc_args = List.map (fun (v, _) ->
+    { fa_name = ident v.v_name; fa_type = tc_type_of v.v_type }
+  ) filtered_args in
+  (* Add 'this' parameter for instance methods *)
+  let fd_args = if is_static then tc_args
+    else { fa_name = "this"; fa_type = TCFibClass class_name } :: tc_args
+  in
+  let func_name = Printf.sprintf "%s_%s" class_name name in
+  (* Run escape analysis *)
+  let escape_result = analyze_function func in
+  (* Build prologue *)
+  let prologue = ref [] in
+  (* 1. FIB_GC_CTX *)
+  prologue := !prologue @ [TCSGCCtx];
+  (* 2. Protect GC pointer parameters *)
+  let gc_param_count = List.fold_left (fun count (v, _) ->
+    let tc = tc_type_of v.v_type in
+    if needs_gc_root tc then begin
+      prologue := !prologue @ [TCSGCPush (mk_expr (TCELocal (ident v.v_name)) tc)];
+      count + 1
+    end else count
+  ) 0 filtered_args in
+  (* 3. Protect 'this' for instance methods *)
+  let gc_param_count = if not is_static then begin
+    prologue := !prologue @ [TCSGCPush (mk_expr (TCELocal "this") (TCFibClass class_name))];
+    gc_param_count + 1
+  end else gc_param_count in
+  (* 4. GC safe point — now that params are protected *)
+  prologue := !prologue @ [TCSGCSafePoint];
+  (* 5. Debug: save base root count for verification at return points *)
+  prologue := !prologue @ [
+    TCSRaw "#ifdef FIBERUS_DEBUG";
+    TCSRaw "size_t _gc_base_count = _fib_gc_ctx ? _fib_gc_ctx->tempRootCount : 0;";
+    TCSRaw "#endif";
+  ];
+  (* 6. Stack frame for source mapping *)
+  if ctx.debug_level > 0 then begin
+    let file = strip_file func.tf_expr.epos.pfile in
+    let line = Lexer.get_error_line func.tf_expr.epos in
+    prologue := !prologue @ [TCSStackFrame {
+      sf_class = class_name;
+      sf_func = name;
+      sf_file = file;
+      sf_line = line;
+    }]
+  end;
+  (* Convert body with full GC tracking *)
+  let body_ctx = {
+    ctx with
+    current_ret_type = Some ret_type;
+    gc_local_count = gc_param_count;
+    func_gc_root_count = gc_param_count;
+    fiber_mature_vars = escape_result.fiber_mature_vars;
+    stack_alloc_vars = escape_result.stack_allocatable;
+  } in
+  let body_stmts = convert_stmt body_ctx func.tf_expr in
+  (* Propagate closures and counters back to caller's context *)
+  ctx.closures <- body_ctx.closures @ ctx.closures;
+  ctx.closure_counter <- body_ctx.closure_counter;
+  ctx.spawn_counter <- body_ctx.spawn_counter;
+  (* Epilogue: pop GC roots for fall-through (non-return) paths *)
+  let epilogue = if body_ctx.gc_local_count > 0 && not (ends_with_return func.tf_expr) then
+    [TCSGCPop body_ctx.gc_local_count]
+  else [] in
+  {
+    fd_name = func_name;
+    fd_ret = ret_type;
+    fd_args = fd_args;
+    fd_body = !prologue @ body_stmts @ epilogue;
+    fd_static = false;
+    fd_inline = false;
+    fd_attrs = [];
+  }
+
+(* Check if constructor body needs GC context (allocations or GC pointer locals) *)
+let rec ctor_needs_gc_context (e : texpr) =
+  match e.eexpr with
+  | TNew _ -> true
+  | TCall ({ eexpr = TField (_, FStatic (_, cf)) }, _) when cf.cf_name = "new" -> true
+  | TVar (v, _) when needs_gc_root (tc_type_of v.v_type) -> true
+  | _ ->
+      let found = ref false in
+      Type.iter (fun e -> if ctor_needs_gc_context e then found := true) e;
+      !found
+
+(* Convert a Haxe constructor to two C-AST function definitions:
+   1. ClassName_init(this, args) — initializes fields on existing object
+   2. ClassName_new(args) — allocates and calls _init
+   Returns None for empty constructors or simple constructors (handled in header).
+   This replaces gen_constructor in genfiberus.ml. *)
+let convert_constructor ctx (c : tclass) =
+  let class_name = match ctx.current_class_name with
+    | Some n -> n | None -> flat_path c.cl_path in
+  match c.cl_constructor with
+  | None -> None
+  | Some cf ->
+      (match cf.cf_expr with
+      | Some { eexpr = TFunction func } ->
+          if FiberusGenClass.is_simple_constructor func then
+            None  (* Simple constructors generated inline in header *)
+          else begin
+            let filtered_args = filter_void_args func.tf_args in
+            let tc_args = List.map (fun (v, _) ->
+              { fa_name = ident v.v_name; fa_type = tc_type_of v.v_type }
+            ) filtered_args in
+            let escape_result = analyze_function func in
+            let init_needs_gc_ctx = ctor_needs_gc_context func.tf_expr in
+            (* === _init function === *)
+            let init_prologue = ref [] in
+            let init_gc_count = ref 0 in
+            if init_needs_gc_ctx then begin
+              init_prologue := [TCSGCCtx];
+              (* Protect GC pointer parameters *)
+              List.iter (fun (v, _) ->
+                let tc = tc_type_of v.v_type in
+                if needs_gc_root tc then begin
+                  init_prologue := !init_prologue @ [TCSGCPush (mk_expr (TCELocal (ident v.v_name)) tc)];
+                  init_gc_count := !init_gc_count + 1
+                end
+              ) filtered_args;
+              (* Protect 'this' *)
+              init_prologue := !init_prologue @ [TCSGCPush (mk_expr (TCELocal "this") (TCFibClass class_name))];
+              init_gc_count := !init_gc_count + 1
+            end;
+            let init_body_ctx = {
+              ctx with
+              current_ret_type = None;  (* Constructors don't return values *)
+              gc_local_count = !init_gc_count;
+              func_gc_root_count = !init_gc_count;
+              fiber_mature_vars = escape_result.fiber_mature_vars;
+              stack_alloc_vars = escape_result.stack_allocatable;
+            } in
+            let init_body_stmts = convert_stmt init_body_ctx func.tf_expr in
+            (* Propagate closures and counters back *)
+            ctx.closures <- init_body_ctx.closures @ ctx.closures;
+            ctx.closure_counter <- init_body_ctx.closure_counter;
+            ctx.spawn_counter <- init_body_ctx.spawn_counter;
+            let init_epilogue = if init_body_ctx.gc_local_count > 0 then
+              [TCSGCPop init_body_ctx.gc_local_count]
+            else [] in
+            let init_func = {
+              fd_name = Printf.sprintf "%s_init" class_name;
+              fd_ret = TCVoid;
+              fd_args = { fa_name = "this"; fa_type = TCFibClass class_name } :: tc_args;
+              fd_body = !init_prologue @ init_body_stmts @ init_epilogue;
+              fd_static = false;
+              fd_inline = false;
+              fd_attrs = [];
+            } in
+            (* === _new function === *)
+            let gc_param_args = List.filter (fun (v, _) ->
+              needs_gc_root (tc_type_of v.v_type)
+            ) filtered_args in
+            let has_gc_params = gc_param_args <> [] in
+            let new_prologue = ref [] in
+            if has_gc_params then begin
+              new_prologue := [TCSGCCtx];
+              List.iter (fun (v, _) ->
+                let tc = tc_type_of v.v_type in
+                new_prologue := !new_prologue @ [TCSGCPush (mk_expr (TCELocal (ident v.v_name)) tc)]
+              ) gc_param_args
+            end;
+            (* Allocate 'this' — mature or nursery depending on fiber capture analysis *)
+            let alloc_func = if escape_result.this_needs_mature then
+              "gc_alloc_mature_object_with_class"
+            else
+              "gc_alloc_object_with_class"
+            in
+            let alloc_stmt = TCSVar {
+              vd_name = "this"; vd_type = TCFibClass class_name;
+              vd_init = Some (mk_expr (TCERaw (Printf.sprintf "%s(sizeof(%s), &%s_class)"
+                alloc_func class_name class_name)) (TCFibClass class_name));
+              vd_static = false; vd_const = false;
+            } in
+            (* Call _init *)
+            let arg_names = List.map (fun (v, _) ->
+              mk_expr (TCELocal (ident v.v_name)) (tc_type_of v.v_type)
+            ) filtered_args in
+            let init_call = TCSExpr (mk_expr (TCECall (
+              TCTFunc (Printf.sprintf "%s_init" class_name),
+              mk_expr (TCELocal "this") (TCFibClass class_name) :: arg_names
+            )) TCVoid) in
+            (* Pop GC params before return *)
+            let new_epilogue = if has_gc_params then
+              [TCSGCPop (List.length gc_param_args)]
+            else [] in
+            let return_this = TCSReturn (Some (mk_expr (TCELocal "this") (TCFibClass class_name))) in
+            let new_func = {
+              fd_name = Printf.sprintf "%s_new" class_name;
+              fd_ret = TCFibClass class_name;
+              fd_args = (if tc_args = [] then [] else tc_args);
+              fd_body = !new_prologue @ [alloc_stmt; init_call] @ new_epilogue @ [return_this];
+              fd_static = false;
+              fd_inline = false;
+              fd_attrs = [];
+            } in
+            Some (init_func, new_func)
+          end
+      | _ -> None)

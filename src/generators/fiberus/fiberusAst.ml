@@ -183,6 +183,13 @@ and tc_expr_kind =
       cc_arg_count: int;
       cc_for_fiber: bool;                     (* Use fib_closure_create_for_fiber *)
     }
+  | TCEMethodClosure of {                  (* Create FibClosure from method reference *)
+      mc_thunk_name: string;                 (* Typed thunk function name *)
+      mc_dyn_thunk_name: string;             (* Dynamic thunk function name *)
+      mc_is_static: bool;                    (* Static methods don't capture 'this' *)
+      mc_arg_count: int;                     (* Number of method arguments *)
+      mc_obj: tc_expr option;                (* 'this' expr for instance methods; None for static *)
+    }
   
   (* Memory *)
   | TCEAlloc of string * tc_expr option     (* gc_alloc with optional size expr *)
@@ -375,6 +382,24 @@ and tc_func_sig = {
   fs_name: string;
   fs_ret: tc_type;
   fs_args: tc_type list;
+}
+
+(* ============================================================================
+ * Method Thunk Representation (for FClosure / method-as-value)
+ * ============================================================================ *)
+
+(* A method thunk wraps a class method so it can be called via FibClosure.
+ * Two functions are generated per thunk:
+ *   - Typed thunk: takes typed parameters, calls the real method
+ *   - Dynamic thunk: takes FibDynamic params, unboxes, calls typed thunk *)
+type tc_method_thunk = {
+  mth_thunk_name: string;           (* e.g. __ClassName_method_thunk *)
+  mth_dyn_thunk_name: string;       (* e.g. __ClassName_method_thunk_dyn *)
+  mth_is_static: bool;              (* Static methods don't capture 'this' *)
+  mth_class_name: string;           (* C name of the class *)
+  mth_method_name: string;          (* C name of the method *)
+  mth_args: (string * tc_type) list; (* (param_name, param_type) pairs *)
+  mth_ret_type: tc_type;            (* Return type *)
 }
 
 (* ============================================================================

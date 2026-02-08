@@ -520,6 +520,25 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
         write w ")"
       end
   
+  (* Method closure - create FibClosure from method reference *)
+  | TCEMethodClosure mc ->
+      if mc.mc_is_static then begin
+        (* Static method - no captures *)
+        writef w "fib_closure_create((void*)%s, (void*)%s, 0, %d)"
+          mc.mc_thunk_name mc.mc_dyn_thunk_name mc.mc_arg_count
+      end else begin
+        (* Instance method - capture 'this' in captures[0].
+         * Uses FIB_METHOD_CLOSURE macro to avoid GCC statement expressions.
+         * Macro: FIB_METHOD_CLOSURE(typed_thunk, dyn_thunk, arg_count, this_ptr) *)
+        write w "FIB_METHOD_CLOSURE(";
+        writef w "(void*)%s, (void*)%s, %d, (FibObject*)"
+          mc.mc_thunk_name mc.mc_dyn_thunk_name mc.mc_arg_count;
+        (match mc.mc_obj with
+         | Some obj -> write_expr w obj
+         | None -> write w "NULL");
+        write w ")"
+      end
+  
   | TCERaw s ->
       write w s
 
@@ -1237,6 +1256,119 @@ let write_closures (w : writer) (closures : tc_closure list) ~(debug_level : int
     write w "/* Closure implementations */";
     newline w;
     List.iter (fun cl -> write_closure w cl ~debug_level) closures
+  end
+
+(* ============================================================================
+ * Method Thunk Generation (for FClosure / method-as-value)
+ * ============================================================================ *)
+
+(* Generate forward declarations for a method thunk *)
+let write_method_thunk_forward_decl (w : writer) (thunk : tc_method_thunk) : unit =
+  (* Typed thunk forward declaration *)
+  write w "static ";
+  write_type w thunk.mth_ret_type;
+  writef w " %s(FibClosure* _c" thunk.mth_thunk_name;
+  List.iteri (fun i (name, typ) ->
+    write w ", ";
+    let param_name = if name = "" then Printf.sprintf "_arg%d" i else name in
+    write_type_with_name w typ param_name
+  ) thunk.mth_args;
+  write w ");";
+  newline w;
+  (* Dynamic thunk forward declaration *)
+  writef w "static FibDynamic %s(FibClosure* _c" thunk.mth_dyn_thunk_name;
+  List.iteri (fun i _ ->
+    writef w ", FibDynamic _arg%d" i
+  ) thunk.mth_args;
+  write w ");";
+  newline w
+
+(* Generate the typed thunk function *)
+let write_method_thunk_typed (w : writer) (thunk : tc_method_thunk) : unit =
+  write w "static ";
+  write_type w thunk.mth_ret_type;
+  writef w " %s(FibClosure* _c" thunk.mth_thunk_name;
+  List.iteri (fun i (name, typ) ->
+    write w ", ";
+    let param_name = if name = "" then Printf.sprintf "_arg%d" i else name in
+    write_type_with_name w typ param_name
+  ) thunk.mth_args;
+  write w ") {";
+  newline w;
+  indent w;
+  (* Call the actual method *)
+  if thunk.mth_ret_type <> TCVoid then write w "return ";
+  writef w "%s_%s(" thunk.mth_class_name thunk.mth_method_name;
+  (* For instance methods, extract 'this' from captures[0] *)
+  if not thunk.mth_is_static then begin
+    writef w "(%s*)fib_dynamic_to_object(_c->captures[0])" thunk.mth_class_name;
+    if thunk.mth_args <> [] then write w ", "
+  end;
+  List.iteri (fun i (name, _) ->
+    if i > 0 then write w ", ";
+    if name = "" then writef w "_arg%d" i else write w name
+  ) thunk.mth_args;
+  write w ");";
+  newline w;
+  dedent w;
+  write w "}";
+  newline w
+
+(* Generate the dynamic thunk function *)
+let write_method_thunk_dynamic (w : writer) (thunk : tc_method_thunk) : unit =
+  writef w "static FibDynamic %s(FibClosure* _c" thunk.mth_dyn_thunk_name;
+  List.iteri (fun i _ ->
+    writef w ", FibDynamic _arg%d" i
+  ) thunk.mth_args;
+  write w ") {";
+  newline w;
+  indent w;
+  (* Convert FibDynamic args to typed *)
+  List.iteri (fun i (_, typ) ->
+    write_type w typ;
+    writef w " _typed%d = %s;" i (unbox_from_dynamic (Printf.sprintf "_arg%d" i) typ);
+    newline w
+  ) thunk.mth_args;
+  (* Call the typed thunk *)
+  let typed_call_args = String.concat ", " (
+    "_c" :: List.mapi (fun i _ -> Printf.sprintf "_typed%d" i) thunk.mth_args
+  ) in
+  if thunk.mth_ret_type = TCVoid then begin
+    writef w "%s(%s);" thunk.mth_thunk_name typed_call_args;
+    newline w;
+    write w "return fib_dynamic_null();";
+    newline w
+  end else begin
+    writef w "return %s;" (box_to_dynamic 
+      (Printf.sprintf "%s(%s)" thunk.mth_thunk_name typed_call_args) 
+      thunk.mth_ret_type);
+    newline w
+  end;
+  dedent w;
+  write w "}";
+  newline w
+
+(* Generate a complete method thunk (typed + dynamic) *)
+let write_method_thunk (w : writer) (thunk : tc_method_thunk) : unit =
+  write_method_thunk_typed w thunk;
+  write_method_thunk_dynamic w thunk;
+  newline w
+
+(* Generate forward declarations for multiple method thunks *)
+let write_method_thunks_forward_decls (w : writer) (thunks : tc_method_thunk list) : unit =
+  if thunks <> [] then begin
+    write w "/* Method thunk forward declarations */";
+    newline w;
+    List.iter (write_method_thunk_forward_decl w) thunks;
+    newline w
+  end
+
+(* Generate implementations for multiple method thunks *)
+let write_method_thunks (w : writer) (thunks : tc_method_thunk list) : unit =
+  if thunks <> [] then begin
+    write w "/* Method thunks for closure wrapping */";
+    newline w;
+    List.iter (write_method_thunk w) thunks
   end
 
 (* ============================================================================
