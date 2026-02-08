@@ -102,6 +102,7 @@ let make_conv_ctx ctx =
     FiberusConvert.in_fiber_spawn = ctx.in_fiber_spawn;
     FiberusConvert.spawn_counter = ctx.spawn_counter;
     FiberusConvert.fiber_mature_vars = ctx.fiber_mature_vars;
+    FiberusConvert.stack_alloc_vars = ctx.stack_alloc_vars;
     FiberusConvert.debug_level = ctx.debug_level;
   }
 
@@ -155,6 +156,21 @@ let emit_cstmt_inline ctx (cstmt : tc_stmt) =
   let s = if String.length s > 0 && s.[String.length s - 1] = '\n' 
           then String.sub s 0 (String.length s - 1) else s in
   spr ctx s
+
+(* Emit multiple C-AST statements, compatible with gen_expr context where
+ * the caller will add a trailing "; newline" after the last one.
+ * All statements except the last get their own "; newline".
+ * The last statement is emitted without trailing newline so the caller can add ";". *)
+let emit_cstmts_for_gen_expr ctx stmts =
+  let rec emit = function
+    | [] -> ()
+    | [stmt] -> emit_cstmt_inline ctx stmt
+    | stmt :: rest ->
+        emit_cstmt_inline ctx stmt;
+        newline ctx;
+        emit rest
+  in
+  emit stmts
 
 (* Emit a C-AST statement without trailing semicolon or newline - for gen_value context *)
 let emit_cstmt_no_semi ctx (cstmt : tc_stmt) =
@@ -1316,74 +1332,17 @@ and gen_value ctx e =
 		let new_closures = sync_closures_from_conv ctx conv_ctx in
 		ctx.closures <- new_closures @ ctx.closures;
 		emit_cexpr ctx cexpr
-	| TVar (v, eo) ->
-		(* Check if this variable needs mature allocation for fiber cross-thread safety *)
-		let is_fiber_mature = Hashtbl.mem ctx.fiber_mature_vars v.v_id in
-		if is_fiber_mature then begin
-			spr ctx "gc_force_mature_begin();";
-			newline ctx
-		end;
-		(* Check if this variable can be stack-allocated *)
-		let is_stack_alloc = Hashtbl.mem ctx.stack_alloc_vars v.v_id in
-		if is_stack_alloc then begin
-			(* Stack allocation: declare struct on stack, then take address *)
-			let c = Hashtbl.find ctx.stack_alloc_vars v.v_id in
-			let class_name = flat_path c.cl_path in
-			(* Declare the struct on the stack with just the class pointer *)
-			print ctx "%s _stack_%s = { ._obj.clazz = &%s_class };" class_name (ident v.v_name) class_name;
-			newline ctx;
-			(* Declare the pointer variable pointing to the stack struct *)
-			print ctx "%s* %s = &_stack_%s;" class_name (ident v.v_name) (ident v.v_name);
-			newline ctx;
-			(* Call init function with constructor arguments *)
-			print ctx "%s_init(%s" class_name (ident v.v_name);
-			(match eo with
-			| Some { eexpr = TNew (tc, _, args) } when List.length args > 0 ->
-				spr ctx ", ";
-				let param_types = match tc.cl_constructor with
-					| Some cf -> get_param_types cf.cf_type
-					| None -> []
-				in
-				gen_call_args ctx args param_types gen_value
-			| _ -> ());
-			spr ctx ");";
-			newline ctx;
-			(* CRITICAL: Push temp roots for each GC-pointer field of the stack-allocated object.
-			 * This enables eliminating conservative stack scanning in minor GC, since all
-			 * GC pointers are now precisely tracked via temp roots. *)
-			List.iter (fun cf ->
-				match cf.cf_kind with
-				| Var _ when needs_gc_root ctx cf.cf_type ->
-					print ctx "gc_push_temp_root_ctx(FIB_CTX, (void**)&%s->%s);" (ident v.v_name) (ident cf.cf_name);
-					newline ctx;
-					ctx.gc_local_count <- ctx.gc_local_count + 1
-				| _ -> ()
-			) c.cl_ordered_fields
-		end else begin
-			(* Normal heap allocation path *)
-			(* Special handling for function types - use FibClosure* *)
-			(match follow v.v_type with
-			| TFun _ ->
-				(* All closures use FibClosure* for uniformity - volatile for GC safety *)
-				print ctx "FibClosure* volatile %s" (ident v.v_name)
-			| _ ->
-				(* Use volatile for GC pointer types to prevent register optimization *)
-				let type_str = s_type ctx v.v_type in
-				if String.length type_str > 0 && type_str.[String.length type_str - 1] = '*' then
-					print ctx "%s volatile %s" type_str (ident v.v_name)
-				else
-					print ctx "%s %s" type_str (ident v.v_name));
-			(match eo with
-			| None -> ()
-			| Some e ->
-				spr ctx " = ";
-				gen_coerce_with_expr ctx e.etype v.v_type (Some e) (fun () -> gen_value ctx e))
-		end;
-		if is_fiber_mature then begin
-			spr ctx ";";
-			newline ctx;
-			spr ctx "gc_force_mature_end()"
-		end
+	| TVar _ ->
+		(* Route through C-AST pipeline for variable declarations *)
+		let conv_ctx = make_conv_ctx ctx in
+		let stmts = FiberusConvert.convert_stmt conv_ctx e in
+		(* Sync closures and GC count back to main context *)
+		let new_closures = sync_closures_from_conv ctx conv_ctx in
+		if new_closures <> [] then ctx.closures <- new_closures @ ctx.closures;
+		ctx.gc_local_count <- conv_ctx.gc_local_count;
+		(* In gen_value context, emit statements directly - 
+		 * each write_stmt adds its own ; and newline *)
+		List.iter (fun stmt -> emit_cstmt_inline ctx stmt) stmts
 	| TBlock el ->
 		(* Block used as value - use C-AST pipeline with GC tracking *)
 		let conv_ctx = make_conv_ctx ctx in
@@ -1592,117 +1551,15 @@ and gen_expr ctx e =
 			print ctx "; gc_pop_temp_roots_ctx(FIB_CTX, %d)" cexpr.gc_roots
 	| TFunction _ ->
 		()  (* Function expressions handled elsewhere *)
-	| TVar (v, eo) ->
-		(* Check if this variable needs mature allocation for fiber cross-thread safety *)
-		let is_fiber_mature = Hashtbl.mem ctx.fiber_mature_vars v.v_id in
-		if is_fiber_mature then begin
-			spr ctx "gc_force_mature_begin();";
-			newline ctx
-		end;
-		(* Check if this variable can be stack-allocated *)
-		let is_stack_alloc = Hashtbl.mem ctx.stack_alloc_vars v.v_id in
-		if is_stack_alloc then begin
-			(* Stack allocation: declare struct on stack, then take address *)
-			let c = Hashtbl.find ctx.stack_alloc_vars v.v_id in
-			let class_name = flat_path c.cl_path in
-			(* Declare the struct on the stack with just the class pointer *)
-			print ctx "%s _stack_%s = { ._obj.clazz = &%s_class };" class_name (ident v.v_name) class_name;
-			newline ctx;
-			(* Declare the pointer variable pointing to the stack struct *)
-			print ctx "%s* %s = &_stack_%s;" class_name (ident v.v_name) (ident v.v_name);
-			newline ctx;
-			(* Call init function with constructor arguments *)
-			print ctx "%s_init(%s" class_name (ident v.v_name);
-			(match eo with
-			| Some { eexpr = TNew (tc, _, args) } when List.length args > 0 ->
-				spr ctx ", ";
-				let param_types = match tc.cl_constructor with
-					| Some cf -> get_param_types cf.cf_type
-					| None -> []
-				in
-				gen_call_args ctx args param_types gen_value
-			| _ -> ());
-			spr ctx ");";
-			newline ctx;
-			(* CRITICAL: Push temp roots for each GC-pointer field of the stack-allocated object.
-			 * This enables eliminating conservative stack scanning in minor GC, since all
-			 * GC pointers are now precisely tracked via temp roots. *)
-			List.iter (fun cf ->
-				match cf.cf_kind with
-				| Var _ when needs_gc_root ctx cf.cf_type ->
-					print ctx "gc_push_temp_root_ctx(FIB_CTX, (void**)&%s->%s);" (ident v.v_name) (ident cf.cf_name);
-					newline ctx;
-					ctx.gc_local_count <- ctx.gc_local_count + 1
-				| _ -> ()
-			) c.cl_ordered_fields
-		end else begin
-			(* Normal heap allocation path *)
-			(* Get type string to check if it's a GC pointer *)
-			let type_str = match follow v.v_type with
-				| TFun _ -> "FibClosure*"
-				| _ -> s_type ctx v.v_type
-			in
-			let is_gc_ptr = String.length type_str > 0 && type_str.[String.length type_str - 1] = '*' in
-			(* Track gc_roots from initializer for proper cleanup order *)
-			let init_gc_roots = ref 0 in
-			(match eo with
-			| None ->
-				(* No initializer - just declare the variable *)
-				print ctx "%s %s" type_str (ident v.v_name)
-			| Some e ->
-				(* Convert to C-AST first to get pending_stmts and gc_roots *)
-				let conv_ctx = make_conv_ctx ctx in
-				let cexpr = FiberusConvert.convert_expr conv_ctx e in
-				(* Sync closures back to main context - critical for TFunction initializers! *)
-				let new_closures = sync_closures_from_conv ctx conv_ctx in
-				if new_closures <> [] then ctx.closures <- new_closures @ ctx.closures;
-				init_gc_roots := cexpr.gc_roots;
-				(* IMPORTANT: Emit pending_stmts BEFORE the variable declaration.
-				 * These contain temp variable declarations needed by the initializer. *)
-				if cexpr.pending_stmts <> [] then begin
-					let w = FiberusSourceWriter.create () in
-					List.iter (FiberusSourceWriter.write_stmt w) cexpr.pending_stmts;
-					spr ctx (FiberusSourceWriter.contents w)
-				end;
-				(* Now emit the variable declaration with initializer *)
-				print ctx "%s %s = " type_str (ident v.v_name);
-				(* Emit with proper coercion *)
-				let from_tc = cexpr.ctype in
-				let to_tc = tc_type_of v.v_type in
-				if from_tc = to_tc then
-					emit_cexpr ctx cexpr
-				else
-					(* Need coercion - emit via coerce function *)
-					gen_coerce_with_expr ctx e.etype v.v_type (Some e) (fun () -> emit_cexpr ctx cexpr));
-			(* For GC pointer types:
-			 * 1. FIRST pop expression-level roots from the initializer
-			 * 2. THEN push the variable as a root - this protects the value
-			 * 
-			 * This order is critical because temp roots are a LIFO stack:
-			 * - If we push first then pop, we pop the variable we just pushed!
-			 * - By popping first, we remove the temp var (e.g., _gc_tmp90)
-			 * - Then push the real variable (e.g., html) which stays protected
-			 * 
-			 * The object is briefly unprotected between pop and push, but since
-			 * gc_push_temp_root_ctx doesn't allocate, no GC can trigger. *)
-			if is_gc_ptr then begin
-				if !init_gc_roots > 0 then begin
-					print ctx "; gc_pop_temp_roots_ctx(FIB_CTX, %d)" !init_gc_roots
-				end;
-				spr ctx "; gc_push_temp_root_ctx(FIB_CTX, (void**)&";
-				spr ctx (ident v.v_name);
-				spr ctx ")";
-				ctx.gc_local_count <- ctx.gc_local_count + 1
-			end else if !init_gc_roots > 0 then begin
-				(* Non-GC pointer type but init had gc_roots - still need to pop *)
-				print ctx "; gc_pop_temp_roots_ctx(FIB_CTX, %d)" !init_gc_roots
-			end
-		end;
-		if is_fiber_mature then begin
-			spr ctx ";";
-			newline ctx;
-			spr ctx "gc_force_mature_end()"
-		end
+	| TVar _ ->
+		(* Route through C-AST pipeline for variable declarations *)
+		let conv_ctx = make_conv_ctx ctx in
+		let stmts = FiberusConvert.convert_stmt conv_ctx e in
+		(* Sync closures and GC count back to main context *)
+		let new_closures = sync_closures_from_conv ctx conv_ctx in
+		if new_closures <> [] then ctx.closures <- new_closures @ ctx.closures;
+		ctx.gc_local_count <- conv_ctx.gc_local_count;
+		emit_cstmts_for_gen_expr ctx stmts
 	| TBlock el ->
 		let b = open_block_for_exprs ctx el in
 		List.iter (fun e ->
@@ -1912,114 +1769,11 @@ and gen_expr ctx e =
 				newline ctx);
 			b ()
 		end
-	| TTry (e, catches) ->
-		(* Generate try-catch using setjmp/longjmp *)
-		let jmp = temp ctx in
-		let exc = temp ctx in
-		let gc_save = temp ctx in
-		let stack_save = temp ctx in
-		spr ctx "{";
-		newline ctx;
-		ctx.tabs <- ctx.tabs ^ "\t";
-		print ctx "jmp_buf %s;" jmp;
-		newline ctx;
-		(* Save GC root count before try - will restore on exception *)
-		(* FIB_CTX is now FiberGCContext*, so use tempRootCount (not mTempRootCount) *)
-		print ctx "size_t %s = FIB_CTX ? FIB_CTX->tempRootCount : 0;" gc_save;
-		newline ctx;
-		(* Save stack frame count - longjmp bypasses cleanup handlers *)
-		print ctx "int %s = fib_current_fiber() ? fib_current_fiber()->stackFrameCount : 0;" stack_save;
-		newline ctx;
-		print ctx "fib_exc_push(&%s);" jmp;
-		newline ctx;
-		print ctx "if (setjmp(%s) == 0) {" jmp;
-		newline ctx;
-		ctx.tabs <- ctx.tabs ^ "\t";
-		gen_expr ctx e;
-		newline ctx;
-		spr ctx "fib_exc_pop();";
-		ctx.tabs <- String.sub ctx.tabs 0 (String.length ctx.tabs - 1);
-		newline ctx;
-		spr ctx "} else {";
-		newline ctx;
-		ctx.tabs <- ctx.tabs ^ "\t";
-		(* Restore GC roots to pre-try level - longjmp skipped cleanup code *)
-		(* FIB_CTX is now FiberGCContext*, so use tempRootCount (not mTempRootCount) *)
-		print ctx "if (FIB_CTX && FIB_CTX->tempRootCount > %s) FIB_CTX->tempRootCount = %s;" gc_save gc_save;
-		newline ctx;
-		(* Restore stack frame count - longjmp bypassed cleanup handlers *)
-		print ctx "if (fib_current_fiber()) fib_current_fiber()->stackFrameCount = %s;" stack_save;
-		newline ctx;
-		print ctx "FibDynamic %s = fib_current_exception();" exc;
-		newline ctx;
-		(* Stop exception unwinding - exception stack is now complete *)
-		spr ctx "fib_exception_catch();";
-		newline ctx;
-		(* Generate catch clauses with proper type checking *)
-		let first = ref true in
-		List.iter (fun (v, catch_e) ->
-			let catch_type = s_type ctx v.v_type in
-			(* Generate type check condition *)
-			let gen_type_check () =
-				if catch_type = "FibDynamic" then
-					(* Dynamic catches everything - no condition needed *)
-					spr ctx "1"
-				else if catch_type = "int32_t" then
-					print ctx "%s.type == FIB_TYPE_INT" exc
-				else if catch_type = "double" then
-					print ctx "%s.type == FIB_TYPE_FLOAT" exc
-				else if catch_type = "bool" then
-					print ctx "%s.type == FIB_TYPE_BOOL" exc
-				else if catch_type = "FibString*" then
-					print ctx "%s.type == FIB_TYPE_STRING" exc
-				else begin
-					(* Object type - check FIB_TYPE_OBJECT and instanceof *)
-					let class_name = String.sub catch_type 0 (String.length catch_type - 1) in (* Remove * *)
-					print ctx "(%s.type == FIB_TYPE_OBJECT && fib_object_instanceof(%s.data.objectVal, &%s_class))"
-						exc exc class_name
-				end
-			in
-			if !first then begin
-				first := false;
-				print ctx "if (";
-				gen_type_check ();
-				spr ctx ")"
-			end else begin
-				spr ctx " else if (";
-				gen_type_check ();
-				spr ctx ")"
-			end;
-			newline ctx;
-			spr ctx "{";
-			newline ctx;
-			ctx.tabs <- ctx.tabs ^ "\t";
-			(* Assign exception to catch variable with proper extraction *)
-			print ctx "%s %s = " catch_type (ident v.v_name);
-			if catch_type = "FibDynamic" then
-				print ctx "%s" exc
-			else if catch_type = "int32_t" then
-				print ctx "fib_dynamic_to_int(%s)" exc
-			else if catch_type = "double" then
-				print ctx "fib_dynamic_to_float(%s)" exc
-			else if catch_type = "bool" then
-				print ctx "%s.data.boolVal" exc
-			else if catch_type = "FibString*" then
-				print ctx "fib_dynamic_to_string(%s)" exc
-			else
-				print ctx "(%s)%s.data.objectVal" catch_type exc;
-			spr ctx ";";
-			newline ctx;
-			gen_expr ctx catch_e;
-			ctx.tabs <- String.sub ctx.tabs 0 (String.length ctx.tabs - 1);
-			newline ctx;
-			spr ctx "}"
-		) catches;
-		ctx.tabs <- String.sub ctx.tabs 0 (String.length ctx.tabs - 1);
-		newline ctx;
-		spr ctx "}";
-		ctx.tabs <- String.sub ctx.tabs 0 (String.length ctx.tabs - 1);
-		newline ctx;
-		spr ctx "}"
+	| TTry _ ->
+		(* Route through C-AST pipeline for try/catch *)
+		let conv_ctx = make_conv_ctx ctx in
+		let stmts = FiberusConvert.convert_stmt conv_ctx e in
+		List.iter (fun stmt -> emit_cstmt_inline ctx stmt) stmts
 	| TReturn eo ->
 		(* Handle GC roots cleanup before return.
 		 * We need to pop:
@@ -2899,430 +2653,12 @@ let gen_header ctx com =
 	spr ctx "#include \"date.h\"\n";
 	spr ctx "\n";
 
-	(* Fiber yield point macro - uses runtime scheduler_should_yield from scheduler.h *)
-	spr ctx "/* Fiber yield point - for loop back-edges (cooperative scheduling only) */\n";
-	spr ctx "#define FIBER_YIELD_POINT() do { \\\n";
-	spr ctx "\tif (scheduler_should_yield()) fiber_yield(); \\\n";
-	spr ctx "} while(0)\n\n";
-
-	(* GC safe point macro - for function entry where stack is clean *)
-	spr ctx "/* GC safe point - called at function entry where temporaries are out of scope */\n";
-	spr ctx "#define GC_SAFE_POINT() do { \\\n";
-	spr ctx "\tgc_maybe_collect(); \\\n";
-	spr ctx "\tif (scheduler_should_yield()) fiber_yield(); \\\n";
-	spr ctx "} while(0)\n\n";
-
-	(* GC disable scope guard - uses GCC cleanup attribute for RAII-style enable on scope exit *)
-	spr ctx "/* GC disable scope guard - auto-enables on ANY scope exit (return, break, etc) */\n";
-	spr ctx "static inline void _gc_scope_cleanup(int* p) { (void)p; gc_enable(); }\n";
-	spr ctx "#define GC_DISABLE_SCOPE() \\\n";
-	spr ctx "\tgc_disable(); \\\n";
-	spr ctx "\tint _gc_scope_guard __attribute__((cleanup(_gc_scope_cleanup))) = 0; \\\n";
-	spr ctx "\t(void)_gc_scope_guard\n\n";
-
-	(* Helper macros *)
-	spr ctx "/* Runtime helpers */\n";
-	spr ctx "static inline void fib_trace(FibString* s) {\n";
-	spr ctx "\tprintf(\"%s\\n\", fib_string_data(s));\n";
-	spr ctx "}\n\n";
-	(* fib_dynamic_is_null is now in object.h *)
-	spr ctx "static inline bool fib_dynamic_is_string(FibDynamic v) {\n";
-	spr ctx "\treturn v.type == FIB_TYPE_STRING;\n";
-	spr ctx "}\n\n";
-	spr ctx "static inline bool fib_dynamic_is_array(FibDynamic v) {\n";
-	spr ctx "\treturn v.type == FIB_TYPE_ARRAY;\n";
-	spr ctx "}\n\n";
-	spr ctx "/* Memory allocation - GC-tracked objects (inline fast path) */\n";
-	spr ctx "/* NOTE: For object allocation, prefer gc_alloc_object_with_class() to avoid race conditions */\n";
-	spr ctx "/* Uses ThreadBlockCache via tls_thread_cache (not tls_current_alloc) */\n";
-	spr ctx "static inline void* fib_alloc(size_t size) {\n";
-	spr ctx "\treturn fibrix_alloc(size, true);  /* isContainer=true for objects with refs */\n";
-	spr ctx "}\n\n";
-	spr ctx "/* Atomic allocation - no references to track */\n";
-	spr ctx "static inline void* fib_alloc_atomic(size_t size) {\n";
-	spr ctx "\treturn fibrix_alloc(size, false);  /* isContainer=false for raw data */\n";
-	spr ctx "}\n\n";
-	spr ctx "/* String comparison */\n";
-	spr ctx "static inline bool fib_string_eq(FibString* a, FibString* b) {\n";
-	spr ctx "\tif (a == b) return true;\n";
-	spr ctx "\tif (a == NULL || b == NULL) return false;\n";
-	spr ctx "\treturn strcmp(fib_string_data(a), fib_string_data(b)) == 0;\n";
-	spr ctx "}\n\n";
-	spr ctx "/* Type coercion helpers - most are now in object.h */\n";
-	spr ctx "static inline FibDynamic fib_string_to_dynamic(FibString* s) {\n";
-	spr ctx "\treturn fib_dynamic_string(s);\n";
-	spr ctx "}\n\n";
-	spr ctx "static inline void* fib_dynamic_to_ptr(FibDynamic v) {\n";
-	spr ctx "\tif (v.type == FIB_TYPE_ENUM) return v.data.ptrVal;\n";
-	spr ctx "\treturn v.data.ptrVal;\n";
-	spr ctx "}\n\n";
-	spr ctx "/* Type constants for runtime type checking */\n";
-	spr ctx "#define FIB_TYPE_STRING_CLASS ((FibDynamic){ .type = FIB_TYPE_CLASS, .data.intVal = FIB_CLASS_ID_STRING })\n\n";
-	spr ctx "/* Anonymous object field storage */\n";
-	spr ctx "typedef struct FibAnonField {\n";
-	spr ctx "\tconst char* name;\n";
-	spr ctx "\tFibDynamic value;\n";
-	spr ctx "\tstruct FibAnonField* next;\n";
-	spr ctx "} FibAnonField;\n\n";
-	spr ctx "/* Dynamic field access */\n";
-	spr ctx "static inline FibDynamic fib_field_get(FibDynamic obj, const char* name) {\n";
-	spr ctx "\tif (obj.type != FIB_TYPE_OBJECT || obj.data.ptrVal == NULL) return fib_dynamic_null();\n";
-	spr ctx "\tFibAnonField* field = (FibAnonField*)obj.data.ptrVal;\n";
-	spr ctx "\twhile (field != NULL) {\n";
-	spr ctx "\t\tif (strcmp(field->name, name) == 0) return field->value;\n";
-	spr ctx "\t\tfield = field->next;\n";
-	spr ctx "\t}\n";
-	spr ctx "\treturn fib_dynamic_null();\n";
-	spr ctx "}\n\n";
-	spr ctx "/* Anonymous object creation helpers (standard C, no GCC extensions) */\n";
-	spr ctx "static inline FibAnonField* _fib_anon_field(const char* name, FibDynamic value, FibAnonField* next) {\n";
-	spr ctx "\tFibAnonField* f = (FibAnonField*)malloc(sizeof(FibAnonField));\n";
-	spr ctx "\tf->name = name; f->value = value; f->next = next;\n";
-	spr ctx "\treturn f;\n";
-	spr ctx "}\n";
-	spr ctx "static inline FibDynamic _fib_anon_wrap(FibAnonField* fields) {\n";
-	spr ctx "\treturn (FibDynamic){ .type = FIB_TYPE_OBJECT, .data.ptrVal = fields };\n";
-	spr ctx "}\n";
-	spr ctx "/* FIB_ANON_NEW - create anonymous object with N fields (standard C) */\n";
-	spr ctx "#define FIB_ANON_NEW_0() _fib_anon_wrap(NULL)\n";
-	spr ctx "#define FIB_ANON_NEW_1(n1, v1) \\\n";
-	spr ctx "\t_fib_anon_wrap(_fib_anon_field(n1, v1, NULL))\n";
-	spr ctx "#define FIB_ANON_NEW_2(n1, v1, n2, v2) \\\n";
-	spr ctx "\t_fib_anon_wrap(_fib_anon_field(n1, v1, _fib_anon_field(n2, v2, NULL)))\n";
-	spr ctx "#define FIB_ANON_NEW_3(n1, v1, n2, v2, n3, v3) \\\n";
-	spr ctx "\t_fib_anon_wrap(_fib_anon_field(n1, v1, _fib_anon_field(n2, v2, _fib_anon_field(n3, v3, NULL))))\n";
-	spr ctx "#define FIB_ANON_NEW_4(n1, v1, n2, v2, n3, v3, n4, v4) \\\n";
-	spr ctx "\t_fib_anon_wrap(_fib_anon_field(n1, v1, _fib_anon_field(n2, v2, _fib_anon_field(n3, v3, _fib_anon_field(n4, v4, NULL)))))\n";
-	spr ctx "#define FIB_ANON_NEW_5(n1, v1, n2, v2, n3, v3, n4, v4, n5, v5) \\\n";
-	spr ctx "\t_fib_anon_wrap(_fib_anon_field(n1, v1, _fib_anon_field(n2, v2, _fib_anon_field(n3, v3, _fib_anon_field(n4, v4, _fib_anon_field(n5, v5, NULL))))))\n";
-	spr ctx "#define FIB_ANON_NEW_6(n1, v1, n2, v2, n3, v3, n4, v4, n5, v5, n6, v6) \\\n";
-	spr ctx "\t_fib_anon_wrap(_fib_anon_field(n1, v1, _fib_anon_field(n2, v2, _fib_anon_field(n3, v3, _fib_anon_field(n4, v4, _fib_anon_field(n5, v5, _fib_anon_field(n6, v6, NULL)))))))\n";
-	spr ctx "/* Note: FIB_ANON_NEW_N macros are called directly with the field count */\n\n";
-	spr ctx "/* FIB_STACK_ALLOC - zero-initialized stack allocation (standard C) */\n";
-	spr ctx "/* Usage: type* ptr = FIB_STACK_ALLOC(type, varname); */\n";
-	spr ctx "/* Note: This expands to a comma expression that declares + returns ptr */\n";
-	spr ctx "#define FIB_STACK_ALLOC(type, name) \\\n";
-	spr ctx "\t((type*)memset(&(type){0}, 0, sizeof(type)))\n\n";
-	spr ctx "/* Dynamic closure call helpers (standard C, no GCC extensions) */\n";
-	spr ctx "/* These functions wrap fib_closure_call_dynamic with fixed argument counts */\n";
-	spr ctx "static inline FibDynamic _fib_dyn_call_0(FibDynamic c) {\n";
-	spr ctx "\treturn fib_closure_call_dynamic((FibClosure*)fib_dynamic_to_object(c), NULL, 0);\n";
-	spr ctx "}\n";
-	spr ctx "static inline FibDynamic _fib_dyn_call_1(FibDynamic c, FibDynamic a0) {\n";
-	spr ctx "\tFibDynamic args[1] = {a0};\n";
-	spr ctx "\treturn fib_closure_call_dynamic((FibClosure*)fib_dynamic_to_object(c), args, 1);\n";
-	spr ctx "}\n";
-	spr ctx "static inline FibDynamic _fib_dyn_call_2(FibDynamic c, FibDynamic a0, FibDynamic a1) {\n";
-	spr ctx "\tFibDynamic args[2] = {a0, a1};\n";
-	spr ctx "\treturn fib_closure_call_dynamic((FibClosure*)fib_dynamic_to_object(c), args, 2);\n";
-	spr ctx "}\n";
-	spr ctx "static inline FibDynamic _fib_dyn_call_3(FibDynamic c, FibDynamic a0, FibDynamic a1, FibDynamic a2) {\n";
-	spr ctx "\tFibDynamic args[3] = {a0, a1, a2};\n";
-	spr ctx "\treturn fib_closure_call_dynamic((FibClosure*)fib_dynamic_to_object(c), args, 3);\n";
-	spr ctx "}\n";
-	spr ctx "static inline FibDynamic _fib_dyn_call_4(FibDynamic c, FibDynamic a0, FibDynamic a1, FibDynamic a2, FibDynamic a3) {\n";
-	spr ctx "\tFibDynamic args[4] = {a0, a1, a2, a3};\n";
-	spr ctx "\treturn fib_closure_call_dynamic((FibClosure*)fib_dynamic_to_object(c), args, 4);\n";
-	spr ctx "}\n";
-	spr ctx "static inline FibDynamic _fib_dyn_call_5(FibDynamic c, FibDynamic a0, FibDynamic a1, FibDynamic a2, FibDynamic a3, FibDynamic a4) {\n";
-	spr ctx "\tFibDynamic args[5] = {a0, a1, a2, a3, a4};\n";
-	spr ctx "\treturn fib_closure_call_dynamic((FibClosure*)fib_dynamic_to_object(c), args, 5);\n";
-	spr ctx "}\n";
-	spr ctx "static inline FibDynamic _fib_dyn_call_6(FibDynamic c, FibDynamic a0, FibDynamic a1, FibDynamic a2, FibDynamic a3, FibDynamic a4, FibDynamic a5) {\n";
-	spr ctx "\tFibDynamic args[6] = {a0, a1, a2, a3, a4, a5};\n";
-	spr ctx "\treturn fib_closure_call_dynamic((FibClosure*)fib_dynamic_to_object(c), args, 6);\n";
-	spr ctx "}\n\n";
-	spr ctx "/* Fiber API bridge - maps Haxe Fiber class to runtime functions */\n";
-	spr ctx "#define Fiber_yield() scheduler_yield()\n";
-	spr ctx "static inline bool Fiber_isAlive(Fiber* f) {\n";
-	spr ctx "\treturn f != NULL && f->state != FIBER_STATE_DEAD;\n";
-	spr ctx "}\n";
-	spr ctx "static inline Fiber* Fiber_current(void) {\n";
-	spr ctx "\treturn scheduler_current();\n";
-	spr ctx "}\n";
-	spr ctx "/* Fiber_spawn wrapper - adapts FibDynamic-taking functions to void* */\n";
-	spr ctx "typedef void (*FibDynamicFunc)(FibDynamic);\n";
-	spr ctx "static void _fib_spawn_trampoline(void* arg) {\n";
-	spr ctx "\tFibDynamicFunc fn = (FibDynamicFunc)arg;\n";
-	spr ctx "\tif (fn) fn(fib_dynamic_null());\n";
-	spr ctx "}\n";
-	spr ctx "static inline Fiber* Fiber_spawn(FibDynamicFunc fn) {\n";
-	spr ctx "\treturn scheduler_spawn(_fib_spawn_trampoline, (void*)fn);\n";
-	spr ctx "}\n";
-	spr ctx "/* Fiber_spawn_closure - spawns a fiber with a closure */\n";
-	spr ctx "typedef void (*FibClosureFunc)(FibClosure*, FibDynamic);\n";
-	spr ctx "/* GDB breakpoint function - called when closure corruption detected */\n";
-	spr ctx "__attribute__((noinline)) static void _fib_closure_corruption_trap(\n";
-	spr ctx "\tFibClosure* closure, void* arg, void* gc_arg,\n";
-	spr ctx "\tvoid* actual_clazz, void* expected_clazz, uint64_t actual_magic) {\n";
-	spr ctx "\tfprintf(stderr, \"\\n[FATAL] CLOSURE CORRUPTION DETECTED!\\n\");\n";
-	spr ctx "\tfprintf(stderr, \"  closure     = %p\\n\", (void*)closure);\n";
-	spr ctx "\tfprintf(stderr, \"  arg         = %p\\n\", arg);\n";
-	spr ctx "\tfprintf(stderr, \"  gc_arg      = %p\\n\", gc_arg);\n";
-	spr ctx "\tfprintf(stderr, \"  clazz       = %p (expected %p)\\n\", actual_clazz, expected_clazz);\n";
-	spr ctx "\tfprintf(stderr, \"  magic       = 0x%016lx (expected 0x%016lx)\\n\",\n";
-	spr ctx "\t\t(unsigned long)actual_magic, (unsigned long)FIB_CLOSURE_MAGIC);\n";
-	spr ctx "\tuint64_t* p = (uint64_t*)closure;\n";
-	spr ctx "\tfor (int i = 0; i < 8; i++) fprintf(stderr, \"  [%d] %p: 0x%016lx\\n\", i, (void*)&p[i], (unsigned long)p[i]);\n";
-	spr ctx "\t__builtin_trap();\n";
-	spr ctx "}\n";
-	spr ctx "static void _fib_spawn_closure_trampoline(void* arg) {\n";
-	spr ctx "\t/* Get closure from fiber's gc_arg which is updated by GC if evacuated.\n";
-	spr ctx "\t * Fall back to arg if fiber_current() fails (shouldn't happen). */\n";
-	spr ctx "\tFiber* self = fiber_current();\n";
-	spr ctx "\tFibClosure* closure = (FibClosure*)(self && self->gc_arg ? self->gc_arg : arg);\n";
-	spr ctx "\t/* Validate closure before calling - check magic and clazz */\n";
-	spr ctx "\tif (closure) {\n";
-	spr ctx "\t\tvolatile FibClosure* vclosure = closure;\n";
-	spr ctx "\t\tif (vclosure->magic != FIB_CLOSURE_MAGIC || vclosure->clazz != &fib_closure_class) {\n";
-	spr ctx "\t\t\t_fib_closure_corruption_trap(closure, arg, self ? self->gc_arg : NULL,\n";
-	spr ctx "\t\t\t\t(void*)vclosure->clazz, (void*)&fib_closure_class, vclosure->magic);\n";
-	spr ctx "\t\t}\n";
-	spr ctx "\t\tFibClosureFunc fn = (FibClosureFunc)vclosure->fn;\n";
-	spr ctx "\t\tfn(closure, fib_dynamic_null());\n";
-	spr ctx "\t}\n";
-	spr ctx "}\n";
-	spr ctx "static inline Fiber* Fiber_spawn_closure(FibClosure* closure) {\n";
-	spr ctx "\t/* Push temp root to protect closure during fiber creation.\n";
-	spr ctx "\t * The closure is in a caller-saved register (rdi) at this point,\n";
-	spr ctx "\t * and GC could run during scheduler_spawn before fiber->gc_arg is set. */\n";
-	spr ctx "\tgc_push_temp_root((void**)&closure);\n";
-	spr ctx "\tFiber* fiber = scheduler_spawn(_fib_spawn_closure_trampoline, (void*)closure);\n";
-	spr ctx "\tgc_pop_temp_roots(1);\n";
-	spr ctx "\treturn fiber;\n";
-	spr ctx "}\n";
-	spr ctx "/* Fiber MT API - multithreading support */\n";
-	spr ctx "static inline int Fiber_createWorkers(int count) {\n";
-	spr ctx "\treturn scheduler_create_workers(count);\n";
-	spr ctx "}\n";
-	spr ctx "static inline int Fiber_getThreadCount(void) {\n";
-	spr ctx "\treturn scheduler_get_thread_count();\n";
-	spr ctx "}\n";
-	spr ctx "static inline int Fiber_getWorkerCount(void) {\n";
-	spr ctx "\treturn scheduler_get_worker_count();\n";
-	spr ctx "}\n";
-	spr ctx "/* Fiber_spawnOn - spawn fiber on specific thread */\n";
-	spr ctx "static void _fib_spawn_on_closure_trampoline(void* arg) {\n";
-	spr ctx "\tFiber* self = fiber_current();\n";
-	spr ctx "\tFibClosure* closure = (FibClosure*)(self && self->gc_arg ? self->gc_arg : arg);\n";
-	spr ctx "\tif (closure) {\n";
-	spr ctx "\t\tvolatile FibClosure* vclosure = closure;\n";
-	spr ctx "\t\tif (vclosure->clazz != &fib_closure_class) {\n";
-	spr ctx "\t\t\tfprintf(stderr, \"[FATAL] Closure wrong class (spawnOn)! closure=%p clazz=%p expected=%p fn=%p arg=%p gc_arg=%p\\n\",\n";
-	spr ctx "\t\t\t\t(void*)closure, (void*)vclosure->clazz, (void*)&fib_closure_class, vclosure->fn, arg, self ? self->gc_arg : NULL);\n";
-	spr ctx "\t\t\t__builtin_trap();\n";
-	spr ctx "\t\t}\n";
-	spr ctx "\t\tFibClosureFunc fn = (FibClosureFunc)vclosure->fn;\n";
-	spr ctx "\t\tfn(closure, fib_dynamic_null());\n";
-	spr ctx "\t}\n";
-	spr ctx "}\n";
-	spr ctx "static inline Fiber* Fiber_spawnOn(int threadId, FibClosure* closure) {\n";
-	spr ctx "\t/* Push temp root to protect closure during fiber creation */\n";
-	spr ctx "\tgc_push_temp_root((void**)&closure);\n";
-	spr ctx "\tFiber* fiber = scheduler_spawn_on(threadId, _fib_spawn_on_closure_trampoline, (void*)closure);\n";
-	spr ctx "\tgc_pop_temp_roots(1);\n";
-	spr ctx "\treturn fiber;\n";
-	spr ctx "}\n";
-	spr ctx "/* Fiber_spawnAny - spawn fiber on least-loaded thread */\n";
-	spr ctx "static inline Fiber* Fiber_spawnAny(FibClosure* closure) {\n";
-	spr ctx "\t/* Push temp root to protect closure during fiber creation */\n";
-	spr ctx "\tgc_push_temp_root((void**)&closure);\n";
-	spr ctx "\tFiber* fiber = scheduler_spawn_any(_fib_spawn_on_closure_trampoline, (void*)closure);\n";
-	spr ctx "\tgc_pop_temp_roots(1);\n";
-	spr ctx "\treturn fiber;\n";
-	spr ctx "}\n";
-	spr ctx "/* Fiber_spawnWithStack - spawn fiber with custom stack size */\n";
-	spr ctx "static inline Fiber* Fiber_spawnWithStack(size_t stackSize, FibClosure* closure) {\n";
-	spr ctx "\t/* Push temp root to protect closure during fiber creation */\n";
-	spr ctx "\tgc_push_temp_root((void**)&closure);\n";
-	spr ctx "\tFiber* fiber = scheduler_spawn_sized(stackSize, _fib_spawn_closure_trampoline, (void*)closure);\n";
-	spr ctx "\tgc_pop_temp_roots(1);\n";
-	spr ctx "\treturn fiber;\n";
-	spr ctx "}\n";
-	spr ctx "/* Fiber_getThreadId - get current thread ID */\n";
-	spr ctx "static inline int Fiber_getThreadId(void) {\n";
-	spr ctx "\treturn scheduler_get_thread_id();\n";
-	spr ctx "}\n";
-	spr ctx "/* _fib_spawn_many_trampoline - trampoline for spawnMany fibers.\n";
-	spr ctx " * Each fiber's gc_arg holds a wrapper closure with captures:\n";
-	spr ctx " *   captures[0] = body closure (the user's (Int, Dynamic)->Void function)\n";
-	spr ctx " *   captures[1] = args (the shared Dynamic argument)\n";
-	spr ctx " * Each fiber's user_data holds (void*)(intptr_t)index.\n";
-	spr ctx " */\n";
-	spr ctx "static void _fib_spawn_many_trampoline(void* arg) {\n";
-	spr ctx "\tFiber* self = fiber_current();\n";
-	spr ctx "\tFibClosure* wrapper = (FibClosure*)(self && self->gc_arg ? self->gc_arg : arg);\n";
-	spr ctx "\tif (wrapper) {\n";
-	spr ctx "\t\tvolatile FibClosure* vw = wrapper;\n";
-	spr ctx "\t\tif (vw->clazz != &fib_closure_class) {\n";
-	spr ctx "\t\t\tfprintf(stderr, \"[FATAL] SpawnMany wrapper wrong class! wrapper=%p clazz=%p expected=%p arg=%p gc_arg=%p\\n\",\n";
-	spr ctx "\t\t\t\t(void*)wrapper, (void*)vw->clazz, (void*)&fib_closure_class, arg, self ? self->gc_arg : NULL);\n";
-	spr ctx "\t\t\t__builtin_trap();\n";
-	spr ctx "\t\t}\n";
-	spr ctx "\t\t/* Extract body closure and args from wrapper captures */\n";
-	spr ctx "\t\tFibClosure* body = (FibClosure*)fib_dynamic_to_object(wrapper->captures[0]);\n";
-	spr ctx "\t\tFibDynamic args = wrapper->captures[1];\n";
-	spr ctx "\t\t/* Get fiber index from user_data (set by scheduler_spawn_many) */\n";
-	spr ctx "\t\tint32_t index = (int32_t)(intptr_t)self->user_data;\n";
-	spr ctx "\t\t/* Call body(closure, index, args) via the typed impl */\n";
-	spr ctx "\t\t((void (*)(FibClosure*, int32_t, FibDynamic))body->fn)(body, index, args);\n";
-	spr ctx "\t}\n";
-	spr ctx "}\n";
-	spr ctx "/* Fiber_spawnMany - spawn multiple fibers with round-robin distribution */\n";
-	spr ctx "static inline int Fiber_spawnMany(int count, FibClosure* body, FibDynamic args) {\n";
-	spr ctx "\t/* Create wrapper closure that captures [body, args] for the trampoline */\n";
-	spr ctx "\tgc_mature_alloc_begin();\n";
-	spr ctx "\tFibClosure* wrapper = fib_closure_create_for_fiber(NULL, NULL, 2, 0);\n";
-	spr ctx "\tgc_push_temp_root((void**)&wrapper);\n";
-	spr ctx "\tgc_push_temp_root((void**)&body);\n";
-	spr ctx "\twrapper->captures[0] = (FibDynamic){.type=FIB_TYPE_OBJECT, .data.ptrVal=body};\n";
-	spr ctx "\twrapper->captures[1] = args;\n";
-	spr ctx "\t/* Write barriers: wrapper is mature, body/args may be nursery */\n";
-	spr ctx "\tfibrix_write_barrier(wrapper, body);\n";
-	spr ctx "\tif (args.type == FIB_TYPE_OBJECT || args.type == FIB_TYPE_STRING ||\n";
-	spr ctx "\t    args.type == FIB_TYPE_ARRAY || args.type == FIB_TYPE_FUNCTION)\n";
-	spr ctx "\t\tfibrix_write_barrier(wrapper, args.data.ptrVal);\n";
-	spr ctx "\tint spawned = scheduler_spawn_many(count, _fib_spawn_many_trampoline, (void*)wrapper);\n";
-	spr ctx "\tgc_mature_alloc_end();\n";
-	spr ctx "\tgc_pop_temp_roots(2);\n";
-	spr ctx "\treturn spawned;\n";
-	spr ctx "}\n\n";
-	spr ctx "/* Counter API bridge - maps Haxe Counter class to runtime functions */\n";
-	spr ctx "static inline Counter* Counter_create(int initialValue) {\n";
-	spr ctx "\treturn counter_create(initialValue);\n";
-	spr ctx "}\n";
-	spr ctx "static inline void Counter_add(Counter* c, int delta) {\n";
-	spr ctx "\tcounter_add(c, delta);\n";
-	spr ctx "}\n";
-	spr ctx "static inline int Counter_decrement(Counter* c) {\n";
-	spr ctx "\treturn counter_decrement(c);\n";
-	spr ctx "}\n";
-	spr ctx "static inline void Counter_wait(Counter* c, int target) {\n";
-	spr ctx "\tcounter_wait(c, target);\n";
-	spr ctx "}\n";
-	spr ctx "static inline void Counter_done(Counter* c) {\n";
-	spr ctx "\tcounter_done(c);\n";
-	spr ctx "}\n";
-	spr ctx "static inline void Counter_waitAndDone(Counter* c, int target) {\n";
-	spr ctx "\tcounter_wait_and_done(c, target);\n";
-	spr ctx "}\n";
-	spr ctx "static inline int Counter_getValue(Counter* c) {\n";
-	spr ctx "\treturn counter_get_value(c);\n";
-	spr ctx "}\n\n";
-	spr ctx "/* Anonymous objects */\n";
-	spr ctx "static inline FibDynamic fib_anon_new(void) {\n";
-	spr ctx "\t/* Create empty anonymous object (fields added with fib_anon_set) */\n";
-	spr ctx "\treturn (FibDynamic){ .type = FIB_TYPE_OBJECT, .data.ptrVal = NULL };\n";
-	spr ctx "}\n";
-	spr ctx "static inline void fib_anon_set(FibDynamic* obj, const char* name, FibDynamic value) {\n";
-	spr ctx "\tif (obj->type != FIB_TYPE_OBJECT) return;\n";
-	spr ctx "\t/* Check if field already exists */\n";
-	spr ctx "\tFibAnonField* field = (FibAnonField*)obj->data.ptrVal;\n";
-	spr ctx "\twhile (field != NULL) {\n";
-	spr ctx "\t\tif (strcmp(field->name, name) == 0) { field->value = value; return; }\n";
-	spr ctx "\t\tfield = field->next;\n";
-	spr ctx "\t}\n";
-	spr ctx "\t/* Add new field */\n";
-	spr ctx "\tFibAnonField* newField = (FibAnonField*)malloc(sizeof(FibAnonField));\n";
-	spr ctx "\tnewField->name = name;\n";
-	spr ctx "\tnewField->value = value;\n";
-	spr ctx "\tnewField->next = (FibAnonField*)obj->data.ptrVal;\n";
-	spr ctx "\tobj->data.ptrVal = newField;\n";
-	spr ctx "}\n\n";
-	spr ctx "/* GC API bridge - maps Haxe GC class to runtime functions */\n";
-	spr ctx "#define GC_collect() gc_collect()\n";
-	spr ctx "#define GC_printStats() gc_print_stats()\n";
-	spr ctx "static inline FibString* GC_statsString(void) {\n";
-	spr ctx "\treturn gc_stats_string_gc();  /* Returns GC-managed string directly - no malloc */\n";
-	spr ctx "}\n";
-	spr ctx "static inline void GC_setDebug(bool enabled) {\n";
-	spr ctx "\tgc_set_debug(enabled);\n";
-	spr ctx "}\n";
-	spr ctx "static inline void GC_setThreshold(int bytes) {\n";
-	spr ctx "\tgc_set_threshold((size_t)bytes);\n";
-	spr ctx "}\n";
-	spr ctx "static inline int GC_getThreshold(void) {\n";
-	spr ctx "\treturn (int)gc_get_threshold();\n";
-	spr ctx "}\n";
-	spr ctx "#define GC_minorCollect() gc_minor_collect()\n";
-	spr ctx "static inline void GC_setMinorThreshold(int bytes) {\n";
-	spr ctx "\tgc_set_minor_threshold((size_t)bytes);\n";
-	spr ctx "}\n";
-	spr ctx "static inline int GC_getMinorThreshold(void) {\n";
-	spr ctx "\treturn (int)gc_get_minor_threshold();\n";
-	spr ctx "}\n";
-	spr ctx "/* GC_stats returns an anonymous object with GC statistics */\n";
-	spr ctx "static inline FibDynamic GC_stats(void) {\n";
-	spr ctx "\tconst GCStats* s = gc_get_stats();\n";
-	spr ctx "\tFibDynamic obj = fib_anon_new();\n";
-	spr ctx "\tfib_anon_set(&obj, \"totalAllocations\", fib_dynamic_int((int)s->total_allocations));\n";
-	spr ctx "\tfib_anon_set(&obj, \"totalBytesAllocated\", fib_dynamic_int((int)s->total_bytes_allocated));\n";
-	spr ctx "\tfib_anon_set(&obj, \"currentHeapSize\", fib_dynamic_int((int)s->current_heap_size));\n";
-	spr ctx "\tfib_anon_set(&obj, \"peakHeapSize\", fib_dynamic_int((int)s->peak_heap_size));\n";
-	spr ctx "\tfib_anon_set(&obj, \"currentObjectCount\", fib_dynamic_int((int)s->current_object_count));\n";
-	spr ctx "\tfib_anon_set(&obj, \"collectionCount\", fib_dynamic_int((int)s->collection_count));\n";
-	spr ctx "\tfib_anon_set(&obj, \"objectsMarked\", fib_dynamic_int((int)s->objects_marked));\n";
-	spr ctx "\tfib_anon_set(&obj, \"objectsSwept\", fib_dynamic_int((int)s->objects_swept));\n";
-	spr ctx "\tfib_anon_set(&obj, \"bytesFreed\", fib_dynamic_int((int)s->bytes_freed));\n";
-	spr ctx "\tfib_anon_set(&obj, \"lastMarkTimeMs\", fib_dynamic_float((double)s->last_mark_time_us / 1000.0));\n";
-	spr ctx "\tfib_anon_set(&obj, \"lastSweepTimeMs\", fib_dynamic_float((double)s->last_sweep_time_us / 1000.0));\n";
-	spr ctx "\tfib_anon_set(&obj, \"totalGcTimeMs\", fib_dynamic_float((double)s->total_gc_time_us / 1000.0));\n";
-	spr ctx "\tfib_anon_set(&obj, \"fibersScanned\", fib_dynamic_int((int)s->fibers_scanned));\n";
-	spr ctx "\tfib_anon_set(&obj, \"stackBytesScanned\", fib_dynamic_int((int)s->stack_bytes_scanned));\n";
-	spr ctx "\t/* Generational GC stats */\n";
-	spr ctx "\tfib_anon_set(&obj, \"minorCollections\", fib_dynamic_int((int)s->minor_collections));\n";
-	spr ctx "\tfib_anon_set(&obj, \"minorObjectsEvacuated\", fib_dynamic_int((int)s->minor_objects_evacuated));\n";
-	spr ctx "\tfib_anon_set(&obj, \"minorBytesEvacuated\", fib_dynamic_int((int)s->minor_bytes_evacuated));\n";
-	spr ctx "\tfib_anon_set(&obj, \"lastMinorTimeMs\", fib_dynamic_float((double)s->last_minor_time_us / 1000.0));\n";
-	spr ctx "\tfib_anon_set(&obj, \"totalMinorTimeMs\", fib_dynamic_float((double)s->total_minor_time_us / 1000.0));\n";
-	spr ctx "\tfib_anon_set(&obj, \"writeBarriersTriggered\", fib_dynamic_int((int)s->write_barriers_triggered));\n";
-	spr ctx "\treturn obj;\n";
-	spr ctx "}\n\n";
-	spr ctx "/* Stub for haxe.Exception base class */\n";
-	spr ctx "typedef struct haxe_Exception haxe_Exception;\n";
-	spr ctx "struct haxe_Exception {\n";
-	spr ctx "\tFibObject _obj;\n";
-	spr ctx "\tFibString* message;\n";
-	spr ctx "};\n";
-	spr ctx "extern FibClass haxe_Exception_class;\n";
-	spr ctx "static inline FibString* haxe_Exception_toString(haxe_Exception* this) {\n";
-	spr ctx "\treturn this ? this->message : fib_string_new(\"Exception\");\n";
-	spr ctx "}\n";
-	spr ctx "void haxe_Exception_init(haxe_Exception* this, FibString* message, haxe_Exception* previous, FibDynamic native);\n";
-	spr ctx "haxe_Exception* haxe_Exception_new(FibString* message, haxe_Exception* previous, FibDynamic native);\n\n";
-
-	(* Exception handling using setjmp/longjmp - per-fiber exception stack with thread-local fallback *)
-	spr ctx "/* Exception handling - per-fiber stacks with thread-local fallback */\n";
-	spr ctx "#define FIB_TLS_EXC_STACK_SIZE 64\n";
-	spr ctx "extern __thread jmp_buf* _fib_tls_exc_stack[FIB_TLS_EXC_STACK_SIZE];\n";
-	spr ctx "extern __thread int _fib_tls_exc_stack_top;\n";
-	spr ctx "extern __thread FibDynamic _fib_current_exception;\n\n";
-	spr ctx "static inline void fib_exc_push(jmp_buf* buf) {\n";
-	spr ctx "\tFiber* f = fiber_current();\n";
-	spr ctx "\tif (f) {\n";
-	spr ctx "\t\tif (f->exc_stack_top < FIBER_EXC_STACK_SIZE) {\n";
-	spr ctx "\t\t\tf->exc_stack[f->exc_stack_top++] = buf;\n";
-	spr ctx "\t\t}\n";
-	spr ctx "\t} else {\n";
-	spr ctx "\t\t/* No fiber context - use thread-local fallback */\n";
-	spr ctx "\t\tif (_fib_tls_exc_stack_top < FIB_TLS_EXC_STACK_SIZE) {\n";
-	spr ctx "\t\t\t_fib_tls_exc_stack[_fib_tls_exc_stack_top++] = buf;\n";
-	spr ctx "\t\t}\n";
-	spr ctx "\t}\n";
-	spr ctx "}\n\n";
-	spr ctx "static inline void fib_exc_pop(void) {\n";
-	spr ctx "\tFiber* f = fiber_current();\n";
-	spr ctx "\tif (f) {\n";
-	spr ctx "\t\tif (f->exc_stack_top > 0) f->exc_stack_top--;\n";
-	spr ctx "\t} else {\n";
-	spr ctx "\t\tif (_fib_tls_exc_stack_top > 0) _fib_tls_exc_stack_top--;\n";
-	spr ctx "\t}\n";
-	spr ctx "}\n\n";
-	spr ctx "static inline FibDynamic fib_current_exception(void) {\n";
-	spr ctx "\treturn _fib_current_exception;\n";
-	spr ctx "}\n\n";
-	spr ctx "void fib_throw(FibDynamic exc);\n";
-	spr ctx "void fiberus_register_gc_roots(void);\n\n";
+	(* Runtime API headers - extracted from inline C to proper .h files *)
+	spr ctx "#include \"anon.h\"\n";
+	spr ctx "#include \"exception.h\"\n";
+	spr ctx "#include \"fiber_api.h\"\n";
+	spr ctx "#include \"gc_api.h\"\n";
+	spr ctx "\n";
 
 	(* Generate forward declarations for all classes - including extern ones *)
 	spr ctx "/* Forward declarations */\n";

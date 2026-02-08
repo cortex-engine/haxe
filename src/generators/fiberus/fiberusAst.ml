@@ -292,9 +292,19 @@ and tc_try = {
   try_catches: tc_catch list;
 }
 
+(* Haxe-level catch kind for type dispatch *)
+and tc_catch_kind =
+  | TCCatchDynamic           (* Dynamic - catches everything *)
+  | TCCatchInt               (* Int *)
+  | TCCatchFloat             (* Float *)
+  | TCCatchBool              (* Bool *)
+  | TCCatchString            (* String *)
+  | TCCatchObject of string  (* Class name (for instanceof check) *)
+
 and tc_catch = {
   catch_var: string;
   catch_type: tc_type;
+  catch_kind: tc_catch_kind;
   catch_body: tc_stmt list;
 }
 

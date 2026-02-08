@@ -36,6 +36,8 @@ type conv_ctx = {
   mutable spawn_counter: int;         (* Counter for unique Fiber.spawn temp variable names *)
   (* Fiber-escape analysis *)
   fiber_mature_vars: (int, unit) Hashtbl.t;  (* var_ids needing mature allocation *)
+  (* Stack allocation escape analysis *)
+  stack_alloc_vars: (int, tclass) Hashtbl.t;  (* var_ids eligible for stack allocation *)
   (* Debug/codegen options *)
   debug_level: int;                   (* 0=none, 1=function, 2=line *)
 }
@@ -53,6 +55,7 @@ let empty_ctx = {
   in_fiber_spawn = false;
   spawn_counter = 0;
   fiber_mature_vars = Hashtbl.create 0;
+  stack_alloc_vars = Hashtbl.create 0;
   debug_level = 0;
 }
 
@@ -1610,19 +1613,7 @@ and convert_unop_expr ctx op flag inner result_tc pos =
 and convert_expr_as_stmt ctx (e : texpr) : tc_stmt list =
   match e.eexpr with
   | TVar (v, init_opt) ->
-      let name = ident v.v_name in
-      let vtype = tc_type_of v.v_type in
-      let init = Option.map (convert_expr ctx) init_opt in
-      let var_stmt = TCSVar { vd_name = name; vd_type = vtype; vd_init = init; vd_static = false; vd_const = false } in
-      (* Wrap with gc_force_mature if this variable is fiber-captured *)
-      let var_stmt =
-        if Hashtbl.mem ctx.fiber_mature_vars v.v_id then
-          TCSForceMature var_stmt
-        else var_stmt
-      in
-      (* Add GC push for pointer types *)
-      let gc_stmts = gc_push_if_needed ctx name vtype in
-      var_stmt :: gc_stmts
+      convert_tvar_stmt ctx v init_opt
   | TBlock exprs ->
       (* Nested block - flatten into statements *)
       List.concat_map (convert_expr_as_stmt ctx) exprs
@@ -2797,6 +2788,122 @@ and convert_call ctx callee args result_tc pos =
       { call with pending_stmts = callee_expr.pending_stmts @ args_pending @ call.pending_stmts }
 
 (* ============================================================================
+ * TVar Conversion (shared between convert_stmt and convert_expr_as_stmt)
+ * ============================================================================
+ * 
+ * Handles three paths:
+ * 1. Stack allocation: struct on stack + pointer alias + init call + per-field GC pushes
+ * 2. Normal with init: pending_stmts + var decl + pop init gc_roots + push var root  
+ * 3. Normal without init: var decl + push var root
+ *
+ * GC root ordering is critical for the init case:
+ * - The initializer may leave gc_roots on the temp root stack (from GC-safe extraction)
+ * - We must POP those BEFORE pushing the variable itself, because temp roots are LIFO
+ * - If we push first then pop, we'd pop the variable we just pushed!
+ * - The object is briefly unprotected between pop and push, but gc_push doesn't allocate
+ *   so no GC can trigger in between.
+ *)
+
+and convert_tvar_stmt (ctx : conv_ctx) (v : tvar) (init_opt : texpr option) : tc_stmt list =
+  let name = ident v.v_name in
+  let vtype = tc_type_of v.v_type in
+  let is_fiber_mature = Hashtbl.mem ctx.fiber_mature_vars v.v_id in
+  let is_stack_alloc = Hashtbl.mem ctx.stack_alloc_vars v.v_id in
+  let stmts =
+    if is_stack_alloc then begin
+      (* Stack allocation path: declare struct on stack, pointer alias, init call, per-field GC pushes *)
+      let c = Hashtbl.find ctx.stack_alloc_vars v.v_id in
+      let class_name = flat_path c.cl_path in
+      (* 1. Declare the struct on the stack with class pointer *)
+      let struct_decl = TCSRaw (Printf.sprintf "%s _stack_%s = { ._obj.clazz = &%s_class };" class_name name class_name) in
+      (* 2. Declare the pointer variable pointing to the stack struct *)
+      let ptr_decl = TCSVar { vd_name = name; vd_type = TCFibClass class_name;
+                              vd_init = Some (mk_expr (TCERaw (Printf.sprintf "&_stack_%s" name)) (TCFibClass class_name));
+                              vd_static = false; vd_const = false } in
+      (* 3. Build init call with constructor arguments *)
+      let init_args, args_pending = match init_opt with
+        | Some { eexpr = TNew (tc, _, args) } when List.length args > 0 ->
+            let arg_exprs = List.map (convert_expr ctx) args in
+            (* Collect pending stmts from args *)
+            let pending = collect_pending arg_exprs in
+            (* Coerce arguments to parameter types *)
+            let param_types = match tc.cl_constructor with
+              | Some cf -> get_param_types cf.cf_type
+              | None -> []
+            in
+            let rec coerce_args aexprs ptypes = match aexprs, ptypes with
+              | [], _ -> []
+              | a :: rest_a, pt :: rest_pt ->
+                  coerce_to_type { a with pending_stmts = [] } (tc_type_of pt) :: coerce_args rest_a rest_pt
+              | a :: rest_a, [] ->
+                  { a with pending_stmts = [] } :: coerce_args rest_a []
+            in
+            (coerce_args arg_exprs param_types, pending)
+        | _ -> ([], [])
+      in
+      let this_arg = mk_expr (TCELocal name) (TCFibClass class_name) in
+      let init_call = TCSExpr (mk_expr (TCECall (TCTFunc (class_name ^ "_init"), this_arg :: init_args)) TCVoid) in
+      (* 4. Push temp roots for each GC-pointer field of the stack-allocated object.
+       * This enables eliminating conservative stack scanning in minor GC, since all
+       * GC pointers are now precisely tracked via temp roots.
+       * Note: TCSGCPush adds & automatically, so we pass the field lvalue directly. *)
+      let field_gc_pushes = List.filter_map (fun (cf : tclass_field) ->
+        match cf.cf_kind with
+        | Var _ when haxe_type_needs_gc_root cf.cf_type ->
+            ctx.gc_local_count <- ctx.gc_local_count + 1;
+            let field_tc = tc_type_of cf.cf_type in
+            Some (TCSGCPush (mk_expr (TCEArrow (mk_expr (TCELocal name) (TCFibClass class_name), ident cf.cf_name)) field_tc))
+        | _ -> None
+      ) c.cl_ordered_fields in
+      args_pending @ [struct_decl; ptr_decl; init_call] @ field_gc_pushes
+    end else begin
+      (* Normal heap allocation path *)
+      match init_opt with
+      | None ->
+          (* No initializer - just declare the variable *)
+          let var_stmt = TCSVar { vd_name = name; vd_type = vtype; vd_init = None; vd_static = false; vd_const = false } in
+          let gc_stmts = gc_push_if_needed ctx name vtype in
+          var_stmt :: gc_stmts
+      | Some init_e ->
+          (* Convert the initializer expression *)
+          let cexpr = convert_expr ctx init_e in
+          (* Coerce to variable type if needed *)
+          let coerced = coerce_to_type cexpr vtype in
+          (* Extract pending statements - they must be emitted BEFORE the var decl *)
+          let pending = coerced.pending_stmts in
+          let init_gc_roots = coerced.gc_roots in
+          let clean_init = { coerced with pending_stmts = []; gc_roots = 0 } in
+          let var_stmt = TCSVar { vd_name = name; vd_type = vtype; vd_init = Some clean_init; vd_static = false; vd_const = false } in
+          (* GC root ordering: pop init roots BEFORE pushing variable root.
+           * This is critical because temp roots are a LIFO stack. *)
+          let is_gc_ptr = needs_gc_root_tc vtype in
+          let gc_stmts =
+            if is_gc_ptr then begin
+              let pop_stmts = if init_gc_roots > 0 then begin
+                ctx.gc_local_count <- ctx.gc_local_count - init_gc_roots;
+                [TCSGCPop init_gc_roots]
+              end else [] in
+              let push_stmts = gc_push_if_needed ctx name vtype in
+              pop_stmts @ push_stmts
+            end else if init_gc_roots > 0 then begin
+              (* Non-GC pointer type but init had gc_roots - still need to pop *)
+              ctx.gc_local_count <- ctx.gc_local_count - init_gc_roots;
+              [TCSGCPop init_gc_roots]
+            end else
+              []
+          in
+          pending @ [var_stmt] @ gc_stmts
+    end
+  in
+  (* Wrap with gc_force_mature if this variable is fiber-captured.
+   * We emit begin/end at the same scope level (not in a block) so the
+   * variable remains visible in the enclosing scope. *)
+  if is_fiber_mature then
+    [TCSRaw "gc_force_mature_begin();"] @ stmts @ [TCSRaw "gc_force_mature_end();"]
+  else
+    stmts
+
+(* ============================================================================
  * Statement Conversion
  * ============================================================================ *)
 
@@ -2804,19 +2911,7 @@ and convert_stmt (ctx : conv_ctx) (e : texpr) : tc_stmt list =
   match e.eexpr with
   (* Variable declaration *)
   | TVar (v, init_opt) ->
-      let name = ident v.v_name in
-      let vtype = tc_type_of v.v_type in
-      let init = Option.map (convert_expr ctx) init_opt in
-      let var_stmt = TCSVar { vd_name = name; vd_type = vtype; vd_init = init; vd_static = false; vd_const = false } in
-      (* Wrap with gc_force_mature if this variable is fiber-captured *)
-      let var_stmt =
-        if Hashtbl.mem ctx.fiber_mature_vars v.v_id then
-          TCSForceMature var_stmt
-        else var_stmt
-      in
-      (* Add GC push for pointer types *)
-      let gc_stmts = gc_push_if_needed ctx name vtype in
-      var_stmt :: gc_stmts
+      convert_tvar_stmt ctx v init_opt
   
   (* Block of statements *)
   | TBlock exprs ->
@@ -2880,9 +2975,20 @@ and convert_stmt (ctx : conv_ctx) (e : texpr) : tc_stmt list =
   | TTry (body, catches) ->
       let body_stmts = convert_stmt ctx body in
       let catch_blocks = List.map (fun (v, catch_body) ->
+        let ct = tc_type_of v.v_type in
+        let ck = match ct with
+          | TCFibDynamic -> TCCatchDynamic
+          | TCInt32 -> TCCatchInt
+          | TCFloat64 -> TCCatchFloat
+          | TCBool -> TCCatchBool
+          | TCFibString -> TCCatchString
+          | TCFibClass name -> TCCatchObject name
+          | _ -> TCCatchDynamic
+        in
         {
           catch_var = ident v.v_name;
-          catch_type = tc_type_of v.v_type;
+          catch_type = ct;
+          catch_kind = ck;
           catch_body = convert_stmt ctx catch_body;
         }
       ) catches in

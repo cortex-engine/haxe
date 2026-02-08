@@ -677,19 +677,62 @@ and write_stmt (w : writer) (s : tc_stmt) : unit =
   
   (* Exception handling *)
   | TCSTry tr ->
-      write w "FIB_TRY ";
+      write w "FIB_TRY";
+      newline w;
       with_block w (fun () ->
         List.iter (write_stmt w) tr.try_body
       );
+      write w "FIB_CATCH_BEGIN";
+      newline w;
+      indent w;
+      let first = ref true in
       List.iter (fun catch ->
-        writef w " FIB_CATCH(%s, " catch.catch_var;
-        write_type w catch.catch_type;
-        write w ") ";
+        let cond_prefix = if !first then (first := false; "if") else "else if" in
+        (* Generate type check condition *)
+        (match catch.catch_kind with
+        | TCCatchDynamic ->
+            (* Dynamic catches everything *)
+            if cond_prefix = "if" then
+              write w "/* catch Dynamic */"
+            else
+              write w "else"
+        | TCCatchInt ->
+            writef w "%s (_fib_caught_exc.type == FIB_TYPE_INT)" cond_prefix
+        | TCCatchFloat ->
+            writef w "%s (_fib_caught_exc.type == FIB_TYPE_FLOAT)" cond_prefix
+        | TCCatchBool ->
+            writef w "%s (_fib_caught_exc.type == FIB_TYPE_BOOL)" cond_prefix
+        | TCCatchString ->
+            writef w "%s (_fib_caught_exc.type == FIB_TYPE_STRING)" cond_prefix
+        | TCCatchObject class_name ->
+            writef w "%s (_fib_caught_exc.type == FIB_TYPE_OBJECT && fib_object_instanceof(_fib_caught_exc.data.objectVal, &%s_class))" cond_prefix class_name);
+        newline w;
         with_block w (fun () ->
+          (* Declare catch variable with proper type extraction *)
+          write_type w catch.catch_type;
+          writef w " %s = " catch.catch_var;
+          (match catch.catch_kind with
+          | TCCatchDynamic ->
+              write w "_fib_caught_exc"
+          | TCCatchInt ->
+              write w "fib_dynamic_to_int(_fib_caught_exc)"
+          | TCCatchFloat ->
+              write w "fib_dynamic_to_float(_fib_caught_exc)"
+          | TCCatchBool ->
+              write w "_fib_caught_exc.data.boolVal"
+          | TCCatchString ->
+              write w "fib_dynamic_to_string(_fib_caught_exc)"
+          | TCCatchObject _ ->
+              write w "(";
+              write_type w catch.catch_type;
+              write w ")_fib_caught_exc.data.objectVal");
+          write w ";";
+          newline w;
           List.iter (write_stmt w) catch.catch_body
         )
       ) tr.try_catches;
-      write w " FIB_END_TRY";
+      dedent w;
+      write w "FIB_END_TRY";
       newline w
   | TCSThrow e ->
       (* Emit pending statements from thrown expression *)
@@ -697,7 +740,7 @@ and write_stmt (w : writer) (s : tc_stmt) : unit =
       (* Exception throw: begin unwinding, then throw boxed FibDynamic *)
       write w "fib_exception_begin(); fib_throw(";
       write_expr w e;
-      write w ")";
+      write w ");";
       newline w
   
   (* GC integration *)
@@ -1114,26 +1157,9 @@ let write_closure_impl (w : writer) (cl : tc_closure) ~(debug_level : int) : uni
             dedent w
         | None -> ());
         newline w
-    | TCSTry tr ->
-        (* Recurse into try/catch blocks *)
-        write w "FIB_TRY {";
-        newline w;
-        indent w;
-        List.iter write_stmt_with_gc_cleanup tr.try_body;
-        dedent w;
-        write w "}";
-        List.iter (fun catch ->
-          writef w " FIB_CATCH(%s, " catch.catch_var;
-          write_type w catch.catch_type;
-          write w ") {";
-          newline w;
-          indent w;
-          List.iter write_stmt_with_gc_cleanup catch.catch_body;
-          dedent w;
-          write w "}"
-        ) tr.try_catches;
-        write w " FIB_END_TRY";
-        newline w
+    | TCSTry _ ->
+        (* Try/catch: delegate to write_stmt which handles full FIB_TRY emission *)
+        write_stmt w stmt
     | _ ->
         (* All other statements: emit normally *)
         write_stmt w stmt
