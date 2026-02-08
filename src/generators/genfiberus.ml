@@ -817,6 +817,12 @@ and gen_builtin_call ctx e args =
 			gen_value ctx arg;
 			spr ctx ")");
 		true
+	(* String.fromCharCode(code) -> fib_string_from_char_code(code) *)
+	| TField (_, FStatic ({ cl_path = ([], "String") }, { cf_name = "fromCharCode" })), [code] ->
+		spr ctx "fib_string_from_char_code(";
+		gen_value ctx code;
+		spr ctx ")";
+		true
 	(* Static method call: Class.method(args) -> Class_method(args) 
 	   Needed when called with TFunction arguments *)
 	| TField (_, FStatic (c, cf)), _ ->
@@ -3822,6 +3828,7 @@ let generate com =
 	Buffer.add_string build_xml "  <files id=\"haxe\"/>\n";
 	Buffer.add_string build_xml "  <files id=\"runtime\"/>\n";
 	Buffer.add_string build_xml "  <files id=\"gc\"/>\n";
+	Buffer.add_string build_xml "  <files id=\"simdutf\"/>\n";
 	if tracy_enabled then
 		Buffer.add_string build_xml "  <files id=\"tracy\"/>\n";
 	Buffer.add_string build_xml "  <lib name=\"-lpthread\" if=\"linux\"/>\n";

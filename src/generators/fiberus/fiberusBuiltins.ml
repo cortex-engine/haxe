@@ -117,7 +117,8 @@ let string_method_of_name (name : string) : string_method option =
   match name with
   | "charAt" -> Some StrCharAt
   | "charCodeAt" -> Some StrCharCodeAt
-  | "substring" | "substr" -> Some StrSubstring
+  | "substring" -> Some StrSubstring
+  | "substr" -> Some StrSubstr
   | "indexOf" -> Some StrIndexOf
   | "lastIndexOf" -> Some StrLastIndexOf
   | "split" -> Some StrSplit
@@ -131,7 +132,8 @@ let string_method_func (method_ : string_method) : string =
   match method_ with
   | StrCharAt -> "fib_string_char_at_str"
   | StrCharCodeAt -> "fib_string_char_code_at"
-  | StrSubstring | StrSubstr -> "fib_string_substr"
+  | StrSubstring -> "fib_string_substring"
+  | StrSubstr -> "fib_string_substr"
   | StrIndexOf -> "fib_string_index_of"
   | StrLastIndexOf -> "fib_string_last_index_of"
   | StrSplit -> "fib_string_split"

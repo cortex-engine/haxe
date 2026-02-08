@@ -189,6 +189,8 @@ let rec is_allocating_expr (e : tc_expr) : bool =
   | TCECall (TCTFunc "fib_string_from_int64", _) -> true
   | TCECall (TCTFunc "fib_string_format", _) -> true
   | TCECall (TCTFunc "fib_string_substring", _) -> true
+  | TCECall (TCTFunc "fib_string_substr", _) -> true
+  | TCECall (TCTFunc "fib_string_from_char_code", _) -> true
   | TCECall (TCTFunc "fib_dynamic_to_string", _) -> true
   
   (* Object/array allocations *)
@@ -2029,10 +2031,15 @@ and convert_string_call ctx str_expr args arg_exprs method_name result_tc pos =
       let idx_expr = arg_or_int_default 0 0 in
       mk_expr_pos (TCECall (TCTFunc "fib_string_char_code_at", [str_expr; idx_expr])) TCInt32 pos
   
-  | "substring" | "substr" ->
+  | "substr" ->
       let start_expr = arg_or_int_default 0 0 in
       let len_expr = arg_or_int_default 1 (-1) in
       mk_expr_pos (TCECall (TCTFunc "fib_string_substr", [str_expr; start_expr; len_expr])) TCFibString pos
+  
+  | "substring" ->
+      let start_expr = arg_or_int_default 0 0 in
+      let end_expr = arg_or_int_default 1 (-1) in
+      mk_expr_pos (TCECall (TCTFunc "fib_string_substring", [str_expr; start_expr; end_expr])) TCFibString pos
   
   | "indexOf" ->
       let needle_expr = arg_or_string_default 0 "" in
@@ -2617,6 +2624,13 @@ and convert_call ctx callee args result_tc pos =
   in
   
   match callee.eexpr with
+  (* String.fromCharCode(code) -> fib_string_from_char_code(code) *)
+  | TField (_, FStatic ({ cl_path = ([], "String") }, { cf_name = "fromCharCode" })) ->
+      let coerced_args = coerce_args arg_exprs [TCInt32] in
+      let args_pending = collect_pending coerced_args in
+      let call = mk_expr_pos (TCECall (TCTFunc "fib_string_from_char_code", coerced_args)) result_tc pos in
+      { call with pending_stmts = args_pending @ call.pending_stmts }
+
   (* Static method call *)
   | TField (_, FStatic (c, cf)) ->
       let class_name = flat_path c.cl_path in
