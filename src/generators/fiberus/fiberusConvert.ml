@@ -49,6 +49,8 @@ type conv_ctx = {
   method_thunks: (string, tc_method_thunk) Hashtbl.t;  (* thunk_name -> thunk info *)
   (* Debug/codegen options *)
   debug_level: int;                   (* 0=none, 1=function, 2=line *)
+  mutable last_line: int;             (* Last emitted FIBLINE number (for dedup) *)
+  has_stack_frame: bool;              (* True if function has FIB_STACKFRAME — FIBLINE requires it *)
 }
 
 (* Create an empty conversion context *)
@@ -72,6 +74,8 @@ let empty_ctx = {
   stack_alloc_vars = Hashtbl.create 0;
   method_thunks = Hashtbl.create 0;
   debug_level = 0;
+  last_line = 0;
+  has_stack_frame = false;
 }
 
 (* Create context with current class *)
@@ -3256,8 +3260,25 @@ and convert_tvar_stmt (ctx : conv_ctx) (v : tvar) (init_opt : texpr option) : tc
  * Statement Conversion
  * ============================================================================ *)
 
+(* Emit TCSLine if source line changed since last emission (dedup like hxcpp HXLINE).
+   Only active at debug_level >= 2 and when function has a stack frame (FIBLINE
+   references _fib_stackframe which is only declared by FIB_STACKFRAME). *)
+and maybe_emit_line ctx (e : texpr) : tc_stmt list =
+  if ctx.debug_level < 2 || not ctx.has_stack_frame then []
+  else
+    let line = Lexer.get_error_line e.epos in
+    if line <> ctx.last_line && line > 0 then begin
+      ctx.last_line <- line;
+      [TCSLine line]
+    end else
+      []
+
 and convert_stmt (ctx : conv_ctx) (e : texpr) : tc_stmt list =
-  match e.eexpr with
+  let line_stmts = match e.eexpr with
+    | TBlock _ -> []
+    | _ -> maybe_emit_line ctx e
+  in
+  let stmts = match e.eexpr with
   (* Variable declaration *)
   | TVar (v, init_opt) ->
       convert_tvar_stmt ctx v init_opt
@@ -3555,6 +3576,8 @@ and convert_stmt (ctx : conv_ctx) (e : texpr) : tc_stmt list =
   | _ ->
       let expr = convert_expr ctx e in
       [TCSExpr expr]
+  in
+  line_stmts @ stmts
 
 (* ============================================================================
  * Function Conversion
@@ -3574,7 +3597,7 @@ let convert_function ctx name func is_static class_name_opt =
     | _ -> args
   in
   (* Set return type in context for proper coercion *)
-  let body_ctx = { ctx with current_ret_type = Some ret_type } in
+  let body_ctx = { ctx with current_ret_type = Some ret_type; last_line = 0; has_stack_frame = false } in
   let body = convert_stmt body_ctx func.tf_expr in
   {
     fd_name = name;
@@ -3641,6 +3664,8 @@ let convert_class_method ctx name (func : tfunc) is_static class_name =
     in_gc_frame = true;
     fiber_mature_vars = escape_result.fiber_mature_vars;
     stack_alloc_vars = escape_result.stack_allocatable;
+    last_line = 0;  (* Reset for fresh FIBLINE dedup per function *)
+    has_stack_frame = ctx.debug_level > 0;  (* TCSStackFrame emitted when debug_level > 0 *)
   } in
   let body_stmts = convert_stmt body_ctx func.tf_expr in
   (* Mark non-GC locals as volatile if function body contains try/catch *)
@@ -3750,6 +3775,8 @@ let convert_constructor ctx (c : tclass) =
               in_gc_frame = init_needs_gc_ctx;
               fiber_mature_vars = escape_result.fiber_mature_vars;
               stack_alloc_vars = escape_result.stack_allocatable;
+              last_line = 0;  (* Reset for fresh FIBLINE dedup per function *)
+              has_stack_frame = false;  (* _init has no FIB_STACKFRAME *)
             } in
             let init_body_stmts = convert_stmt init_body_ctx func.tf_expr in
             let init_body_stmts = mark_volatile_for_try init_body_stmts in

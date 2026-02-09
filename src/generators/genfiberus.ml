@@ -88,6 +88,8 @@ let make_conv_ctx ctx =
     FiberusConvert.stack_alloc_vars = ctx.stack_alloc_vars;
     FiberusConvert.method_thunks = ctx.cast_method_thunks;
     FiberusConvert.debug_level = ctx.debug_level;
+    FiberusConvert.last_line = 0;
+    FiberusConvert.has_stack_frame = false;
   }
 
 (* Sync closure state from conv_ctx back to genfiberus ctx, return collected closures *)
