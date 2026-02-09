@@ -378,6 +378,7 @@ and tc_class_meta = {
   cm_instance_size: string;                 (* sizeof expression, e.g. "sizeof(ClassName)" *)
   cm_super: string option;                  (* Parent class C name, or None *)
   cm_mark_func: string option;              (* Mark function name, or None *)
+  cm_tostring_func: string option;          (* toString function name, or None *)
   cm_vtable_name: string option;            (* Vtable variable name, or None *)
   cm_vtable_size: int;
 }

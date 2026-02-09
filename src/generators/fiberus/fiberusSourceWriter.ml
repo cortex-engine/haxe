@@ -1054,6 +1054,10 @@ let write_decl (w : writer) (d : tc_decl) : unit =
         newline w;
         write w ".fieldCount = 0,";
         newline w;
+        (match cm.cm_tostring_func with
+        | Some func -> writef w ".toStringFunc = (FibToStringFunc)%s," func
+        | None -> write w ".toStringFunc = NULL,");
+        newline w;
         (match cm.cm_vtable_name with
         | Some vt -> writef w ".vtable = %s," vt
         | None -> write w ".vtable = NULL,");

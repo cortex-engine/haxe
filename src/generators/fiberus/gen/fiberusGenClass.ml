@@ -213,6 +213,24 @@ let gen_struct_def (c : tclass) : tc_struct_def =
   }
 
 (* Generate class metadata structure *)
+(*
+ * Find the toString function for a class.
+ * Searches the class and its parent chain for a toString instance method.
+ * Returns the C function name (e.g. "ClassName_toString") or None.
+ *)
+let rec find_tostring_func (c : tclass) : string option =
+  let has_tostring = List.exists (fun cf ->
+    cf.cf_name = "toString" &&
+    (match cf.cf_kind with Method _ -> true | _ -> false) &&
+    not (has_class_field_flag cf CfStatic)
+  ) c.cl_ordered_fields in
+  if has_tostring then
+    Some (flat_path c.cl_path ^ "_toString")
+  else
+    match c.cl_super with
+    | Some (parent, _) -> find_tostring_func parent
+    | None -> None
+
 let gen_class_meta (c : tclass) (class_id : int) (vtable_size : int) : tc_class_meta =
   let class_name = flat_path c.cl_path in
   let super_name = match c.cl_super with
@@ -220,6 +238,7 @@ let gen_class_meta (c : tclass) (class_id : int) (vtable_size : int) : tc_class_
     | None -> None
   in
   let mark_func = if needs_mark_function c then Some (class_name ^ "_mark") else None in
+  let tostring_func = find_tostring_func c in
   {
     cm_name = s_type_path c.cl_path;
     cm_var_name = class_name;
@@ -227,6 +246,7 @@ let gen_class_meta (c : tclass) (class_id : int) (vtable_size : int) : tc_class_
     cm_instance_size = "sizeof(" ^ class_name ^ ")";
     cm_super = super_name;
     cm_mark_func = mark_func;
+    cm_tostring_func = tostring_func;
     cm_vtable_name = if vtable_size > 0 then Some (class_name ^ "_vtable") else None;
     cm_vtable_size = vtable_size;
   }

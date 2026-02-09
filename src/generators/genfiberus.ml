@@ -264,6 +264,7 @@ let gen_class_impl ctx c =
 		end;
 
 		(* 3. FibClass struct *)
+		let tostring_func = FiberusGenClass.find_tostring_func c in
 		add (TCDClassMeta {
 			cm_name = s_type_path c.cl_path;
 			cm_var_name = class_name;
@@ -271,6 +272,7 @@ let gen_class_impl ctx c =
 			cm_instance_size = Printf.sprintf "sizeof(%s)" class_name;
 			cm_super = (match c.cl_super with Some (p, _) -> Some (flat_path p.cl_path) | None -> None);
 			cm_mark_func = if has_mark_func then Some (class_name ^ "_mark") else None;
+			cm_tostring_func = tostring_func;
 			cm_vtable_name = if vtable_size > 0 then Some (class_name ^ "_vtable") else None;
 			cm_vtable_size = vtable_size;
 		});
