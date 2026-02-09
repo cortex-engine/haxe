@@ -353,9 +353,9 @@ let unbox_func_name = function
   | TCInt64 -> "fib_dynamic_to_int64"
   | TCFloat64 | TCFloat32 -> "fib_dynamic_to_float"
   | TCBool -> "fib_dynamic_to_bool"
-  | TCFibString -> "fib_dynamic_to_string"
+  | TCFibString -> "fib_dynamic_extract_string"
   | TCFibArray _ -> "fib_dynamic_to_array"
-  | TCFibObject | TCFibClass _ -> "fib_dynamic_to_object"
+  | TCFibObject | TCFibClass _ | TCFibClosure -> "fib_dynamic_to_object"
   | TCFibEnum _ -> "fib_dynamic_to_ptr"  (* Returns void*, needs cast and deref *)
   | _ -> ""
 

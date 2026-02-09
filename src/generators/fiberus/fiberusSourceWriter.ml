@@ -524,6 +524,7 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
           | TCFloat64 -> writef w "fib_dynamic_float(%s)" var_name
           | TCBool -> writef w "fib_dynamic_bool(%s)" var_name
           | TCFibString -> writef w "fib_dynamic_string(%s)" var_name
+          | TCFibDynamic -> write w var_name
           | _ -> writef w "(FibDynamic){.type=FIB_TYPE_OBJECT, .data.ptrVal=%s}" var_name
         ) cc.cc_captures;
         write w ")"
@@ -1083,6 +1084,7 @@ let capture_extract_expr (cap : tc_capture) : string =
   | TCBool -> Printf.sprintf "_closure->captures[%d].data.boolVal" idx
   | TCFibString -> Printf.sprintf "_closure->captures[%d].data.stringVal" idx
   | TCFibClosure -> Printf.sprintf "(FibClosure*)_closure->captures[%d].data.ptrVal" idx
+  | TCFibDynamic -> Printf.sprintf "_closure->captures[%d]" idx
   | t -> Printf.sprintf "(%s)_closure->captures[%d].data.ptrVal" (tc_type_to_string t) idx
 
 (* Helper: get C expression for boxing value to FibDynamic based on type *)
@@ -1094,6 +1096,7 @@ let box_to_dynamic (var_name : string) (t : tc_type) : string =
   | TCBool -> Printf.sprintf "fib_dynamic_bool(%s)" var_name
   | TCFibString -> Printf.sprintf "fib_dynamic_string(%s)" var_name
   | TCVoid -> "fib_dynamic_null()"
+  | TCFibDynamic -> var_name  (* Already a FibDynamic, pass through *)
   | _ -> Printf.sprintf "(FibDynamic){.type=FIB_TYPE_OBJECT, .data.ptrVal=%s}" var_name
 
 (* Helper: get C expression for unboxing FibDynamic to typed value *)
@@ -1103,7 +1106,7 @@ let unbox_from_dynamic (arg_name : string) (t : tc_type) : string =
   | TCInt64 -> Printf.sprintf "fib_dynamic_to_int64(%s)" arg_name
   | TCFloat64 -> Printf.sprintf "fib_dynamic_to_float(%s)" arg_name
   | TCBool -> Printf.sprintf "fib_dynamic_to_bool(%s)" arg_name
-  | TCFibString -> Printf.sprintf "fib_dynamic_to_string(%s)" arg_name
+  | TCFibString -> Printf.sprintf "fib_dynamic_extract_string(%s)" arg_name
   | TCFibClosure -> Printf.sprintf "(FibClosure*)fib_dynamic_to_object(%s)" arg_name
   | TCFibDynamic -> arg_name  (* Pass through unchanged *)
   | t -> Printf.sprintf "(%s)fib_dynamic_to_object(%s)" (tc_type_to_string t) arg_name

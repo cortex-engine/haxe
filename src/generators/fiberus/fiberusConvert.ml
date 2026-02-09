@@ -41,6 +41,7 @@ type conv_ctx = {
   mutable closures: tc_closure list;  (* Closures created during conversion *)
   mutable in_fiber_spawn: bool;       (* True if inside Fiber.spawn context *)
   mutable spawn_counter: int;         (* Counter for unique Fiber.spawn temp variable names *)
+  mutable temp_counter: int;          (* Counter for unique temp variable names *)
   (* Fiber-escape analysis *)
   fiber_mature_vars: (int, unit) Hashtbl.t;  (* var_ids needing mature allocation *)
   (* Stack allocation escape analysis *)
@@ -70,6 +71,7 @@ let empty_ctx = {
   closures = [];
   in_fiber_spawn = false;
   spawn_counter = 0;
+  temp_counter = 0;
   fiber_mature_vars = Hashtbl.create 0;
   stack_alloc_vars = Hashtbl.create 0;
   method_thunks = Hashtbl.create 0;
@@ -245,9 +247,27 @@ let coerce_to_type expr target_tc =
   else if expr.ctype = TCFibDynamic && target_tc <> TCFibDynamic then
     (* Unbox from FibDynamic *)
     mk_expr (TCEUnbox (expr, target_tc)) target_tc
+  else if (expr.ctype = TCInt32 || expr.ctype = TCInt64) && (target_tc = TCFloat64 || target_tc = TCFloat32) then
+    (* Numeric promotion: Int -> Float *)
+    mk_expr (TCECast (target_tc, expr)) target_tc
+  else if (expr.ctype = TCFloat64 || expr.ctype = TCFloat32) && (target_tc = TCInt32 || target_tc = TCInt64) then
+    (* Numeric truncation: Float -> Int *)
+    mk_expr (TCECast (target_tc, expr)) target_tc
   else
     (* Other type conversions - just return as-is for now *)
     expr
+
+(* Box all arguments to FibDynamic for use in _fib_dyn_call_N *)
+let box_args_for_dynamic_call args =
+  List.map (fun arg ->
+    if arg.ctype = TCFibDynamic then arg
+    else mk_expr (TCEBox (arg, box_kind_of_type arg.ctype)) TCFibDynamic
+  ) args
+
+(* Wrap a TCEDynamicCall result with TCEUnbox if the expected return type is not Dynamic/Void *)
+let unwrap_dynamic_result dyn_call result_tc =
+  if result_tc = TCFibDynamic || result_tc = TCVoid then dyn_call
+  else { (mk_expr (TCEUnbox (dyn_call, result_tc)) result_tc) with cpos = dyn_call.cpos; pending_stmts = dyn_call.pending_stmts }
 
 (* ============================================================================
  * GC Safety for Nested Allocating Expressions
@@ -295,6 +315,7 @@ let rec is_allocating_expr (e : tc_expr) : bool =
   | TCECall (TCTFunc "fib_string_substr", _) -> true
   | TCECall (TCTFunc "fib_string_from_char_code", _) -> true
   | TCECall (TCTFunc "fib_dynamic_to_string", _) -> true
+  | TCECall (TCTFunc "fib_dynamic_extract_string", _) -> true
   
   (* Object/array allocations *)
   | TCENew _ -> true
@@ -1346,13 +1367,37 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
       let e1_ex = extract_fib_dynamic e1_expr TCInt32 in
       let e2_ex = extract_fib_dynamic e2_expr TCInt32 in
       let c_op = convert_binop inner_op in
-      let result = mk_expr (TCEBinop (c_op, e1_ex, e2_ex)) TCInt32 in
-      let boxed = mk_expr (TCECall (TCTFunc "fib_dynamic_int", [result])) TCFibDynamic in
-      let assign = mk_expr_pos (TCEAssign (e1_expr, boxed)) TCFibDynamic pos in
-      (* Propagate pending_stmts from both operands *)
-      { assign with 
-        pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ assign.pending_stmts;
-        gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
+      (* Check for nested compound assignment — same UB issue as regular case *)
+      let is_nested_assign = match e2.Type.eexpr with
+        | Type.TBinop (Ast.OpAssignOp _, _, _) | Type.TBinop (Ast.OpAssign, _, _) -> true
+        | _ -> false
+      in
+      if is_nested_assign then begin
+        (* Save outer LHS extracted value before inner assignment *)
+        let save_name = Printf.sprintf "_cmpd_%d" ctx.temp_counter in
+        ctx.temp_counter <- ctx.temp_counter + 1;
+        let save_var = TCSVar { vd_name = save_name; vd_type = TCInt32; vd_init = Some e1_ex; vd_static = false; vd_const = false; vd_volatile = false } in
+        let save_ref = mk_expr (TCELocal save_name) TCInt32 in
+        (* Evaluate inner and save its result *)
+        let rhs_name = Printf.sprintf "_cmpd_%d" ctx.temp_counter in
+        ctx.temp_counter <- ctx.temp_counter + 1;
+        let rhs_var = TCSVar { vd_name = rhs_name; vd_type = TCInt32; vd_init = Some e2_ex; vd_static = false; vd_const = false; vd_volatile = false } in
+        let rhs_ref = mk_expr (TCELocal rhs_name) TCInt32 in
+        (* Compute outer: lhs = box(saved op rhs_result) *)
+        let result = mk_expr (TCEBinop (c_op, save_ref, rhs_ref)) TCInt32 in
+        let boxed = mk_expr (TCECall (TCTFunc "fib_dynamic_int", [result])) TCFibDynamic in
+        let assign = mk_expr_pos (TCEAssign (e1_expr, boxed)) TCFibDynamic pos in
+        { assign with
+          pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ e1_ex.pending_stmts @ e2_ex.pending_stmts @ [save_var; rhs_var] }
+      end else begin
+        let result = mk_expr (TCEBinop (c_op, e1_ex, e2_ex)) TCInt32 in
+        let boxed = mk_expr (TCECall (TCTFunc "fib_dynamic_int", [result])) TCFibDynamic in
+        let assign = mk_expr_pos (TCEAssign (e1_expr, boxed)) TCFibDynamic pos in
+        (* Propagate pending_stmts from both operands *)
+        { assign with 
+          pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ assign.pending_stmts;
+          gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
+      end
   
   (* Regular compound assignment *)
   | OpAssignOp inner_op ->
@@ -1360,11 +1405,36 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
       let e2_expr = convert_expr ctx e2 in
       let e2_ex = extract_fib_dynamic e2_expr e1_expr.ctype in
       let c_op = convert_binop inner_op in
-      let result = mk_expr_pos (TCEAssignOp (c_op, e1_expr, e2_ex)) e1_expr.ctype pos in
-      (* Propagate pending_stmts from both operands *)
-      { result with 
-        pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
-        gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
+      (* Check if RHS is itself an assignment (nested compound assign).
+         In C, (x += (x += 1)) is undefined behavior because x is read and
+         written without a sequence point. We must sequence via temporaries. *)
+      let is_nested_assign = match e2.Type.eexpr with
+        | Type.TBinop (Ast.OpAssignOp _, _, _) | Type.TBinop (Ast.OpAssign, _, _) -> true
+        | _ -> false
+      in
+      if is_nested_assign then begin
+        (* Save outer LHS value before inner assignment modifies it *)
+        let save_name = Printf.sprintf "_cmpd_%d" ctx.temp_counter in
+        ctx.temp_counter <- ctx.temp_counter + 1;
+        let save_var = TCSVar { vd_name = save_name; vd_type = e1_expr.ctype; vd_init = Some e1_expr; vd_static = false; vd_const = false; vd_volatile = false } in
+        let save_ref = mk_expr (TCELocal save_name) e1_expr.ctype in
+        (* Evaluate inner compound assign and save its result *)
+        let rhs_name = Printf.sprintf "_cmpd_%d" ctx.temp_counter in
+        ctx.temp_counter <- ctx.temp_counter + 1;
+        let rhs_var = TCSVar { vd_name = rhs_name; vd_type = e2_ex.ctype; vd_init = Some e2_ex; vd_static = false; vd_const = false; vd_volatile = false } in
+        let rhs_ref = mk_expr (TCELocal rhs_name) e2_ex.ctype in
+        (* Compute outer: lhs = saved_lhs op rhs_result *)
+        let sum = mk_expr (TCEBinop (c_op, save_ref, rhs_ref)) e1_expr.ctype in
+        let assign = mk_expr_pos (TCEAssign (e1_expr, sum)) e1_expr.ctype pos in
+        { assign with
+          pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ e2_ex.pending_stmts @ [save_var; rhs_var] }
+      end else begin
+        let result = mk_expr_pos (TCEAssignOp (c_op, e1_expr, e2_ex)) e1_expr.ctype pos in
+        (* Propagate pending_stmts from both operands *)
+        { result with 
+          pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+          gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
+      end
   
   (* === NULL COMPARISONS === *)
   
@@ -1476,10 +1546,10 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
       let e1_expr = convert_expr ctx e1 in
       let e2_expr = convert_expr ctx e2 in
       let s1 = if e1_expr.ctype = TCFibDynamic 
-               then mk_expr (TCECall (TCTFunc "fib_dynamic_to_string", [e1_expr])) TCFibString 
+               then mk_expr (TCECall (TCTFunc "fib_dynamic_extract_string", [e1_expr])) TCFibString 
                else e1_expr in
       let s2 = if e2_expr.ctype = TCFibDynamic 
-               then mk_expr (TCECall (TCTFunc "fib_dynamic_to_string", [e2_expr])) TCFibString 
+               then mk_expr (TCECall (TCTFunc "fib_dynamic_extract_string", [e2_expr])) TCFibString 
                else e2_expr in
       let result = mk_expr_pos (TCEStringEq (s1, s2)) TCBool pos in
       (* Propagate pending_stmts from both operands *)
@@ -1492,10 +1562,10 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
       let e1_expr = convert_expr ctx e1 in
       let e2_expr = convert_expr ctx e2 in
       let s1 = if e1_expr.ctype = TCFibDynamic 
-               then mk_expr (TCECall (TCTFunc "fib_dynamic_to_string", [e1_expr])) TCFibString 
+               then mk_expr (TCECall (TCTFunc "fib_dynamic_extract_string", [e1_expr])) TCFibString 
                else e1_expr in
       let s2 = if e2_expr.ctype = TCFibDynamic 
-               then mk_expr (TCECall (TCTFunc "fib_dynamic_to_string", [e2_expr])) TCFibString 
+               then mk_expr (TCECall (TCTFunc "fib_dynamic_extract_string", [e2_expr])) TCFibString 
                else e2_expr in
       let eq = mk_expr (TCEStringEq (s1, s2)) TCBool in
       let result = mk_expr_pos (TCEUnop (TCUNot, eq)) TCBool pos in
@@ -1850,9 +1920,11 @@ and convert_unop_expr ctx op flag inner result_tc pos =
         let result = mk_expr (TCECall (TCTFunc "fib_dynamic_to_int", [inner_expr])) TCInt32 in
         { result with pending_stmts = result.pending_stmts @ [assign]; cpos = pos }
       end else begin
-        (* Post: save _old = fib_dynamic_to_int(e), assign e = fib_dynamic_int(_old +/- 1), return _old *)
-        let old_var = TCSVar { vd_name = "_old"; vd_type = TCInt32; vd_init = Some extract; vd_static = false; vd_const = false; vd_volatile = false } in
-        let old_ref = mk_expr (TCELocal "_old") TCInt32 in
+        (* Post: save _old_N = fib_dynamic_to_int(e), assign e = fib_dynamic_int(_old_N +/- 1), return _old_N *)
+        let old_name = Printf.sprintf "_old_%d" ctx.temp_counter in
+        ctx.temp_counter <- ctx.temp_counter + 1;
+        let old_var = TCSVar { vd_name = old_name; vd_type = TCInt32; vd_init = Some extract; vd_static = false; vd_const = false; vd_volatile = false } in
+        let old_ref = mk_expr (TCELocal old_name) TCInt32 in
         let new_val = mk_expr (TCEBinop (delta_op, old_ref, one)) TCInt32 in
         let boxed = mk_expr (TCECall (TCTFunc "fib_dynamic_int", [new_val])) TCFibDynamic in
         let assign = TCSExpr (mk_expr (TCEAssign (inner_expr, boxed)) TCFibDynamic) in
@@ -2051,7 +2123,43 @@ and convert_field_access ctx obj fa result_tc pos =
   (* Static field *)
   | FStatic (c, cf) ->
       let class_name = flat_path c.cl_path in
-      mk_expr_pos (TCEStatic (class_name, ident cf.cf_name)) result_tc pos
+      (* Check if this is a static METHOD used as a value (not a call).
+         The Haxe AST uses FStatic for both static var access and static method-as-value
+         (unlike instance methods, which get FClosure). We detect method-as-value when
+         the result type is a closure/function type. *)
+      (match cf.cf_kind with
+      | Method _ when result_tc = TCFibClosure || result_tc = TCFibDynamic ->
+          (* Static method reference — wrap in FibClosure via method thunk *)
+          let method_name = ident cf.cf_name in
+          let thunk_name = Printf.sprintf "__%s_%s_thunk" class_name method_name in
+          let dyn_thunk_name = thunk_name ^ "_dyn" in
+          let arg_types, ret_type = match Type.follow cf.cf_type with
+            | TFun (args, ret) ->
+                (List.map (fun (n, _, t) -> (n, tc_type_of t)) args,
+                 tc_type_of ret)
+            | _ -> ([], TCFibDynamic)
+          in
+          let arg_count = List.length arg_types in
+          let thunk = {
+            mth_thunk_name = thunk_name;
+            mth_dyn_thunk_name = dyn_thunk_name;
+            mth_is_static = true;
+            mth_class_name = class_name;
+            mth_method_name = method_name;
+            mth_args = arg_types;
+            mth_ret_type = ret_type;
+          } in
+          Hashtbl.replace ctx.method_thunks thunk_name thunk;
+          mk_expr_pos (TCEMethodClosure {
+            mc_thunk_name = thunk_name;
+            mc_dyn_thunk_name = dyn_thunk_name;
+            mc_is_static = true;
+            mc_arg_count = arg_count;
+            mc_obj = None;
+          }) TCFibClosure pos
+      | _ ->
+          (* Regular static field/variable access *)
+          mk_expr_pos (TCEStatic (class_name, ident cf.cf_name)) result_tc pos)
   
   (* Instance field - special cases for Array.length and String.length *)
   | FInstance (c, _, cf) ->
@@ -2077,7 +2185,7 @@ and convert_field_access ctx obj fa result_tc pos =
           (* If object came from dynamic field, need to convert from FibDynamic first *)
           let str_expr = 
             if is_dynamic_field_expr obj then
-              mk_expr (TCECall (TCTFunc "fib_dynamic_to_string", [safe_str])) TCFibString
+              mk_expr (TCECall (TCTFunc "fib_dynamic_extract_string", [safe_str])) TCFibString
             else
               safe_str
           in
@@ -2332,7 +2440,7 @@ and convert_string_call ctx str_expr args arg_exprs method_name result_tc pos =
   (* Coerce FibDynamic to string if needed *)
   let str_expr = 
     if str_expr.ctype = TCFibDynamic then
-      mk_expr (TCECall (TCTFunc "fib_dynamic_to_string", [str_expr])) TCFibString
+      mk_expr (TCECall (TCTFunc "fib_dynamic_extract_string", [str_expr])) TCFibString
     else str_expr
   in
   
@@ -2942,6 +3050,12 @@ and convert_call ctx callee args result_tc pos =
     else if arg_expr.ctype = TCFibDynamic && param_tc <> TCFibDynamic then
       (* Unbox from FibDynamic - except for null which should use default *)
       mk_expr (TCEUnbox (arg_expr, param_tc)) param_tc
+    else if (arg_expr.ctype = TCInt32 || arg_expr.ctype = TCInt64) && (param_tc = TCFloat64 || param_tc = TCFloat32) then
+      (* Numeric promotion: Int -> Float *)
+      mk_expr (TCECast (param_tc, arg_expr)) param_tc
+    else if (arg_expr.ctype = TCFloat64 || arg_expr.ctype = TCFloat32) && (param_tc = TCInt32 || param_tc = TCInt64) then
+      (* Numeric truncation: Float -> Int *)
+      mk_expr (TCECast (param_tc, arg_expr)) param_tc
     else
       arg_expr
   in
@@ -2950,6 +3064,23 @@ and convert_call ctx callee args result_tc pos =
   let get_param_tc_types func_type =
     match Type.follow func_type with
     | Type.TFun (params, _) -> List.map (fun (_, _, t) -> tc_type_of t) params
+    | _ -> []
+  in
+
+  (* Get parameter types for closure calls, respecting the optional flag.
+     CTFunction annotations like (Int, ?Int)->Int store bare Int with opt=true,
+     but closure impls/thunks use FibDynamic for optional primitives (Null<T>).
+     This variant ensures the function pointer cast matches the actual thunk signature. *)
+  let get_closure_param_tc_types func_type =
+    match Type.follow func_type with
+    | Type.TFun (params, _) -> List.map (fun (_, opt, t) ->
+        let tc = tc_type_of t in
+        if opt then
+          match tc with
+          | TCInt32 | TCInt64 | TCFloat64 | TCFloat32 | TCBool -> TCFibDynamic
+          | _ -> tc
+        else tc
+      ) params
     | _ -> []
   in
   
@@ -3078,10 +3209,12 @@ and convert_call ctx callee args result_tc pos =
       let field_name = mk_raw_string cf.cf_name in
       (* Collect pending_stmts from arguments *)
       let args_pending = collect_pending arg_exprs in
+      let boxed_args = box_args_for_dynamic_call arg_exprs in
       let call_result = wrap_single_gc_extraction_ctx (Some ctx) (fun safe_obj ->
         (* Get closure from dynamic field, then call it *)
         let closure = mk_expr (TCECall (TCTFunc "fib_dynamic_get_field", [safe_obj; field_name])) TCFibClosure in
-        mk_expr_pos (TCEDynamicCall { closure; args = arg_exprs }) result_tc pos
+        let dyn_call = mk_expr_pos (TCEDynamicCall { closure; args = boxed_args }) TCFibDynamic pos in
+        unwrap_dynamic_result dyn_call result_tc
       ) obj_expr in
       { call_result with pending_stmts = args_pending @ call_result.pending_stmts }
   
@@ -3090,9 +3223,11 @@ and convert_call ctx callee args result_tc pos =
       let field_name = mk_raw_string name in
       (* Collect pending_stmts from arguments *)
       let args_pending = collect_pending arg_exprs in
+      let boxed_args = box_args_for_dynamic_call arg_exprs in
       let call_result = wrap_single_gc_extraction_ctx (Some ctx) (fun safe_obj ->
         let closure = mk_expr (TCECall (TCTFunc "fib_dynamic_get_field", [safe_obj; field_name])) TCFibClosure in
-        mk_expr_pos (TCEDynamicCall { closure; args = arg_exprs }) result_tc pos
+        let dyn_call = mk_expr_pos (TCEDynamicCall { closure; args = boxed_args }) TCFibDynamic pos in
+        unwrap_dynamic_result dyn_call result_tc
       ) obj_expr in
       { call_result with pending_stmts = args_pending @ call_result.pending_stmts }
   
@@ -3127,17 +3262,25 @@ and convert_call ctx callee args result_tc pos =
       let args_pending = collect_pending arg_exprs in
       let call = (match callee_expr.ctype with
       | TCFibClosure ->
-          (* Get arg types from the function type *)
-          let arg_types = List.map (fun e -> e.ctype) arg_exprs in
+          (* Get formal parameter types from callee's Haxe type for correct fn pointer cast.
+             This is critical for optional params: ?Int has formal type Null<Int> -> TCFibDynamic
+             in the closure impl, but the actual arg may be TCInt32. Using formal types ensures
+             the function pointer cast matches the closure's actual C signature. *)
+          let formal_param_types = get_closure_param_tc_types callee.etype in
+          let coerced_args = coerce_args arg_exprs formal_param_types in
+          let arg_types = if formal_param_types <> [] then formal_param_types
+                          else List.map (fun e -> e.ctype) coerced_args in
           mk_expr_pos (TCEClosureCall {
             closure = callee_expr;
             arg_types = arg_types;
             ret_type = result_tc;
-            args = arg_exprs;
+            args = coerced_args;
           }) result_tc pos
       | _ ->
-          (* Unknown callable - use dynamic call *)
-          mk_expr_pos (TCEDynamicCall { closure = callee_expr; args = arg_exprs }) result_tc pos) in
+          (* Unknown callable - use dynamic call, boxing args to FibDynamic *)
+          let boxed_args = box_args_for_dynamic_call arg_exprs in
+          let dyn_call = mk_expr_pos (TCEDynamicCall { closure = callee_expr; args = boxed_args }) TCFibDynamic pos in
+          unwrap_dynamic_result dyn_call result_tc) in
       { call with pending_stmts = callee_expr.pending_stmts @ args_pending @ call.pending_stmts }
 
 (* ============================================================================
