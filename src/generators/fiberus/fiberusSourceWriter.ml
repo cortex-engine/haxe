@@ -976,10 +976,13 @@ let write_decl (w : writer) (d : tc_decl) : unit =
   | TCDForwardFunc fs ->
       write_type w fs.fs_ret;
       writef w " %s(" fs.fs_name;
-      List.iteri (fun i typ ->
-        if i > 0 then write w ", ";
-        write_type w typ
-      ) fs.fs_args;
+      if fs.fs_args = [] then
+        write w "void"
+      else
+        List.iteri (fun i typ ->
+          if i > 0 then write w ", ";
+          write_type w typ
+        ) fs.fs_args;
       write w ");";
       newline w
   | TCDExtern vd ->
@@ -1000,6 +1003,66 @@ let write_decl (w : writer) (d : tc_decl) : unit =
       newline w
   | TCDRaw s ->
       write w s;
+      newline w
+  | TCDVtable vt ->
+      writef w "static void* %s[%d] = " vt.vt_name vt.vt_size;
+      with_block w (fun () ->
+        (* Build slot-indexed array: fill from entries, gaps become NULL *)
+        let slot_array = Array.make vt.vt_size None in
+        List.iter (fun entry ->
+          if entry.ve_slot >= 0 && entry.ve_slot < vt.vt_size then
+            slot_array.(entry.ve_slot) <- Some entry
+        ) vt.vt_entries;
+        for i = 0 to vt.vt_size - 1 do
+          (match slot_array.(i) with
+          | Some entry ->
+              writef w "(void*)%s" entry.ve_impl_name
+          | None ->
+              write w "NULL");
+          if i < vt.vt_size - 1 then write w ",";
+          writef w " /* slot %d */" i;
+          newline w
+        done
+      );
+      write w ";";
+      newline w;
+      newline w
+  | TCDClassMeta cm ->
+      writef w "FibClass %s_class = " cm.cm_var_name;
+      with_block w (fun () ->
+        writef w ".name = \"%s\"," cm.cm_name;
+        newline w;
+        writef w ".classId = %d," cm.cm_class_id;
+        newline w;
+        writef w ".instanceSize = %s," cm.cm_instance_size;
+        newline w;
+        (match cm.cm_super with
+        | Some parent -> writef w ".super = &%s_class," parent
+        | None -> write w ".super = NULL,");
+        newline w;
+        (match cm.cm_mark_func with
+        | Some func -> writef w ".markFunc = %s," func
+        | None -> write w ".markFunc = NULL,");
+        newline w;
+        write w ".construct = NULL,";
+        newline w;
+        write w ".destruct = NULL,";
+        newline w;
+        write w ".staticFields = NULL,";
+        newline w;
+        write w ".fieldNames = NULL,";
+        newline w;
+        write w ".fieldCount = 0,";
+        newline w;
+        (match cm.cm_vtable_name with
+        | Some vt -> writef w ".vtable = %s," vt
+        | None -> write w ".vtable = NULL,");
+        newline w;
+        writef w ".vtableSize = %d" cm.cm_vtable_size;
+        newline w
+      );
+      write w ";";
+      newline w;
       newline w
 
 (* ============================================================================

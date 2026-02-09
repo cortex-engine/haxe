@@ -139,19 +139,6 @@ let needs_gc_marking_tc = function
  * Class / Function Generation (via C-AST pipeline)
  * =========================================================================== *)
 
-let gen_function ctx name f c is_static =
-	let class_name = flat_path c.cl_path in
-	(* Create conversion context and generate via C-AST pipeline *)
-	let conv_ctx = make_conv_ctx ctx in
-	let func_def = FiberusConvert.convert_class_method conv_ctx name f is_static class_name in
-	(* Emit via SourceWriter *)
-	let w = FiberusSourceWriter.create () in
-	FiberusSourceWriter.write_decl w (TCDFunc func_def);
-	spr ctx (FiberusSourceWriter.contents w);
-	(* Sync closures back *)
-	let new_closures = sync_closures_from_conv ctx conv_ctx in
-	ctx.closures <- new_closures @ ctx.closures
-
 (* Generate a static variable declaration *)
 (* is_compile_time_constant now imported from FiberusGenClass *)
 
@@ -168,7 +155,7 @@ let needs_runtime_init cf =
 let get_runtime_init_fields c =
 	List.filter needs_runtime_init c.cl_ordered_statics
 
-let gen_static_var ctx c cf =
+let gen_static_var_decl ctx c cf =
 	let class_name = flat_path c.cl_path in
 	let tc = tc_type_of cf.cf_type in
 	let is_local_static = has_class_field_flag cf CfNoLookup in
@@ -183,39 +170,14 @@ let gen_static_var ctx c cf =
 			in
 			Some (mk_expr (TCERaw zero) tc)
 	in
-	let decl = TCDVar {
+	TCDVar {
 		vd_name = class_name ^ "_" ^ ident cf.cf_name;
 		vd_type = tc;
 		vd_init = init;
 		vd_static = is_local_static;
 		vd_const = false;
 		vd_volatile = false;
-	} in
-	let w = FiberusSourceWriter.create () in
-	FiberusSourceWriter.write_decl w decl;
-	spr ctx (FiberusSourceWriter.contents w)
-
-let gen_class_field ctx c cf is_static =
-	match cf.cf_expr with
-	| Some { eexpr = TFunction f } ->
-		gen_function ctx cf.cf_name f c is_static
-	| _ -> ()
-
-(* Generate constructor: ClassName_init(this, args) and ClassName_new(args) *)
-(* For simple constructors, these are generated inline in the header, so skip *)
-(* Now uses C-AST pipeline via FiberusConvert.convert_constructor *)
-let gen_constructor ctx c =
-	let conv_ctx = make_conv_ctx ctx in
-	match FiberusConvert.convert_constructor conv_ctx c with
-	| None -> ()  (* Empty or simple constructor — handled in header *)
-	| Some (init_func, new_func) ->
-		let w = FiberusSourceWriter.create () in
-		FiberusSourceWriter.write_decl w (TCDFunc init_func);
-		FiberusSourceWriter.write_decl w (TCDFunc new_func);
-		spr ctx (FiberusSourceWriter.contents w);
-		(* Sync closures back *)
-		let new_closures = sync_closures_from_conv ctx conv_ctx in
-		ctx.closures <- new_closures @ ctx.closures
+	}
 
 (* Generate a single class to its own .c file - returns the class implementation as string *)
 let gen_class_impl ctx c =
@@ -231,10 +193,11 @@ let gen_class_impl ctx c =
 		(* Clear C-AST method thunks table for this class *)
 		Hashtbl.clear ctx.cast_method_thunks;
 
-		Buffer.clear ctx.buf;
-		ctx.tabs <- "";
+		(* Collect all declarations into a list *)
+		let decls = ref [] in
+		let add d = decls := d :: !decls in
 
-		(* Collect instance fields that need GC marking *)
+		(* 1. Mark function — if there are GC pointer instance fields *)
 		let gc_fields = List.filter (fun cf ->
 			match cf.cf_kind with
 			| Var _ when not (has_class_field_flag cf CfStatic) ->
@@ -242,134 +205,87 @@ let gen_class_impl ctx c =
 				needs_gc_marking_tc type_tc
 			| _ -> false
 		) c.cl_ordered_fields in
-
-		(* Generate mark function if there are GC pointer fields *)
-		let has_mark_func = List.length gc_fields > 0 in
+		let has_mark_func = gc_fields <> [] in
 		if has_mark_func then begin
-			print ctx "static void %s_mark(FibObject* obj, MarkContext* ctx) {" class_name;
-			newline ctx;
-			print ctx "\t%s* this = (%s*)obj;" class_name class_name;
-			newline ctx;
-			List.iter (fun cf ->
-				let field_name = ident cf.cf_name in
-				print ctx "\tgc_mark_object(ctx, this->%s);" field_name;
-				newline ctx
-			) gc_fields;
-			spr ctx "}";
-			newline ctx;
-			newline ctx
+			let body =
+				[TCSRaw (Printf.sprintf "%s* this = (%s*)obj;" class_name class_name)]
+				@ List.map (fun cf ->
+					TCSRaw (Printf.sprintf "gc_mark_object(ctx, this->%s);" (ident cf.cf_name))
+				) gc_fields
+			in
+			add (TCDFunc {
+				fd_name = class_name ^ "_mark";
+				fd_ret = TCVoid;
+				fd_args = [
+					{ fa_name = "obj"; fa_type = TCPointer (TCRaw "FibObject") };
+					{ fa_name = "ctx"; fa_type = TCPointer (TCRaw "MarkContext") };
+				];
+				fd_body = body;
+				fd_static = true;
+				fd_inline = false;
+				fd_attrs = [];
+			})
 		end;
 
-		(* Generate vtable array if class has virtual methods *)
+		(* 2. Vtable array *)
 		let vtable_methods = match ctx.vtable_ctx with
 			| Some vctx -> FiberusVtable.get_vtable_methods vctx c
 			| None -> []
 		in
-		(* Vtable size is max_slot + 1, not count of methods *)
 		let vtable_size = match vtable_methods with
 			| [] -> 0
-			| _ -> 
+			| _ ->
 				let max_slot = List.fold_left (fun acc (slot, _, _) -> max acc slot) 0 vtable_methods in
 				max_slot + 1
 		in
 		if vtable_size > 0 then begin
-			print ctx "static void* %s_vtable[%d] = {" class_name vtable_size;
-			newline ctx;
-			(* Create a slot-indexed array for proper placement *)
-			let slot_array = Array.make vtable_size None in
-			List.iter (fun (slot, method_name, _cf) ->
-				(* Find which class actually implements this method *)
-				let impl_class = 
-					let rec find_impl c =
-						if List.exists (fun cf2 -> cf2.cf_name = method_name && FiberusVtable.is_instance_method cf2) c.cl_ordered_fields then
-							c
-						else match c.cl_super with
-							| Some (parent, _) -> find_impl parent
-							| None -> c (* fallback to current class *)
-					in
-					find_impl c
+			(* Build vtable entries, resolving implementation class for each method *)
+			let entries = List.map (fun (slot, method_name, _cf) ->
+				let rec find_impl c =
+					if List.exists (fun cf2 -> cf2.cf_name = method_name && FiberusVtable.is_instance_method cf2) c.cl_ordered_fields then
+						c
+					else match c.cl_super with
+						| Some (parent, _) -> find_impl parent
+						| None -> c
 				in
-				slot_array.(slot) <- Some (impl_class, method_name)
-			) vtable_methods;
-			(* Generate entries in slot order *)
-			for i = 0 to vtable_size - 1 do
-				ctx.tabs <- "\t";
-				(match slot_array.(i) with
-				| Some (impl_class, method_name) ->
-					let impl_class_name = flat_path impl_class.cl_path in
-					print ctx "(void*)%s_%s" impl_class_name (ident method_name)
-				| None ->
-					spr ctx "NULL");
-				if i < vtable_size - 1 then spr ctx ",";
-				print ctx " /* slot %d */" i;
-				newline ctx
-			done;
-			ctx.tabs <- "";
-			spr ctx "};";
-			newline ctx;
-			newline ctx
+				let impl_class = find_impl c in
+				let impl_class_name = flat_path impl_class.cl_path in
+				{ ve_slot = slot;
+				  ve_method_name = ident method_name;
+				  ve_impl_name = impl_class_name ^ "_" ^ ident method_name }
+			) vtable_methods in
+			add (TCDVtable {
+				vt_name = class_name ^ "_vtable";
+				vt_size = vtable_size;
+				vt_entries = entries;
+			})
 		end;
 
-		(* FibClass definition *)
-		print ctx "FibClass %s_class = {" class_name;
-		newline ctx;
-		ctx.tabs <- "\t";
-		print ctx ".name = \"%s\"," (s_type_path c.cl_path);
-		newline ctx;
-		print ctx ".classId = %d," class_id;
-		newline ctx;
-		print ctx ".instanceSize = sizeof(%s)," class_name;
-		newline ctx;
-		(match c.cl_super with
-		| Some (parent_c, _) ->
-			print ctx ".super = &%s_class," (flat_path parent_c.cl_path)
-		| None ->
-			spr ctx ".super = NULL,");
-		newline ctx;
-		if has_mark_func then
-			print ctx ".markFunc = %s_mark," class_name
-		else
-			spr ctx ".markFunc = NULL,";
-		newline ctx;
-		spr ctx ".construct = NULL,";
-		newline ctx;
-		spr ctx ".destruct = NULL,";
-		newline ctx;
-		spr ctx ".staticFields = NULL,";
-		newline ctx;
-		spr ctx ".fieldNames = NULL,";
-		newline ctx;
-		spr ctx ".fieldCount = 0,";
-		newline ctx;
-		(* Vtable fields *)
-		if vtable_size > 0 then
-			print ctx ".vtable = %s_vtable," class_name
-		else
-			spr ctx ".vtable = NULL,";
-		newline ctx;
-		print ctx ".vtableSize = %d" vtable_size;
-		newline ctx;
-		ctx.tabs <- "";
-		spr ctx "};";
-		newline ctx;
-		newline ctx;
+		(* 3. FibClass struct *)
+		add (TCDClassMeta {
+			cm_name = s_type_path c.cl_path;
+			cm_var_name = class_name;
+			cm_class_id = class_id;
+			cm_instance_size = Printf.sprintf "sizeof(%s)" class_name;
+			cm_super = (match c.cl_super with Some (p, _) -> Some (flat_path p.cl_path) | None -> None);
+			cm_mark_func = if has_mark_func then Some (class_name ^ "_mark") else None;
+			cm_vtable_name = if vtable_size > 0 then Some (class_name ^ "_vtable") else None;
+			cm_vtable_size = vtable_size;
+		});
 
-		(* Static variable declarations - for static locals promoted to class statics *)
+		(* 4. Static variable declarations *)
 		List.iter (fun cf ->
 			match cf.cf_kind, cf.cf_expr with
 			| Var _, None ->
-				(* Static variable with no initializer *)
-				gen_static_var ctx c cf
+				add (gen_static_var_decl ctx c cf)
 			| Var _, Some { eexpr = TFunction _ } ->
-				(* This is a function, skip *)
 				()
 			| Var _, Some _ ->
-				(* Static variable with initializer *)
-				gen_static_var ctx c cf
+				add (gen_static_var_decl ctx c cf)
 			| _ -> ()
 		) c.cl_ordered_statics;
 
-		(* Generate __boot function for runtime static initialization *)
+		(* 5. Boot function for runtime static initialization *)
 		let runtime_init_fields = get_runtime_init_fields c in
 		if runtime_init_fields <> [] then begin
 			let conv_ctx = make_conv_ctx ctx in
@@ -386,7 +302,7 @@ let gen_class_impl ctx c =
 			let gc_pop = if conv_ctx.FiberusConvert.gc_local_count > 0 then
 				[TCSGCPop conv_ctx.FiberusConvert.gc_local_count]
 			else [] in
-			let boot_func = {
+			add (TCDFunc {
 				fd_name = class_name ^ "___boot";
 				fd_ret = TCVoid;
 				fd_args = [];
@@ -394,59 +310,70 @@ let gen_class_impl ctx c =
 				fd_static = false;
 				fd_inline = false;
 				fd_attrs = [];
-			} in
-			let w = FiberusSourceWriter.create () in
-			FiberusSourceWriter.write_decl w (TCDFunc boot_func);
-			spr ctx (FiberusSourceWriter.contents w)
+			})
 		end;
 
-		(* Constructor *)
-		gen_constructor ctx c;
+		(* 6. Constructor — inlined from gen_constructor *)
+		(let conv_ctx = make_conv_ctx ctx in
+		match FiberusConvert.convert_constructor conv_ctx c with
+		| None -> ()
+		| Some (init_func, new_func) ->
+			add (TCDFunc init_func);
+			add (TCDFunc new_func);
+			let new_closures = sync_closures_from_conv ctx conv_ctx in
+			ctx.closures <- new_closures @ ctx.closures);
 
-		(* Static methods *)
-		List.iter (fun cf -> gen_class_field ctx c cf true) c.cl_ordered_statics;
+		(* 7. Static methods — inlined from gen_function *)
+		List.iter (fun cf ->
+			match cf.cf_expr with
+			| Some { eexpr = TFunction f } ->
+				let conv_ctx = make_conv_ctx ctx in
+				let func_def = FiberusConvert.convert_class_method conv_ctx cf.cf_name f true class_name in
+				add (TCDFunc func_def);
+				let new_closures = sync_closures_from_conv ctx conv_ctx in
+				ctx.closures <- new_closures @ ctx.closures
+			| _ -> ()
+		) c.cl_ordered_statics;
 
-		(* Instance methods *)
-		List.iter (fun cf -> gen_class_field ctx c cf false) c.cl_ordered_fields;
+		(* 8. Instance methods — inlined from gen_function *)
+		List.iter (fun cf ->
+			match cf.cf_expr with
+			| Some { eexpr = TFunction f } ->
+				let conv_ctx = make_conv_ctx ctx in
+				let func_def = FiberusConvert.convert_class_method conv_ctx cf.cf_name f false class_name in
+				add (TCDFunc func_def);
+				let new_closures = sync_closures_from_conv ctx conv_ctx in
+				ctx.closures <- new_closures @ ctx.closures
+			| _ -> ()
+		) c.cl_ordered_fields;
 
-		(* Get the main content we've generated so far *)
-		let main_content = Buffer.contents ctx.buf in
+		(* Emit everything through a single SourceWriter *)
+		let all_decls = List.rev !decls in
+		let w = FiberusSourceWriter.create () in
 
-		(* Collect method thunks from C-AST pipeline *)
+		(* Closure/thunk forward declarations must come before main content *)
 		let method_thunks = Hashtbl.fold (fun _name thunk acc -> thunk :: acc) ctx.cast_method_thunks [] in
-
-		(* Generate closures and method thunks using C-AST pipeline *)
 		let has_closures = ctx.closures <> [] in
 		let has_thunks = method_thunks <> [] in
-		if has_closures || has_thunks then begin
-			Buffer.clear ctx.buf;
-			
-			(* Use FiberusSourceWriter to generate forward declarations *)
-			let w = FiberusSourceWriter.create () in
-			if has_closures then
-				FiberusSourceWriter.write_closures_forward_decls w (List.rev ctx.closures);
-			if has_thunks then
-				FiberusSourceWriter.write_method_thunks_forward_decls w method_thunks;
-			spr ctx (FiberusSourceWriter.contents w);
-			
-			(* Add main content *)
-			spr ctx main_content;
-			
-			(* Use FiberusSourceWriter to generate implementations *)
-			let w2 = FiberusSourceWriter.create () in
-			if has_closures then
-				FiberusSourceWriter.write_closures w2 (List.rev ctx.closures) ~debug_level:ctx.debug_level;
-			if has_thunks then
-				FiberusSourceWriter.write_method_thunks w2 method_thunks;
-			spr ctx (FiberusSourceWriter.contents w2);
-			
-			ctx.closures <- []
-		end;
+		if has_closures then
+			FiberusSourceWriter.write_closures_forward_decls w (List.rev ctx.closures);
+		if has_thunks then
+			FiberusSourceWriter.write_method_thunks_forward_decls w method_thunks;
+
+		(* Main declarations *)
+		List.iter (FiberusSourceWriter.write_decl w) all_decls;
+
+		(* Closure/thunk implementations after main content *)
+		if has_closures then
+			FiberusSourceWriter.write_closures w (List.rev ctx.closures) ~debug_level:ctx.debug_level;
+		if has_thunks then
+			FiberusSourceWriter.write_method_thunks w method_thunks;
+		ctx.closures <- [];
 
 		(* Clear current class *)
 		ctx.current_class <- None;
 
-		Buffer.contents ctx.buf
+		FiberusSourceWriter.contents w
 	end
 
 let gen_enum_impl _ctx e =

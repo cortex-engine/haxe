@@ -356,11 +356,36 @@ type tc_decl =
   | TCDInclude of string * bool             (* file, is_system_header *)
   | TCDDefine of string * string option     (* name, value *)
   | TCDRaw of string
+  | TCDVtable of tc_vtable_def              (* static void* vtable[N] = { ... } *)
+  | TCDClassMeta of tc_class_meta           (* FibClass ClassName_class = { ... } *)
 
 and tc_struct_def = {
   sd_name: string;
   sd_parent: string option;                 (* Embedded parent for inheritance *)
   sd_fields: tc_struct_field list;
+}
+
+and tc_vtable_def = {
+  vt_name: string;                          (* e.g., "ClassName_vtable" *)
+  vt_size: int;                             (* Array size (max_slot + 1) *)
+  vt_entries: tc_vtable_entry list;         (* Populated slots; gaps filled with NULL *)
+}
+
+and tc_class_meta = {
+  cm_name: string;                          (* Display name, e.g. "tests.SimplePerson" *)
+  cm_var_name: string;                      (* C variable prefix, e.g. "tests_SimplePerson" *)
+  cm_class_id: int;
+  cm_instance_size: string;                 (* sizeof expression, e.g. "sizeof(ClassName)" *)
+  cm_super: string option;                  (* Parent class C name, or None *)
+  cm_mark_func: string option;              (* Mark function name, or None *)
+  cm_vtable_name: string option;            (* Vtable variable name, or None *)
+  cm_vtable_size: int;
+}
+
+and tc_vtable_entry = {
+  ve_slot: int;
+  ve_method_name: string;
+  ve_impl_name: string;
 }
 
 and tc_struct_field = {
@@ -459,21 +484,6 @@ type tc_class = {
   tcl_boot_func: tc_func_def option;
   tcl_vtable: tc_vtable_entry list;
   tcl_mark_func: tc_func_def option;        (* GC mark function *)
-}
-
-and tc_class_meta = {
-  cm_name: string;
-  cm_class_id: int;
-  cm_instance_size: string;                 (* sizeof expression *)
-  cm_super: string option;
-  cm_mark_func: string option;
-  cm_vtable_size: int;
-}
-
-and tc_vtable_entry = {
-  ve_slot: int;
-  ve_method_name: string;
-  ve_impl_name: string;
 }
 
 (* ============================================================================

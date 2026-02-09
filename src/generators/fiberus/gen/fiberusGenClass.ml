@@ -222,10 +222,12 @@ let gen_class_meta (c : tclass) (class_id : int) (vtable_size : int) : tc_class_
   let mark_func = if needs_mark_function c then Some (class_name ^ "_mark") else None in
   {
     cm_name = s_type_path c.cl_path;
+    cm_var_name = class_name;
     cm_class_id = class_id;
     cm_instance_size = "sizeof(" ^ class_name ^ ")";
     cm_super = super_name;
     cm_mark_func = mark_func;
+    cm_vtable_name = if vtable_size > 0 then Some (class_name ^ "_vtable") else None;
     cm_vtable_size = vtable_size;
   }
 
