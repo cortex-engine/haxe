@@ -295,7 +295,10 @@ let gen_class_impl ctx c =
 		if runtime_init_fields <> [] then begin
 			let conv_ctx = make_conv_ctx ctx in
 			conv_ctx.FiberusConvert.gc_local_count <- 0;
-			let gc_ctx_stmt = TCSRaw "FIB_GC_CTX;" in
+			conv_ctx.FiberusConvert.in_gc_frame <- true;
+			conv_ctx.FiberusConvert.gc_frame_name <- "_gc";
+			conv_ctx.FiberusConvert.gc_frame_slots <- [];
+			conv_ctx.FiberusConvert.gc_frame_rooted_vars <- Hashtbl.create 8;
 			let init_stmts = List.filter_map (fun cf ->
 				match cf.cf_expr with
 				| Some e ->
@@ -304,14 +307,16 @@ let gen_class_impl ctx c =
 					Some (TCSExpr (mk_expr (TCEAssign (lhs, cexpr)) (tc_type_of cf.cf_type)))
 				| None -> None
 			) runtime_init_fields in
-			let gc_pop = if conv_ctx.FiberusConvert.gc_local_count > 0 then
-				[TCSGCPop conv_ctx.FiberusConvert.gc_local_count]
-			else [] in
+			(* Build GCFrame prologue/epilogue from accumulated slots *)
+			let frame_info = FiberusConvert.gc_frame_build_info conv_ctx in
+			let has_gc_slots = frame_info.gfi_slots <> [] in
+			let prologue = [TCSGCCtx] @ (if has_gc_slots then [TCSGCFrameDecl frame_info] else []) in
+			let epilogue = if has_gc_slots then [TCSGCFramePop "_gc"] else [] in
 			add (TCDFunc {
 				fd_name = class_name ^ "___boot";
 				fd_ret = TCVoid;
 				fd_args = [];
-				fd_body = [gc_ctx_stmt] @ init_stmts @ gc_pop;
+				fd_body = prologue @ init_stmts @ epilogue;
 				fd_static = false;
 				fd_inline = false;
 				fd_attrs = [];
@@ -847,11 +852,21 @@ let generate com =
 	let main_body = match com.main.main_expr with
 		| Some e ->
 			let conv_ctx = make_conv_ctx ctx in
+			conv_ctx.FiberusConvert.gc_local_count <- 0;
+			conv_ctx.FiberusConvert.in_gc_frame <- true;
+			conv_ctx.FiberusConvert.gc_frame_name <- "_gc";
+			conv_ctx.FiberusConvert.gc_frame_slots <- [];
+			conv_ctx.FiberusConvert.gc_frame_rooted_vars <- Hashtbl.create 8;
 			let stmts = FiberusConvert.convert_stmt conv_ctx e in
 			(* Sync closures back *)
 			let new_closures = sync_closures_from_conv ctx conv_ctx in
 			if new_closures <> [] then ctx.closures <- new_closures @ ctx.closures;
-			[TCSRaw "(void)arg;"] @ stmts
+			(* Build GCFrame prologue/epilogue from accumulated slots *)
+			let frame_info = FiberusConvert.gc_frame_build_info conv_ctx in
+			let has_gc_slots = frame_info.gfi_slots <> [] in
+			let prologue = [TCSRaw "(void)arg;"; TCSGCCtx] @ (if has_gc_slots then [TCSGCFrameDecl frame_info] else []) in
+			let epilogue = if has_gc_slots then [TCSGCFramePop "_gc"] else [] in
+			prologue @ stmts @ epilogue
 		| None ->
 			[TCSRaw "(void)arg;"; TCSComment "No main expression"]
 	in

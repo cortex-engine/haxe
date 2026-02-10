@@ -1127,25 +1127,79 @@ let rec convert_expr (ctx : conv_ctx) (e : texpr) : tc_expr =
         (ident v.v_name, tc_type_of v.v_type)
       ) free_vars in
       
-      (* Convert the function body to C-AST for later emission.
-       * Closure bodies are NOT in the parent's GCFrame — they get their own
-       * frame emitted by write_closure_impl in the source writer. So disable
-       * in_gc_frame for the closure body conversion. *)
-      let body_ctx = { (ctx_for_scope ctx) with 
-        current_ret_type = Some (tc_type_of f.tf_type);
-        closures = [];
-        in_gc_frame = false;
-        gc_frame_slots = [];
-        gc_frame_rooted_vars = Hashtbl.create 0;
-        func_gc_root_count = -1;
-      } in
-      let body_stmts = convert_stmt body_ctx f.tf_expr in
-      (* Sync any nested closures from body back to outer context *)
-      ctx.closures <- body_ctx.closures @ ctx.closures;
+      (* Convert the function body to C-AST with GCFrame tracking.
+       * Closure bodies get their own GCFrame containing _closure, GC-typed
+       * params, and GC-typed captures. The frame declaration, capture extraction,
+       * and cleanup are included in cl_body so write_closure_impl just emits them. *)
       let ret_type = tc_type_of f.tf_type in
       let args = List.map (fun (v, _) ->
         { fa_name = ident v.v_name; fa_type = tc_type_of v.v_type }
       ) f.tf_args in
+      let cl_captures_list = List.mapi (fun i (name, typ) ->
+        { cap_var = name; cap_type = typ; cap_index = i }
+      ) captures in
+      let frame_name = "_gc" in
+      let frame_rooted_vars = Hashtbl.create 16 in
+      let param_inits = ref [] in
+      let initial_slots = ref [] in
+      (* Always root _closure *)
+      initial_slots := ("_closure", TCFibClosure) :: !initial_slots;
+      Hashtbl.replace frame_rooted_vars "_closure" ();
+      param_inits := ("_closure", mk_expr (TCELocal "_closure") TCFibClosure) :: !param_inits;
+      (* GC-typed parameters *)
+      List.iter (fun arg ->
+        if needs_gc_root arg.fa_type then begin
+          initial_slots := (arg.fa_name, arg.fa_type) :: !initial_slots;
+          Hashtbl.replace frame_rooted_vars arg.fa_name ();
+          param_inits := (arg.fa_name, mk_expr (TCELocal arg.fa_name) arg.fa_type) :: !param_inits
+        end
+      ) args;
+      (* GC-typed captures — registered as slots, initialized to NULL (assigned after extraction) *)
+      List.iter (fun cap ->
+        if needs_gc_root cap.cap_type then begin
+          initial_slots := (cap.cap_var, cap.cap_type) :: !initial_slots;
+          Hashtbl.replace frame_rooted_vars cap.cap_var ()
+        end
+      ) cl_captures_list;
+      let body_ctx = { (ctx_for_scope ctx) with 
+        current_ret_type = Some ret_type;
+        closures = [];
+        in_gc_frame = true;
+        gc_frame_name = frame_name;
+        gc_frame_slots = List.rev !initial_slots;
+        gc_frame_rooted_vars = frame_rooted_vars;
+        func_gc_root_count = 0;
+      } in
+      let body_stmts = convert_stmt body_ctx f.tf_expr in
+      let body_stmts = mark_volatile_for_try body_stmts in
+      (* Build prologue: FIB_GC_CTX + GCFrame + capture extraction *)
+      let prologue = ref [TCSGCCtx] in
+      let frame_info = gc_frame_build_info_with_inits body_ctx !param_inits in
+      let has_gc_slots = frame_info.gfi_slots <> [] in
+      if has_gc_slots then
+        prologue := !prologue @ [TCSGCFrameDecl frame_info];
+      if captures = [] then
+        prologue := !prologue @ [TCSRaw "(void)_closure;"];
+      (* Extract captured variables into locals, assign to frame if GC-typed *)
+      List.iter (fun cap ->
+        let extract_str = FiberusSourceWriter.capture_extract_expr cap in
+        prologue := !prologue @ [TCSVar {
+          vd_name = cap.cap_var; vd_type = cap.cap_type;
+          vd_init = Some (mk_expr (TCERaw extract_str) cap.cap_type);
+          vd_static = false; vd_const = false; vd_volatile = false;
+        }];
+        if needs_gc_root cap.cap_type then
+          prologue := !prologue @ [TCSGCFrameAssign (frame_name, cap.cap_var, mk_expr (TCELocal cap.cap_var) cap.cap_type)]
+      ) cl_captures_list;
+      (* Epilogue: pop any legacy temp roots (from stack-alloc fields) + GC_FRAME_POP for fall-through *)
+      let epilogue = if ret_type = TCVoid && not (ends_with_return f.tf_expr) then begin
+        let temp_pop = if body_ctx.gc_local_count > 0 then [TCSGCPop body_ctx.gc_local_count] else [] in
+        let frame_pop = if has_gc_slots then [TCSGCFramePop frame_name] else [] in
+        temp_pop @ frame_pop
+      end else [] in
+      let full_body = !prologue @ body_stmts @ epilogue in
+      (* Sync any nested closures from body back to outer context *)
+      ctx.closures <- body_ctx.closures @ ctx.closures;
       
       (* Register the closure for later implementation generation *)
       let closure_def = {
@@ -1154,10 +1208,8 @@ let rec convert_expr (ctx : conv_ctx) (e : texpr) : tc_expr =
         cl_impl_name = impl_name;
         cl_args = args;
         cl_ret = ret_type;
-        cl_captures = List.mapi (fun i (name, typ) ->
-          { cap_var = name; cap_type = typ; cap_index = i }
-        ) captures;
-        cl_body = body_stmts;
+        cl_captures = cl_captures_list;
+        cl_body = full_body;
       } in
       ctx.closures <- closure_def :: ctx.closures;
       
@@ -1977,6 +2029,10 @@ and convert_expr_as_stmt ctx (e : texpr) : tc_stmt list =
       List.concat_map (convert_expr_as_stmt ctx) exprs
   | TIf (cond, ethen, eelse_opt) ->
       let cond_expr = convert_expr ctx cond in
+      (* Save/restore gc_local_count around branches.
+       * In GCFrame mode, gc_local_count only tracks stack-alloc field temp roots
+       * (regular locals use frame slots), so this is typically a no-op.
+       * In legacy mode, it tracks all temp roots as before. *)
       let saved_gc1 = gc_save_count ctx in
       let then_stmts = convert_expr_as_stmt ctx ethen in
       let to_pop1 = gc_roots_to_pop ctx saved_gc1 in
@@ -2648,27 +2704,75 @@ and extract_fiber_closure ctx arg =
         (ident v.v_name, tc_type_of (Type.follow v.v_type))
       ) free_vars in
       
-      (* Convert function body with fiber_spawn context.
-       * Closure bodies are NOT in the parent's GCFrame — they get their own
-       * frame emitted by write_closure_impl. So disable in_gc_frame. *)
-      let body_ctx = { (ctx_for_scope ctx) with 
-        current_ret_type = Some (tc_type_of (Type.follow f.tf_type));
-        closures = ctx.closures;
-        in_gc_frame = false;
-        gc_frame_slots = [];
-        gc_frame_rooted_vars = Hashtbl.create 0;
-        func_gc_root_count = -1;
-        in_fiber_spawn = true;
-      } in
-      
-      (* Function arguments - Fiber.spawn closures always take (FibDynamic) -> Void *)
+      (* Convert function body with fiber_spawn context and GCFrame tracking.
+       * Same pattern as regular closures — build GCFrame in the conversion phase. *)
       let args = List.map (fun (v, _) ->
         { fa_name = ident v.v_name; fa_type = tc_type_of (Type.follow v.v_type) }
       ) f.tf_args in
       let ret_type = tc_type_of (Type.follow f.tf_type) in
-      
-      (* Convert the body *)
+      let cl_captures_list = List.mapi (fun i (name, typ) ->
+        { cap_var = name; cap_type = typ; cap_index = i }
+      ) captures in
+      let frame_name = "_gc" in
+      let frame_rooted_vars = Hashtbl.create 16 in
+      let param_inits = ref [] in
+      let initial_slots = ref [] in
+      (* Always root _closure *)
+      initial_slots := ("_closure", TCFibClosure) :: !initial_slots;
+      Hashtbl.replace frame_rooted_vars "_closure" ();
+      param_inits := ("_closure", mk_expr (TCELocal "_closure") TCFibClosure) :: !param_inits;
+      (* GC-typed parameters *)
+      List.iter (fun arg ->
+        if needs_gc_root arg.fa_type then begin
+          initial_slots := (arg.fa_name, arg.fa_type) :: !initial_slots;
+          Hashtbl.replace frame_rooted_vars arg.fa_name ();
+          param_inits := (arg.fa_name, mk_expr (TCELocal arg.fa_name) arg.fa_type) :: !param_inits
+        end
+      ) args;
+      (* GC-typed captures *)
+      List.iter (fun cap ->
+        if needs_gc_root cap.cap_type then begin
+          initial_slots := (cap.cap_var, cap.cap_type) :: !initial_slots;
+          Hashtbl.replace frame_rooted_vars cap.cap_var ()
+        end
+      ) cl_captures_list;
+      let body_ctx = { (ctx_for_scope ctx) with 
+        current_ret_type = Some ret_type;
+        closures = ctx.closures;
+        in_gc_frame = true;
+        gc_frame_name = frame_name;
+        gc_frame_slots = List.rev !initial_slots;
+        gc_frame_rooted_vars = frame_rooted_vars;
+        func_gc_root_count = 0;
+        in_fiber_spawn = true;
+      } in
       let body_stmts = convert_stmt body_ctx f.tf_expr in
+      let body_stmts = mark_volatile_for_try body_stmts in
+      (* Build prologue *)
+      let prologue = ref [TCSGCCtx] in
+      let frame_info = gc_frame_build_info_with_inits body_ctx !param_inits in
+      let has_gc_slots = frame_info.gfi_slots <> [] in
+      if has_gc_slots then
+        prologue := !prologue @ [TCSGCFrameDecl frame_info];
+      if captures = [] then
+        prologue := !prologue @ [TCSRaw "(void)_closure;"];
+      List.iter (fun cap ->
+        let extract_str = FiberusSourceWriter.capture_extract_expr cap in
+        prologue := !prologue @ [TCSVar {
+          vd_name = cap.cap_var; vd_type = cap.cap_type;
+          vd_init = Some (mk_expr (TCERaw extract_str) cap.cap_type);
+          vd_static = false; vd_const = false; vd_volatile = false;
+        }];
+        if needs_gc_root cap.cap_type then
+          prologue := !prologue @ [TCSGCFrameAssign (frame_name, cap.cap_var, mk_expr (TCELocal cap.cap_var) cap.cap_type)]
+      ) cl_captures_list;
+      (* Epilogue: pop any legacy temp roots (from stack-alloc fields) + GC_FRAME_POP for fall-through *)
+      let epilogue = if ret_type = TCVoid && not (ends_with_return f.tf_expr) then begin
+        let temp_pop = if body_ctx.gc_local_count > 0 then [TCSGCPop body_ctx.gc_local_count] else [] in
+        let frame_pop = if has_gc_slots then [TCSGCFramePop frame_name] else [] in
+        temp_pop @ frame_pop
+      end else [] in
+      let full_body = !prologue @ body_stmts @ epilogue in
       
       (* Sync nested closures back to parent context *)
       ctx.closures <- body_ctx.closures;
@@ -2680,10 +2784,8 @@ and extract_fiber_closure ctx arg =
         cl_impl_name = impl_name;
         cl_args = args;
         cl_ret = ret_type;
-        cl_captures = List.mapi (fun i (name, typ) ->
-          { cap_var = name; cap_type = typ; cap_index = i }
-        ) captures;
-        cl_body = body_stmts;
+        cl_captures = cl_captures_list;
+        cl_body = full_body;
       } in
       ctx.closures <- closure_def :: ctx.closures;
       
@@ -2725,10 +2827,20 @@ and convert_fiber_spawn ctx spawn_func trampoline_func args pos =
             vd_const = false; vd_volatile = false;
           } in
           
-          (* gc_push_temp_root - push address of _fcN as temp root *)
-          let push_root = TCSExpr (mk_expr (TCECall (TCTFunc "gc_push_temp_root", 
-            [mk_expr (TCECast (TCPointer (TCPointer TCVoid), mk_expr (TCEAddrOf (mk_expr (TCELocal fc_name) TCFibClosure)) (TCPointer TCFibClosure))) (TCPointer (TCPointer TCVoid))]
-          )) TCVoid) in
+          (* Root protection for _fcN during spawn *)
+          let root_push, root_pop = if ctx.in_gc_frame then begin
+            (* GCFrame mode: register _fcN as a frame slot *)
+            gc_frame_add_slot ctx fc_name TCFibClosure;
+            let assign = TCSGCFrameAssign (ctx.gc_frame_name, fc_name, mk_expr (TCELocal fc_name) TCFibClosure) in
+            ([assign], [])
+          end else begin
+            (* Legacy mode: push/pop temp root *)
+            let push = TCSExpr (mk_expr (TCECall (TCTFunc "gc_push_temp_root", 
+              [mk_expr (TCECast (TCPointer (TCPointer TCVoid), mk_expr (TCEAddrOf (mk_expr (TCELocal fc_name) TCFibClosure)) (TCPointer TCFibClosure))) (TCPointer (TCPointer TCVoid))]
+            )) TCVoid) in
+            let pop = TCSExpr (mk_expr (TCECall (TCTFunc "gc_pop_temp_roots", [mk_int 1l])) TCVoid) in
+            ([push], [pop])
+          end in
           
           (* Fiber* _fibN = scheduler_spawn(trampoline, _fcN) *)
           let spawn_call = mk_expr (TCECall (TCTFunc spawn_func, [
@@ -2747,14 +2859,11 @@ and convert_fiber_spawn ctx spawn_func trampoline_func args pos =
           (* gc_mature_alloc_end(); *)
           let alloc_end = TCSExpr (mk_expr (TCECall (TCTFunc "gc_mature_alloc_end", [])) TCVoid) in
           
-          (* gc_pop_temp_roots(1); *)
-          let pop_roots = TCSExpr (mk_expr (TCECall (TCTFunc "gc_pop_temp_roots", [mk_int 1l])) TCVoid) in
-          
           (* Final expression is just _fibN *)
           let result = mk_expr (TCELocal fib_name) TCFiber in
           
           (* Combine all pending statements *)
-          let all_pending = pending @ [fc_var; push_root; fib_var; alloc_end; pop_roots] in
+          let all_pending = pending @ [fc_var] @ root_push @ [fib_var; alloc_end] @ root_pop in
           
           with_pending all_pending result
           
@@ -2800,9 +2909,18 @@ and convert_fiber_spawn_on ctx tid_expr arg pos =
         vd_static = false; vd_const = false; vd_volatile = false;
       } in
       
-      let push_root = TCSExpr (mk_expr (TCECall (TCTFunc "gc_push_temp_root", 
-        [mk_expr (TCECast (TCPointer (TCPointer TCVoid), mk_expr (TCEAddrOf (mk_expr (TCELocal fc_name) TCFibClosure)) (TCPointer TCFibClosure))) (TCPointer (TCPointer TCVoid))]
-      )) TCVoid) in
+      (* Root protection for _fcN during spawn *)
+      let root_push, root_pop = if ctx.in_gc_frame then begin
+        gc_frame_add_slot ctx fc_name TCFibClosure;
+        let assign = TCSGCFrameAssign (ctx.gc_frame_name, fc_name, mk_expr (TCELocal fc_name) TCFibClosure) in
+        ([assign], [])
+      end else begin
+        let push = TCSExpr (mk_expr (TCECall (TCTFunc "gc_push_temp_root", 
+          [mk_expr (TCECast (TCPointer (TCPointer TCVoid), mk_expr (TCEAddrOf (mk_expr (TCELocal fc_name) TCFibClosure)) (TCPointer TCFibClosure))) (TCPointer (TCPointer TCVoid))]
+        )) TCVoid) in
+        let pop = TCSExpr (mk_expr (TCECall (TCTFunc "gc_pop_temp_roots", [mk_int 1l])) TCVoid) in
+        ([push], [pop])
+      end in
       
       let spawn_call = mk_expr (TCECall (TCTFunc "scheduler_spawn_on", [
         mk_expr (TCELocal tid_name) TCInt32;
@@ -2818,10 +2936,9 @@ and convert_fiber_spawn_on ctx tid_expr arg pos =
       } in
       
       let alloc_end = TCSExpr (mk_expr (TCECall (TCTFunc "gc_mature_alloc_end", [])) TCVoid) in
-      let pop_roots = TCSExpr (mk_expr (TCECall (TCTFunc "gc_pop_temp_roots", [mk_int 1l])) TCVoid) in
       
       let result = mk_expr (TCELocal fib_name) TCFiber in
-      let all_pending = pending @ [fc_var; push_root; fib_var; alloc_end; pop_roots] in
+      let all_pending = pending @ [fc_var] @ root_push @ [fib_var; alloc_end] @ root_pop in
       
       with_pending all_pending result
       
@@ -2864,9 +2981,18 @@ and convert_fiber_spawn_with_stack ctx size_expr arg pos =
         vd_static = false; vd_const = false; vd_volatile = false;
       } in
       
-      let push_root = TCSExpr (mk_expr (TCECall (TCTFunc "gc_push_temp_root", 
-        [mk_expr (TCECast (TCPointer (TCPointer TCVoid), mk_expr (TCEAddrOf (mk_expr (TCELocal fc_name) TCFibClosure)) (TCPointer TCFibClosure))) (TCPointer (TCPointer TCVoid))]
-      )) TCVoid) in
+      (* Root protection for _fcN during spawn *)
+      let root_push, root_pop = if ctx.in_gc_frame then begin
+        gc_frame_add_slot ctx fc_name TCFibClosure;
+        let assign = TCSGCFrameAssign (ctx.gc_frame_name, fc_name, mk_expr (TCELocal fc_name) TCFibClosure) in
+        ([assign], [])
+      end else begin
+        let push = TCSExpr (mk_expr (TCECall (TCTFunc "gc_push_temp_root", 
+          [mk_expr (TCECast (TCPointer (TCPointer TCVoid), mk_expr (TCEAddrOf (mk_expr (TCELocal fc_name) TCFibClosure)) (TCPointer TCFibClosure))) (TCPointer (TCPointer TCVoid))]
+        )) TCVoid) in
+        let pop = TCSExpr (mk_expr (TCECall (TCTFunc "gc_pop_temp_roots", [mk_int 1l])) TCVoid) in
+        ([push], [pop])
+      end in
       
       let spawn_call = mk_expr (TCECall (TCTFunc "scheduler_spawn_sized", [
         mk_expr (TCELocal sz_name) TCUInt64;
@@ -2882,10 +3008,9 @@ and convert_fiber_spawn_with_stack ctx size_expr arg pos =
       } in
       
       let alloc_end = TCSExpr (mk_expr (TCECall (TCTFunc "gc_mature_alloc_end", [])) TCVoid) in
-      let pop_roots = TCSExpr (mk_expr (TCECall (TCTFunc "gc_pop_temp_roots", [mk_int 1l])) TCVoid) in
       
       let result = mk_expr (TCELocal fib_name) TCFiber in
-      let all_pending = pending @ [fc_var; push_root; fib_var; alloc_end; pop_roots] in
+      let all_pending = pending @ [fc_var] @ root_push @ [fib_var; alloc_end] @ root_pop in
       
       with_pending all_pending result
       
@@ -3444,90 +3569,72 @@ and convert_stmt (ctx : conv_ctx) (e : texpr) : tc_stmt list =
   
   (* If statement - save/restore GC roots around each branch to prevent
    * roots from branch-scoped variables leaking into the enclosing scope.
-   * Skip pop if branch ends with return (return handles its own GC cleanup). *)
+   * Skip pop if branch ends with return (return handles its own GC cleanup).
+   * In GCFrame mode, gc_local_count only tracks stack-alloc field temp roots
+   * (regular locals use frame slots), so pops are only emitted when needed. *)
   | TIf (cond, ethen, eelse_opt) ->
       let cond_expr = convert_expr ctx cond in
-      if ctx.in_gc_frame then begin
-        (* GCFrame mode: no push/pop management needed.
-         * Branch-scoped GC locals are just additional frame slots. *)
-        let then_stmts = convert_stmt ctx ethen in
-        let else_stmts = match eelse_opt with
-          | None -> None
-          | Some eelse -> Some (convert_stmt ctx eelse)
-        in
-        [TCSIf (cond_expr, then_stmts, else_stmts)]
+      let saved_gc1 = gc_save_count ctx in
+      let then_stmts = convert_stmt ctx ethen in
+      let to_pop1 = gc_roots_to_pop ctx saved_gc1 in
+      let then_with_pop = if to_pop1 > 0 && not (ends_with_return ethen) then begin
+        ctx.gc_local_count <- saved_gc1;
+        then_stmts @ [TCSGCPop to_pop1]
       end else begin
-        (* Legacy mode: save/restore gc_local_count *)
-        let saved_gc1 = gc_save_count ctx in
-        let then_stmts = convert_stmt ctx ethen in
-        let to_pop1 = gc_roots_to_pop ctx saved_gc1 in
-        let then_with_pop = if to_pop1 > 0 && not (ends_with_return ethen) then begin
-          ctx.gc_local_count <- saved_gc1;
-          then_stmts @ [TCSGCPop to_pop1]
-        end else begin
-          ctx.gc_local_count <- saved_gc1;
-          then_stmts
-        end in
-        let else_with_pop = match eelse_opt with
-          | None -> None
-          | Some eelse ->
-              let saved_gc2 = gc_save_count ctx in
-              let else_stmts = convert_stmt ctx eelse in
-              let to_pop2 = gc_roots_to_pop ctx saved_gc2 in
-              if to_pop2 > 0 && not (ends_with_return eelse) then begin
-                ctx.gc_local_count <- saved_gc2;
-                Some (else_stmts @ [TCSGCPop to_pop2])
-              end else begin
-                ctx.gc_local_count <- saved_gc2;
-                Some else_stmts
-              end
-        in
-        [TCSIf (cond_expr, then_with_pop, else_with_pop)]
-      end
+        ctx.gc_local_count <- saved_gc1;
+        then_stmts
+      end in
+      let else_with_pop = match eelse_opt with
+        | None -> None
+        | Some eelse ->
+            let saved_gc2 = gc_save_count ctx in
+            let else_stmts = convert_stmt ctx eelse in
+            let to_pop2 = gc_roots_to_pop ctx saved_gc2 in
+            if to_pop2 > 0 && not (ends_with_return eelse) then begin
+              ctx.gc_local_count <- saved_gc2;
+              Some (else_stmts @ [TCSGCPop to_pop2])
+            end else begin
+              ctx.gc_local_count <- saved_gc2;
+              Some else_stmts
+            end
+      in
+      [TCSIf (cond_expr, then_with_pop, else_with_pop)]
   
   (* While loop - save/restore GC roots around loop body to prevent
    * unbounded temp root accumulation from loop-scoped GC pointer variables.
-   * Also inject yield point for outer loops (depth <= 1) to allow fiber scheduling. *)
+   * Also inject yield point for outer loops (depth <= 1) to allow fiber scheduling.
+   * In GCFrame mode, gc_local_count only tracks stack-alloc field temp roots. *)
   | TWhile (cond, body, flag) ->
       let cond_expr = convert_expr ctx cond in
       ctx.loop_depth <- ctx.loop_depth + 1;
+      let saved_gc_count = gc_save_count ctx in
       (* Yield point for outer loops - inner loops are short-lived *)
       let yield_stmts = if ctx.loop_depth <= 1 then [TCSYieldPoint] else [] in
-      if ctx.in_gc_frame then begin
-        (* GCFrame mode: no push/pop management needed.
-         * Loop-scoped GC locals are just additional frame slots.
-         * They're initialized to NULL from the frame declaration. *)
-        let body_stmts = convert_stmt ctx body in
-        ctx.loop_depth <- ctx.loop_depth - 1;
-        let is_do_while = (flag = DoWhile) in
-        [TCSWhile (cond_expr, yield_stmts @ body_stmts, is_do_while)]
-      end else begin
-        (* Legacy mode: save/restore gc_local_count *)
-        let saved_gc_count = gc_save_count ctx in
-        let body_stmts = convert_stmt ctx body in
-        let to_pop = gc_roots_to_pop ctx saved_gc_count in
-        let body_with_pop = if to_pop > 0 then begin
-          ctx.gc_local_count <- saved_gc_count;
-          yield_stmts @ body_stmts @ [TCSGCPop to_pop]
-        end else
-          yield_stmts @ body_stmts
-        in
-        ctx.loop_depth <- ctx.loop_depth - 1;
-        let is_do_while = (flag = DoWhile) in
-        [TCSWhile (cond_expr, body_with_pop, is_do_while)]
-      end
+      let body_stmts = convert_stmt ctx body in
+      let to_pop = gc_roots_to_pop ctx saved_gc_count in
+      let body_with_pop = if to_pop > 0 then begin
+        ctx.gc_local_count <- saved_gc_count;
+        yield_stmts @ body_stmts @ [TCSGCPop to_pop]
+      end else
+        yield_stmts @ body_stmts
+      in
+      ctx.loop_depth <- ctx.loop_depth - 1;
+      let is_do_while = (flag = DoWhile) in
+      [TCSWhile (cond_expr, body_with_pop, is_do_while)]
   
   (* Return statement - with GC root cleanup when inside a converted function. *)
   | TReturn expr_opt ->
       if ctx.in_gc_frame then begin
-        (* GCFrame path: emit GC_FRAME_POP before return *)
+        (* GCFrame path: pop any legacy temp roots (from stack-alloc field tracking),
+         * then emit GC_FRAME_POP before return. *)
         let has_frame_slots = ctx.gc_frame_slots <> [] in
+        let temp_root_pop = if ctx.gc_local_count > 0 then [TCSGCPop ctx.gc_local_count] else [] in
+        let frame_pop = if has_frame_slots then [TCSGCFramePop ctx.gc_frame_name] else [] in
+        let cleanup = temp_root_pop @ frame_pop in
+        let needs_cleanup = cleanup <> [] in
         match expr_opt with
         | None ->
-            if has_frame_slots then
-              [TCSGCFramePop ctx.gc_frame_name; TCSReturn None]
-            else
-              [TCSReturn None]
+            cleanup @ [TCSReturn None]
         | Some inner ->
             let inner_expr = convert_expr ctx inner in
             let cexpr = match ctx.current_ret_type with
@@ -3535,10 +3642,10 @@ and convert_stmt (ctx : conv_ctx) (e : texpr) : tc_stmt list =
               | None -> inner_expr
             in
             let has_pending = cexpr.pending_stmts <> [] in
-            if not has_frame_slots && not has_pending then
+            if not needs_cleanup && not has_pending then
               [TCSReturn (Some cexpr)]
             else if not has_pending then begin
-              (* Simple: evaluate, pop frame, return.
+              (* Simple: evaluate, cleanup, return.
                * For non-void returns with GC types, save to temp first because
                * the return value might be a frame slot reference that becomes invalid
                * after frame pop. *)
@@ -3549,14 +3656,14 @@ and convert_stmt (ctx : conv_ctx) (e : texpr) : tc_stmt list =
                   vd_name = "__ret"; vd_type = ret_type;
                   vd_init = Some cexpr;
                   vd_static = false; vd_const = false; vd_volatile = false }];
-                stmts := !stmts @ [TCSGCFramePop ctx.gc_frame_name];
+                stmts := !stmts @ cleanup;
                 stmts := !stmts @ [TCSReturn (Some (mk_expr (TCELocal "__ret") ret_type))];
                 [TCSBlock !stmts]
               end else begin
-                [TCSGCFramePop ctx.gc_frame_name; TCSReturn (Some cexpr)]
+                cleanup @ [TCSReturn (Some cexpr)]
               end
             end else begin
-              (* Complex: pending stmts + frame pop *)
+              (* Complex: pending stmts + cleanup *)
               let ret_type = cexpr.ctype in
               let stmts = ref [] in
               stmts := !stmts @ cexpr.pending_stmts;
@@ -3564,7 +3671,7 @@ and convert_stmt (ctx : conv_ctx) (e : texpr) : tc_stmt list =
                 vd_name = "__ret"; vd_type = ret_type;
                 vd_init = Some { cexpr with pending_stmts = [] };
                 vd_static = false; vd_const = false; vd_volatile = false }];
-              stmts := !stmts @ [TCSGCFramePop ctx.gc_frame_name];
+              stmts := !stmts @ cleanup;
               stmts := !stmts @ [TCSReturn (Some (mk_expr (TCELocal "__ret") ret_type))];
               [TCSBlock !stmts]
             end
@@ -3950,10 +4057,12 @@ let convert_class_method ctx name (func : tfunc) is_static class_name =
       sf_line = line;
     }]
   end;
-  (* Epilogue: GC_FRAME_POP for fall-through paths *)
-  let epilogue = if has_gc_slots && not (ends_with_return func.tf_expr) then
-    [TCSGCFramePop frame_name]
-  else [] in
+  (* Epilogue: pop any legacy temp roots (from stack-alloc fields) + GC_FRAME_POP for fall-through *)
+  let epilogue = if not (ends_with_return func.tf_expr) then begin
+    let temp_pop = if body_ctx.gc_local_count > 0 then [TCSGCPop body_ctx.gc_local_count] else [] in
+    let frame_pop = if has_gc_slots then [TCSGCFramePop frame_name] else [] in
+    temp_pop @ frame_pop
+  end else [] in
   {
     fd_name = func_name;
     fd_ret = ret_type;
@@ -4043,10 +4152,14 @@ let convert_constructor ctx (c : tclass) =
             if init_needs_gc_ctx then begin
               init_prologue := [TCSGCCtx];
               let frame_info = gc_frame_build_info_with_inits init_body_ctx !param_inits in
-              if frame_info.gfi_slots <> [] then begin
+              let has_gc_slots = frame_info.gfi_slots <> [] in
+              if has_gc_slots then
                 init_prologue := !init_prologue @ [TCSGCFrameDecl frame_info];
-                init_epilogue := [TCSGCFramePop frame_name]
-              end
+              (* Pop any legacy temp roots (from stack-alloc fields) + frame pop *)
+              if init_body_ctx.gc_local_count > 0 then
+                init_epilogue := [TCSGCPop init_body_ctx.gc_local_count];
+              if has_gc_slots then
+                init_epilogue := !init_epilogue @ [TCSGCFramePop frame_name]
             end;
             let init_func = {
               fd_name = Printf.sprintf "%s_init" class_name;

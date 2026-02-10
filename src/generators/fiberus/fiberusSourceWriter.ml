@@ -1133,7 +1133,14 @@ let write_closure_forward_decls (w : writer) (cl : tc_closure) : unit =
   write w ");";
   newline w
 
-(* Generate the typed implementation function for a closure *)
+(* Generate the typed implementation function for a closure.
+ * The closure body (cl_body) already contains the complete GCFrame lifecycle:
+ * - FIB_GC_CTX
+ * - TCSGCFrameDecl (frame struct declaration + push)
+ * - (void)_closure or capture extraction + TCSGCFrameAssign
+ * - body statements (with TCSGCFramePop before returns)
+ * - trailing TCSGCFramePop for void closures
+ * So we just emit the function signature, debug frame, and the body directly. *)
 let write_closure_impl (w : writer) (cl : tc_closure) ~(debug_level : int) : unit =
   (* Function signature *)
   write w "static ";
@@ -1147,10 +1154,6 @@ let write_closure_impl (w : writer) (cl : tc_closure) ~(debug_level : int) : uni
   newline w;
   indent w;
   
-  (* GC context *)
-  write w "FIB_GC_CTX;";
-  newline w;
-  
   (* Debug stack frame *)
   if debug_level > 0 then begin
     writef w "FIB_LOCAL_STACK_FRAME(_fib_pos_%s, \"<closure>\", \"%s\", \"<closure>.%s\", \"generated\", 0);"
@@ -1160,174 +1163,8 @@ let write_closure_impl (w : writer) (cl : tc_closure) ~(debug_level : int) : uni
     newline w
   end;
   
-  (* Build GCFrame with _closure + GC-typed args + GC-typed captures *)
-  let frame_slots = ref [] in
-  (* Always root _closure *)
-  frame_slots := ("_closure", TCFibClosure) :: !frame_slots;
-  (* GC-typed parameters *)
-  List.iter (fun arg ->
-    if needs_gc_root arg.fa_type then
-      frame_slots := (arg.fa_name, arg.fa_type) :: !frame_slots
-  ) cl.cl_args;
-  (* GC-typed captures - will be extracted from closure and assigned later *)
-  List.iter (fun cap ->
-    if needs_gc_root cap.cap_type then
-      frame_slots := (cap.cap_var, cap.cap_type) :: !frame_slots
-  ) cl.cl_captures;
-  let frame_slots = List.rev !frame_slots in
-  let n_slots = List.length frame_slots in
-  
-  (* Emit frame declaration *)
-  if n_slots > 0 then begin
-    write w "struct { GCFrame _hdr;";
-    List.iter (fun (name, typ) ->
-      write w " ";
-      write_type w typ;
-      writef w " %s;" name
-    ) frame_slots;
-    writef w " } _gc = { { FIB_CTX ? FIB_CTX->topFrame : NULL, %d }" n_slots;
-    (* Initial values: _closure and GC-typed params get their values, captures get NULL *)
-    List.iter (fun (name, _typ) ->
-      write w ", ";
-      (* Check if this is a capture (to be initialized later) *)
-      let is_capture = List.exists (fun cap -> cap.cap_var = name) cl.cl_captures in
-      if is_capture then
-        write w "NULL"
-      else
-        write w name  (* param or _closure *)
-    ) frame_slots;
-    write w " };";
-    newline w;
-    write w "GC_FRAME_PUSH(FIB_CTX, _gc);";
-    newline w
-  end;
-  
-  (* Suppress unused _closure warning if no captures *)
-  if cl.cl_captures = [] then begin
-    write w "(void)_closure;";
-    newline w
-  end;
-  
-  (* Extract captured variables into locals, then assign to frame if GC-typed *)
-  List.iter (fun cap ->
-    write_type w cap.cap_type;
-    writef w " %s = %s;" cap.cap_var (capture_extract_expr cap);
-    newline w;
-    if needs_gc_root cap.cap_type then begin
-      writef w "_gc.%s = %s;" cap.cap_var cap.cap_var;
-      newline w
-    end
-  ) cl.cl_captures;
-  
-  (* Helper to write statements, transforming returns to include GC_FRAME_POP.
-   * For GCFrame closures, returns need to pop the frame before returning. *)
-  let rec write_stmt_with_gc_cleanup stmt =
-    match stmt with
-    | TCSReturn (Some e) when n_slots > 0 ->
-        (* For non-void returns: evaluate to temp, pop frame, return temp *)
-        emit_pending_stmts w e;
-        write w "{ ";
-        write_type w cl.cl_ret;
-        write w " _ret = ";
-        write_expr w e;
-        write w "; GC_FRAME_POP(FIB_CTX, _gc); return _ret; }";
-        newline w
-    | TCSReturn None when n_slots > 0 ->
-        write w "GC_FRAME_POP(FIB_CTX, _gc); return;";
-        newline w
-    | TCSReturn _ ->
-        write_stmt w stmt
-    | TCSBlock stmts ->
-        write w "{";
-        newline w;
-        indent w;
-        List.iter write_stmt_with_gc_cleanup stmts;
-        dedent w;
-        write w "}";
-        newline w
-    | TCSIf (cond, then_stmts, else_opt) ->
-        emit_pending_stmts w cond;
-        write w "if (";
-        write_expr w cond;
-        write w ") {";
-        newline w;
-        indent w;
-        List.iter write_stmt_with_gc_cleanup then_stmts;
-        dedent w;
-        write w "}";
-        (match else_opt with
-        | Some else_stmts ->
-            write w " else {";
-            newline w;
-            indent w;
-            List.iter write_stmt_with_gc_cleanup else_stmts;
-            dedent w;
-            write w "}"
-        | None -> ());
-        newline w
-    | TCSWhile (cond, body, is_do_while) ->
-        if is_do_while then begin
-          write w "do {";
-          newline w;
-          indent w;
-          List.iter write_stmt_with_gc_cleanup body;
-          dedent w;
-          write w "} while (";
-          write_expr w cond;
-          write w ");";
-          newline w
-        end else begin
-          write w "while (";
-          write_expr w cond;
-          write w ") {";
-          newline w;
-          indent w;
-          List.iter write_stmt_with_gc_cleanup body;
-          dedent w;
-          write w "}";
-          newline w
-        end
-    | TCSSwitch sw ->
-        write w "switch (";
-        write_expr w sw.sw_expr;
-        write w ") {";
-        newline w;
-        List.iter (fun (values, stmts) ->
-          List.iter (fun v ->
-            write w "case ";
-            write_expr w v;
-            write w ":";
-            newline w
-          ) values;
-          indent w;
-          List.iter write_stmt_with_gc_cleanup stmts;
-          write w "break;";
-          newline w;
-          dedent w
-        ) sw.sw_cases;
-        (match sw.sw_default with
-        | Some stmts ->
-            write w "default:";
-            newline w;
-            indent w;
-            List.iter write_stmt_with_gc_cleanup stmts;
-            dedent w
-        | None -> ());
-        newline w
-    | TCSTry _ ->
-        write_stmt w stmt
-    | _ ->
-        write_stmt w stmt
-  in
-  
-  (* Body statements with GC cleanup transformation *)
-  List.iter write_stmt_with_gc_cleanup cl.cl_body;
-  
-  (* Fall-through cleanup for void closures that don't explicitly return *)
-  if n_slots > 0 && cl.cl_ret = TCVoid then begin
-    write w "GC_FRAME_POP(FIB_CTX, _gc);";
-    newline w
-  end;
+  (* Body already contains GCFrame prologue, statements, and epilogue *)
+  List.iter (write_stmt w) cl.cl_body;
   
   dedent w;
   write w "}";
