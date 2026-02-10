@@ -3963,7 +3963,12 @@ let convert_constructor ctx (c : tclass) =
               vd_static = false; vd_const = false; vd_volatile = false;
             } in
             let arg_names = List.map (fun (v, _) ->
-              mk_expr (TCELocal (ident v.v_name)) (tc_type_of v.v_type)
+              let tc = tc_type_of v.v_type in
+              let vname = ident v.v_name in
+              if has_gc_params && needs_gc_root tc then
+                mk_expr (TCEDot (mk_expr (TCELocal "_gc") TCVoid, vname)) tc
+              else
+                mk_expr (TCELocal vname) tc
             ) filtered_args in
             let init_call = TCSExpr (mk_expr (TCECall (
               TCTFunc (Printf.sprintf "%s_init" class_name),
