@@ -1194,7 +1194,7 @@ let rec convert_expr (ctx : conv_ctx) (e : texpr) : tc_expr =
           in
           (name, boxed)
         ) fl in
-        mk_expr_pos (TCEAnonObject fields) TCFibDynamic pos
+        mk_expr_pos (TCEAnonObject (fields, false)) TCFibDynamic pos
       end
   
   | TIf (cond, ethen, None) ->
@@ -1765,12 +1765,20 @@ and convert_array_assign ctx e1 e2 pos =
       let e2_expr = convert_expr ctx e2 in
       mk_expr_pos (TCEAssign (e1_expr, e2_expr)) e1_expr.ctype pos
 
+(* Mark anonymous object as heap-allocated if stored in a field/variable.
+   Compound-literal (stack) anon objects become dangling pointers when stored
+   in fields that outlive the current scope. *)
+and mark_anon_heap_alloc (e : tc_expr) : tc_expr =
+  match e.cexpr with
+  | TCEAnonObject (fields, false) -> { e with cexpr = TCEAnonObject (fields, true) }
+  | _ -> e
+
 (* Convert field assignment - may need write barrier *)
 and convert_field_assign ctx e1 e2 pos =
   match e1.Type.eexpr with
   | Type.TField (obj, fa) ->
       let obj_expr = convert_expr ctx obj in
-      let val_expr = convert_expr ctx e2 in
+      let val_expr = mark_anon_heap_alloc (convert_expr ctx e2) in
       let lhs_tc = tc_type_of e1.Type.etype in
       let rhs_tc = val_expr.ctype in
       (* Check if this is an instance field (has an object to barrier) *)
@@ -3752,6 +3760,107 @@ let convert_function ctx name func is_static class_name_opt =
     fd_attrs = [];
   }
 
+(* ============================================================================
+ * Peephole optimization: fib_bytes_alloc + fib_bytes_fill fusion
+ * 
+ * When Bytes.alloc(n) is followed by fill(0, n, val), the calloc zeroing in
+ * fib_bytes_alloc is redundant because fill will memset the entire buffer.
+ * This pass replaces fib_bytes_alloc with fib_bytes_alloc_uninitialized
+ * when a full-range fill is detected in the same scope.
+ * ============================================================================ *)
+
+(* Extract the size argument from a "fib_bytes_alloc(SIZE)" raw string *)
+let extract_bytes_alloc_size (raw : string) : string option =
+  let prefix = "fib_bytes_alloc(" in
+  let prefix_len = String.length prefix in
+  if String.length raw > prefix_len + 1 
+     && String.sub raw 0 prefix_len = prefix 
+     && raw.[String.length raw - 1] = ')' then
+    Some (String.sub raw prefix_len (String.length raw - prefix_len - 1))
+  else
+    None
+
+(* Check if string s contains substring sub *)
+let string_contains s sub =
+  let sub_len = String.length sub in
+  let s_len = String.length s in
+  if sub_len > s_len then false
+  else begin
+    let found = ref false in
+    for i = 0 to s_len - sub_len do
+      if not !found && String.sub s i sub_len = sub then
+        found := true
+    done;
+    !found
+  end
+
+(* Check if a raw string is "fib_bytes_fill(EXPR, 0, SIZE, VALUE)" with matching size *)
+let is_matching_bytes_fill (raw : string) (alloc_size : string) : bool =
+  let prefix = "fib_bytes_fill(" in
+  let prefix_len = String.length prefix in
+  if String.length raw > prefix_len && String.sub raw 0 prefix_len = prefix then begin
+    (* Parse arguments: skip first arg (the data pointer), check pos=0, match size *)
+    let inner = String.sub raw prefix_len (String.length raw - prefix_len - 1) in
+    (* Look for ", 0, SIZE, " or ", 0, SIZE)" pattern *)
+    string_contains inner (", 0, " ^ alloc_size ^ ", ")
+    || string_contains inner (", 0, " ^ alloc_size ^ ")")
+  end else
+    false
+
+(* Check if a statement list contains a full-range fib_bytes_fill for the given alloc size *)
+let rec has_matching_fill (stmts : tc_stmt list) (alloc_size : string) : bool =
+  List.exists (fun stmt ->
+    match stmt with
+    | TCSExpr { cexpr = TCERaw raw; _ } ->
+        is_matching_bytes_fill raw alloc_size
+    | _ -> false
+  ) stmts
+
+(* Replace "fib_bytes_alloc(" with "fib_bytes_alloc_uninitialized(" in a raw string *)
+let replace_alloc_with_uninit (raw : string) : string =
+  let old_prefix = "fib_bytes_alloc(" in
+  let new_prefix = "fib_bytes_alloc_uninitialized(" in
+  if String.length raw >= String.length old_prefix 
+     && String.sub raw 0 (String.length old_prefix) = old_prefix then
+    new_prefix ^ String.sub raw (String.length old_prefix) (String.length raw - String.length old_prefix)
+  else
+    raw
+
+(* Apply bytes alloc+fill peephole optimization to a statement list.
+   Recurses into while loops, if branches, and blocks. *)
+let rec peephole_bytes_alloc_fill (stmts : tc_stmt list) : tc_stmt list =
+  (* First pass: collect alloc sizes that have matching fills in this scope *)
+  let alloc_sizes_with_fill = Hashtbl.create 4 in
+  List.iter (fun stmt ->
+    match stmt with
+    | TCSVar { vd_type = TCFibBytesData; vd_init = Some { cexpr = TCERaw raw; _ }; _ } ->
+        (match extract_bytes_alloc_size raw with
+         | Some size when has_matching_fill stmts size ->
+             Hashtbl.replace alloc_sizes_with_fill size true
+         | _ -> ())
+    | _ -> ()
+  ) stmts;
+  (* Second pass: rewrite alloc calls and recurse into sub-statements *)
+  List.map (fun stmt ->
+    match stmt with
+    | TCSVar ({ vd_type = TCFibBytesData; vd_init = Some ({ cexpr = TCERaw raw; _ } as init_expr); _ } as vd) ->
+        (match extract_bytes_alloc_size raw with
+         | Some size when Hashtbl.mem alloc_sizes_with_fill size ->
+             let new_raw = replace_alloc_with_uninit raw in
+             TCSVar { vd with vd_init = Some { init_expr with cexpr = TCERaw new_raw } }
+         | _ -> stmt)
+    | TCSWhile (cond, body, is_do) ->
+        TCSWhile (cond, peephole_bytes_alloc_fill body, is_do)
+    | TCSBlock body ->
+        TCSBlock (peephole_bytes_alloc_fill body)
+    | TCSIf (cond, then_stmts, else_stmts) ->
+        TCSIf (cond, peephole_bytes_alloc_fill then_stmts,
+               Option.map peephole_bytes_alloc_fill else_stmts)
+    | TCSFor (init, cond, step, body) ->
+        TCSFor (init, cond, step, peephole_bytes_alloc_fill body)
+    | _ -> stmt
+  ) stmts
+
 (* Convert a Haxe class method to C-AST function definition WITH full prologue/epilogue.
    Uses GCFrame-based shadow stack for GC root tracking.
    Emits: FIB_GC_CTX, GCFrame declaration, GC safe point, debug assertions,
@@ -3813,6 +3922,9 @@ let convert_class_method ctx name (func : tfunc) is_static class_name =
   let body_stmts = convert_stmt body_ctx func.tf_expr in
   (* Mark non-GC locals as volatile if function body contains try/catch *)
   let body_stmts = mark_volatile_for_try body_stmts in
+  (* Peephole: replace fib_bytes_alloc with fib_bytes_alloc_uninitialized
+     when a full-range fib_bytes_fill follows in the same scope *)
+  let body_stmts = peephole_bytes_alloc_fill body_stmts in
   (* Propagate closures and counters back to caller's context *)
   ctx.closures <- body_ctx.closures @ ctx.closures;
   ctx.closure_counter <- body_ctx.closure_counter;

@@ -220,7 +220,7 @@ and tc_expr_kind =
   (* Object operations *)
   | TCENew of string * tc_expr list         (* Class_new(args) *)
   | TCEInstanceOf of tc_expr * string       (* Std.is equivalent *)
-  | TCEAnonObject of (string * tc_expr) list  (* Anonymous object { field: value, ... } *)
+  | TCEAnonObject of (string * tc_expr) list * bool  (* Anonymous object { field: value, ... }, heap_alloc *)
   
   (* String operations *)
   | TCEStringConcat of tc_expr * tc_expr    (* fib_string_concat *)

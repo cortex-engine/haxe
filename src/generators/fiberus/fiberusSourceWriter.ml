@@ -425,15 +425,16 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
       writef w "fib_is_instance(";
       write_expr w e;
       writef w ", &%s_class)" cls
-  | TCEAnonObject fields ->
+  | TCEAnonObject (fields, heap_alloc) ->
       (* Use numbered helper macro to create anonymous object.
-       * This avoids GCC statement expressions.
-       * Macro: FIB_ANON_NEW_N("name1", val1, "name2", val2, ...) *)
+       * FIB_ANON_NEW_N uses stack-allocated compound literals (temporary use only).
+       * FIB_ANON_HEAP_N uses malloc'd nodes (for long-lived storage in fields/variables). *)
       let n = List.length fields in
+      let prefix = if heap_alloc then "FIB_ANON_HEAP" else "FIB_ANON_NEW" in
       if n = 0 then
-        write w "FIB_ANON_NEW_0()"
+        writef w "%s_0()" prefix
       else begin
-        writef w "FIB_ANON_NEW_%d(" n;
+        writef w "%s_%d(" prefix n;
         let first = ref true in
         List.iter (fun (name, value) ->
           if not !first then write w ", ";

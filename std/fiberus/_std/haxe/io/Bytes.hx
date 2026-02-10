@@ -115,7 +115,7 @@ class Bytes {
 		return b;
 	}
 
-	public static function alloc(length:Int):Bytes {
+	public static inline function alloc(length:Int):Bytes {
 		var data:BytesData = untyped __fiberus__("fib_bytes_alloc(", length, ")");
 		return new Bytes(length, data);
 	}
