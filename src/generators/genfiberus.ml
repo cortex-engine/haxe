@@ -440,6 +440,14 @@ let gen_header ctx com =
 	spr ctx "#include \"gc_api.h\"\n";
 	spr ctx "\n";
 
+	(* Cross-platform attribute for functions used only via function pointer *)
+	spr ctx "/* Mark static functions whose address is taken (closures) */\n";
+	spr ctx "#if defined(__GNUC__) || defined(__clang__)\n";
+	spr ctx "#define FIB_USED __attribute__((used))\n";
+	spr ctx "#else\n";
+	spr ctx "#define FIB_USED\n";
+	spr ctx "#endif\n\n";
+
 	(* Generate forward declarations for all classes - including extern ones *)
 	spr ctx "/* Forward declarations */\n";
 	List.iter (function
@@ -571,9 +579,14 @@ let gen_header ctx com =
 						(match f.tf_expr.eexpr with
 						| TBlock el -> List.iter extract_assigns el
 						| _ -> extract_assigns f.tf_expr);
-						let init_func = { fd_name = class_name ^ "_init"; fd_ret = TCVoid;
-							fd_args = this_arg :: ctor_args; fd_body = List.rev !init_body;
-							fd_static = true; fd_inline = true; fd_attrs = [] } in
+					(* Add (void)this if body is empty to suppress -Wunused-parameter *)
+					let final_init_body = match !init_body with
+						| [] -> [TCSRaw "(void)this;"]
+						| body -> List.rev body
+					in
+					let init_func = { fd_name = class_name ^ "_init"; fd_ret = TCVoid;
+						fd_args = this_arg :: ctor_args; fd_body = final_init_body;
+						fd_static = true; fd_inline = true; fd_attrs = [] } in
 						(* Build _new: alloc + init + return *)
 						let arg_names = List.map (fun (v, _) -> ident v.v_name) filtered_args in
 						let arg_refs = List.map (fun n -> mk_expr (TCELocal n) TCVoid) arg_names in

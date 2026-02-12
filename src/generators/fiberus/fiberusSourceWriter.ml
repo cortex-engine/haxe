@@ -341,7 +341,7 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
       write w "}"
   | TCEArrayLength (arr, arr_kind) ->
       let prefix = array_kind_prefix arr_kind in
-      writef w "%slength(" prefix;
+      writef w "(int32_t)%slength(" prefix;
       write_expr w arr;
       write w ")"
   | TCEArrayFromValues { afv_kind; afv_c_type; afv_values } ->
@@ -363,6 +363,9 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
         (match kind with
         | TCBoxObject | TCBoxClosure ->
             write w "(FibObject*)";
+            write_expr w e
+        | TCBoxArray ->
+            write w "(FibArray*)";
             write_expr w e
         | TCBoxEnum enum_name ->
             write w "&";
@@ -574,7 +577,12 @@ and write_stmt (w : writer) (s : tc_stmt) : unit =
   | TCSExpr e ->
       (* Emit pending statements first (lifted from sub-expressions) *)
       emit_pending_stmts w e;
-      write_expr w e;
+      (* Cast non-void expression-statements to (void) to suppress
+       * -Wunused-value for results used only for side effects *)
+      (match e.cexpr with
+      | TCECall _ | TCEAssign _ | TCEUnop _ -> write_expr w e
+      | _ when e.ctype = TCVoid -> write_expr w e
+      | _ -> write w "(void)"; write_expr w e);
       write w ";";
       newline w
   | TCSVar vd ->
@@ -758,6 +766,9 @@ and write_stmt (w : writer) (s : tc_stmt) : unit =
               write w ")_fib_caught_exc.data.objectVal");
           write w ";";
           newline w;
+          (* Suppress -Wunused-variable when catch var is only used for type matching *)
+          writef w "(void)%s;" catch.catch_var;
+          newline w;
           List.iter (write_stmt w) catch.catch_body
         )
       ) tr.try_catches;
@@ -786,6 +797,8 @@ and write_stmt (w : writer) (s : tc_stmt) : unit =
       () (* n=0, emit nothing *)
   | TCSGCCtx ->
       write w "FIB_GC_CTX;";
+      newline w;
+      write w "(void)FIB_CTX;";
       newline w
   | TCSGCSafePoint ->
       write w "GC_SAFE_POINT();";
@@ -1115,7 +1128,7 @@ let unbox_from_dynamic (arg_name : string) (t : tc_type) : string =
 (* Generate forward declarations for a closure *)
 let write_closure_forward_decls (w : writer) (cl : tc_closure) : unit =
   (* Forward declaration for typed impl function *)
-  write w "static ";
+  write w "static FIB_USED ";
   write_type w cl.cl_ret;
   writef w " %s(FibClosure* _closure" cl.cl_impl_name;
   List.iter (fun arg ->
@@ -1126,7 +1139,7 @@ let write_closure_forward_decls (w : writer) (cl : tc_closure) : unit =
   newline w;
   
   (* Forward declaration for dynamic thunk *)
-  writef w "static FibDynamic %s(FibClosure* _closure" cl.cl_name;
+  writef w "static FIB_USED FibDynamic %s(FibClosure* _closure" cl.cl_name;
   List.iteri (fun i _ ->
     writef w ", FibDynamic _arg%d" i
   ) cl.cl_args;
@@ -1143,7 +1156,7 @@ let write_closure_forward_decls (w : writer) (cl : tc_closure) : unit =
  * So we just emit the function signature, debug frame, and the body directly. *)
 let write_closure_impl (w : writer) (cl : tc_closure) ~(debug_level : int) : unit =
   (* Function signature *)
-  write w "static ";
+  write w "static FIB_USED ";
   write_type w cl.cl_ret;
   writef w " %s(FibClosure* _closure" cl.cl_impl_name;
   List.iter (fun arg ->
@@ -1174,7 +1187,7 @@ let write_closure_impl (w : writer) (cl : tc_closure) ~(debug_level : int) : uni
 (* Generate the dynamic thunk for a closure *)
 let write_closure_thunk (w : writer) (cl : tc_closure) : unit =
   (* Function signature *)
-  writef w "static FibDynamic %s(FibClosure* _closure" cl.cl_name;
+  writef w "static FIB_USED FibDynamic %s(FibClosure* _closure" cl.cl_name;
   List.iteri (fun i _ ->
     writef w ", FibDynamic _arg%d" i
   ) cl.cl_args;
@@ -1269,6 +1282,11 @@ let write_method_thunk_typed (w : writer) (thunk : tc_method_thunk) : unit =
   write w ") {";
   newline w;
   indent w;
+  (* Suppress -Wunused-parameter for _c in static thunks *)
+  if thunk.mth_is_static then begin
+    write w "(void)_c;";
+    newline w
+  end;
   (* Call the actual method *)
   if thunk.mth_ret_type <> TCVoid then write w "return ";
   writef w "%s_%s(" thunk.mth_class_name thunk.mth_method_name;

@@ -253,7 +253,11 @@ let coerce_to_type expr target_tc =
   else if (expr.ctype = TCFloat64 || expr.ctype = TCFloat32) && (target_tc = TCInt32 || target_tc = TCInt64) then
     (* Numeric truncation: Float -> Int *)
     mk_expr (TCECast (target_tc, expr)) target_tc
-  else
+  else match expr.ctype, target_tc with
+  | TCFibClass src_name, TCFibClass tgt_name when src_name <> tgt_name ->
+    (* Class/interface pointer cast (e.g., concrete class to interface) *)
+    mk_expr (TCECast (target_tc, expr)) target_tc
+  | _ ->
     (* Other type conversions - just return as-is for now *)
     expr
 
@@ -1174,6 +1178,11 @@ let rec convert_expr (ctx : conv_ctx) (e : texpr) : tc_expr =
       let body_stmts = mark_volatile_for_try body_stmts in
       (* Build prologue: FIB_GC_CTX + GCFrame + capture extraction *)
       let prologue = ref [TCSGCCtx] in
+      (* Suppress -Wunused-parameter for scalar (non-GC) closure args *)
+      List.iter (fun arg ->
+        if not (Hashtbl.mem frame_rooted_vars arg.fa_name) then
+          prologue := !prologue @ [TCSExpr (mk_expr (TCECast (TCVoid, mk_expr (TCELocal arg.fa_name) arg.fa_type)) TCVoid)]
+      ) args;
       let frame_info = gc_frame_build_info_with_inits body_ctx !param_inits in
       let has_gc_slots = frame_info.gfi_slots <> [] in
       if has_gc_slots then
@@ -1363,11 +1372,29 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
       let e1_expr = convert_expr ctx e1 in
       let e2_expr = convert_expr ctx e2 in
       let rhs = box_if_needed e1_expr.ctype e2_expr in
-      (* Propagate pending_stmts from both sides *)
-      let assign = mk_expr_pos (TCEAssign (e1_expr, rhs)) e1_expr.ctype pos in
-      { assign with 
-        pending_stmts = e1_expr.pending_stmts @ rhs.pending_stmts @ assign.pending_stmts;
-        gc_roots = e1_expr.gc_roots + rhs.gc_roots }
+      (* Check if RHS is an assignment that may modify the same lvalue.
+         In C, (x = (x += 1)) is undefined behavior — sequence via temporary. *)
+      let rhs_is_assign = match e2.Type.eexpr with
+        | Type.TBinop (Ast.OpAssignOp _, _, _) | Type.TBinop (Ast.OpAssign, _, _) -> true
+        | _ -> false
+      in
+      if rhs_is_assign then begin
+        let tmp_name = Printf.sprintf "_seq_%d" ctx.temp_counter in
+        ctx.temp_counter <- ctx.temp_counter + 1;
+        let tmp_var = TCSVar { vd_name = tmp_name; vd_type = rhs.ctype; vd_init = Some rhs;
+          vd_static = false; vd_const = false; vd_volatile = false } in
+        let tmp_ref = mk_expr (TCELocal tmp_name) rhs.ctype in
+        let assign = mk_expr_pos (TCEAssign (e1_expr, tmp_ref)) e1_expr.ctype pos in
+        { assign with
+          pending_stmts = e1_expr.pending_stmts @ rhs.pending_stmts @ [tmp_var];
+          gc_roots = e1_expr.gc_roots + rhs.gc_roots }
+      end else begin
+        (* Propagate pending_stmts from both sides *)
+        let assign = mk_expr_pos (TCEAssign (e1_expr, rhs)) e1_expr.ctype pos in
+        { assign with 
+          pending_stmts = e1_expr.pending_stmts @ rhs.pending_stmts @ assign.pending_stmts;
+          gc_roots = e1_expr.gc_roots + rhs.gc_roots }
+      end
   
   (* Unsigned right shift assignment *)
   | OpAssignOp OpUShr ->
@@ -1842,6 +1869,21 @@ and convert_field_assign ctx e1 e2 pos =
       (* Convert the LHS field expression *)
       let lhs_expr = convert_expr ctx e1 in
       let rhs = box_if_needed lhs_tc val_expr in
+      (* If RHS is itself an assignment/compound assignment, sequence via a
+         temporary to avoid undefined behavior (e.g., x = x += 1). *)
+      let rhs_is_assign = match e2.Type.eexpr with
+        | Type.TBinop (Ast.OpAssignOp _, _, _) | Type.TBinop (Ast.OpAssign, _, _) -> true
+        | _ -> false
+      in
+      let rhs, seq_stmts = if rhs_is_assign then begin
+        let tmp_name = Printf.sprintf "_seq_%d" ctx.temp_counter in
+        ctx.temp_counter <- ctx.temp_counter + 1;
+        let tmp_var = TCSVar { vd_name = tmp_name; vd_type = rhs.ctype; vd_init = Some rhs;
+          vd_static = false; vd_const = false; vd_volatile = false } in
+        mk_expr (TCELocal tmp_name) rhs.ctype, [tmp_var]
+      end else
+        rhs, []
+      in
       (* Check if write barrier needed - object pointers need barriers *)
       let needs_barrier = is_instance_field && needs_write_barrier_tc rhs_tc in
       if needs_barrier then begin
@@ -1851,13 +1893,13 @@ and convert_field_assign ctx e1 e2 pos =
         let result = mk_expr_pos (TCEComma [barrier; assign]) lhs_tc pos in
         (* Propagate pending_stmts from all sub-expressions *)
         { result with 
-          pending_stmts = obj_expr.pending_stmts @ lhs_expr.pending_stmts @ rhs.pending_stmts @ result.pending_stmts;
+          pending_stmts = obj_expr.pending_stmts @ lhs_expr.pending_stmts @ rhs.pending_stmts @ seq_stmts @ result.pending_stmts;
           gc_roots = obj_expr.gc_roots + lhs_expr.gc_roots + rhs.gc_roots }
       end else begin
         let result = mk_expr_pos (TCEAssign (lhs_expr, rhs)) lhs_tc pos in
         (* Propagate pending_stmts from sub-expressions *)
         { result with 
-          pending_stmts = lhs_expr.pending_stmts @ rhs.pending_stmts @ result.pending_stmts;
+          pending_stmts = lhs_expr.pending_stmts @ rhs.pending_stmts @ seq_stmts @ result.pending_stmts;
           gc_roots = lhs_expr.gc_roots + rhs.gc_roots }
       end
   | _ ->
@@ -3288,6 +3330,14 @@ and convert_call ctx callee args result_tc pos =
        * This ensures that if the object came from an array element access or
        * method call, it's rooted before we evaluate arguments or call the method. *)
       let call_result = wrap_single_gc_extraction_ctx (Some ctx) (fun safe_obj ->
+        (* Cast this pointer to declaring class type if it differs from the object's
+         * actual type. This avoids -Wincompatible-pointer-types when calling a parent
+         * class method on a subclass instance, e.g. haxe_Exception_toString called
+         * on a PosException pointer. *)
+        let this_type = TCFibClass class_name in
+        let cast_obj = if safe_obj.ctype <> this_type then
+          mk_expr (TCECast (this_type, safe_obj)) this_type
+        else safe_obj in
         (* Check if this needs vtable dispatch *)
         match ctx.vtable_ctx with
         | Some vtctx ->
@@ -3317,12 +3367,12 @@ and convert_call ctx callee args result_tc pos =
                     args = coerced_args;
                   }) result_tc pos
               | None ->
-                  (* Direct call *)
-                  mk_expr_pos (TCECall (TCTMethod (class_name, method_name), safe_obj :: coerced_args)) result_tc pos
+                  (* Direct call - use cast_obj for correct pointer type *)
+                  mk_expr_pos (TCECall (TCTMethod (class_name, method_name), cast_obj :: coerced_args)) result_tc pos
             end
         | None ->
-            (* No vtable context - direct call *)
-            mk_expr_pos (TCECall (TCTMethod (class_name, method_name), safe_obj :: coerced_args)) result_tc pos
+            (* No vtable context - direct call, use cast_obj for correct pointer type *)
+            mk_expr_pos (TCECall (TCTMethod (class_name, method_name), cast_obj :: coerced_args)) result_tc pos
       ) obj_expr in
       (* Prepend arguments' pending_stmts to ensure temp vars are declared before call *)
       { call_result with pending_stmts = args_pending @ call_result.pending_stmts }
@@ -4039,6 +4089,13 @@ let convert_class_method ctx name (func : tfunc) is_static class_name =
   (* Build prologue: FIB_GC_CTX + GCFrame declaration *)
   let prologue = ref [] in
   prologue := [TCSGCCtx];
+  (* Suppress -Wunused-parameter for scalar (non-GC) parameters that may not
+     be referenced in the body (e.g., encoding, index).  GC-rooted params are
+     always used because they're assigned into the GC frame. *)
+  List.iter (fun arg ->
+    if not (Hashtbl.mem frame_rooted_vars arg.fa_name) then
+      prologue := !prologue @ [TCSExpr (mk_expr (TCECast (TCVoid, mk_expr (TCELocal arg.fa_name) arg.fa_type)) TCVoid)]
+  ) tc_args;
   (* Build frame info with all accumulated slots (params + body locals + temps) *)
   let frame_info = gc_frame_build_info_with_inits body_ctx !param_inits in
   let has_gc_slots = frame_info.gfi_slots <> [] in
