@@ -31,8 +31,11 @@ class Sys {
 	}
 
 	public static function command(cmd:String, ?args:Array<String>):Int {
-		// TODO: Implement system command
-		return -1;
+		if (args == null) {
+			return untyped __fiberus__("fib_sys_command(", cmd, ")");
+		} else {
+			return untyped __fiberus__("fib_sys_command_args(", cmd, ", ", args, ")");
+		}
 	}
 
 	public static function cpuTime():Float {
@@ -60,7 +63,14 @@ class Sys {
 	}
 
 	public static function environment():Map<String, String> {
-		return new Map();
+		var result = new Map<String, String>();
+		var vars:Array<String> = untyped __fiberus__("fib_sys_environment()");
+		var i = 0;
+		while (i < vars.length) {
+			result.set(vars[i], vars[i + 1]);
+			i += 2;
+		}
+		return result;
 	}
 
 	@:deprecated("Use programPath instead")
@@ -69,7 +79,7 @@ class Sys {
 	}
 
 	public static function programPath():String {
-		return "./";
+		return untyped __fiberus__("fib_sys_program_path()");
 	}
 
 	public static function getCwd():String {

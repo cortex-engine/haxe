@@ -145,6 +145,40 @@ extern class GC {
 	public static function getThreshold():Int;
 
 	/**
+	 * Enter a GC-free zone.
+	 *
+	 * While in a GC-free zone, this thread will not block garbage collection.
+	 * The GC can proceed with stop-the-world without waiting for this thread.
+	 *
+	 * **Important:** While in a GC-free zone, you MUST NOT:
+	 * - Allocate GC-managed objects
+	 * - Access GC-managed pointers (Haxe objects, strings, arrays, etc.)
+	 *
+	 * This is intended for long-running native/C calls (regex matching,
+	 * JSON parsing, compression, subprocess waiting, etc.) that only
+	 * operate on non-GC memory.
+	 *
+	 * Always pair with `exitUnsafe()`.
+	 *
+	 * Example:
+	 * ```haxe
+	 * GC.enterUnsafe();
+	 * // ... long-running native call ...
+	 * GC.exitUnsafe();
+	 * ```
+	 */
+	public static function enterUnsafe():Void;
+
+	/**
+	 * Exit a GC-free zone.
+	 *
+	 * If a GC collection is currently in progress, this will wait for it
+	 * to complete before returning. After this call, the thread is back in
+	 * managed mode and can safely access GC objects again.
+	 */
+	public static function exitUnsafe():Void;
+
+	/**
 	 * Triggers a minor (nursery) collection.
 	 *
 	 * This is normally called automatically when the nursery fills up,

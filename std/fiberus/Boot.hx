@@ -22,6 +22,10 @@ class Boot {
 			return "[Array]";
 		if (untyped __fiberus__("(", o, ").type == FIB_TYPE_OBJECT"))
 			return "[Object]";
+		if (untyped __fiberus__("(", o, ").type == FIB_TYPE_ENUM"))
+			return untyped __fiberus__("fib_dynamic_to_string(", o, ")");
+		if (untyped __fiberus__("(", o, ").type == FIB_TYPE_ANON"))
+			return "{...}";
 		return "[Unknown]";
 	}
 

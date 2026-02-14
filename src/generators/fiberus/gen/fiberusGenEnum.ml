@@ -163,7 +163,7 @@ let gen_enum_constructor_func (info : enum_info) (ci : enum_constr_info) : tc_fu
     let decl_stmt = TCSVar {
       vd_name = "_e";
       vd_type = enum_type;
-      vd_init = Some (mk_expr (TCERaw (Printf.sprintf "{ .index = %d }" ci.eci_index)) enum_type);
+      vd_init = Some (mk_expr (TCERaw (Printf.sprintf "{ ._meta = &%s_meta, .index = %d }" info.ei_name ci.eci_index)) enum_type);
       vd_static = false;
       vd_const = false; vd_volatile = false;
     } in
@@ -198,7 +198,7 @@ let gen_enum_const_decl (info : enum_info) (ci : enum_constr_info) : tc_decl =
   TCDVar {
     vd_name = info.ei_name ^ "_" ^ ci.eci_name;
     vd_type = enum_type;
-    vd_init = Some (mk_expr (TCERaw (Printf.sprintf "{ .index = %d }" ci.eci_index)) enum_type);
+    vd_init = Some (mk_expr (TCERaw (Printf.sprintf "{ ._meta = &%s_meta, .index = %d }" info.ei_name ci.eci_index)) enum_type);
     vd_static = false;
     vd_const = true; vd_volatile = false;
   }

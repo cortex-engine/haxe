@@ -43,12 +43,13 @@ let get_instance_fields (c : tclass) : struct_field_info list =
           sfi_is_dynamic_method = false;
         }
     | Method MethDynamic ->
-        (* Dynamic methods are stored as function pointers *)
+        (* Dynamic methods are stored as closure pointers -- void* holding FibClosure.
+           They need GC marking because the closure is a GC-managed object. *)
         Some {
           sfi_name = ident cf.cf_name;
           sfi_type = TCPointer TCVoid;  (* void* for dynamic function *)
           sfi_haxe_type = cf.cf_type;
-          sfi_needs_gc = false;
+          sfi_needs_gc = true;
           sfi_is_dynamic_method = true;
         }
     | _ -> None
@@ -80,7 +81,8 @@ type static_field_info = {
 (* Check if an expression is a compile-time constant *)
 let rec is_compile_time_constant (e : texpr) : bool =
   match e.eexpr with
-  | TConst (TInt _ | TFloat _ | TBool _ | TNull) -> true
+  | TConst (TInt _ | TFloat _ | TBool _) -> true
+  | TConst TNull -> (match tc_type_of e.etype with TCFibDynamic -> false | _ -> true)
   | TConst (TString _) -> false  (* Strings need runtime alloc *)
   | TConst TThis -> false
   | TConst TSuper -> false
@@ -126,7 +128,7 @@ let get_runtime_init_fields (c : tclass) : static_field_info list =
 
 (* Check if class needs a __boot function *)
 let needs_boot_function (c : tclass) : bool =
-  get_runtime_init_fields c <> []
+  get_runtime_init_fields c <> [] || TClass.get_cl_init c <> None
 
 (* ============================================================================
  * Constructor Analysis
@@ -239,6 +241,11 @@ let gen_class_meta (c : tclass) (class_id : int) (vtable_size : int) : tc_class_
   in
   let mark_func = if needs_mark_function c then Some (class_name ^ "_mark") else None in
   let tostring_func = find_tostring_func c in
+  let field_descs = List.filter_map (fun cf ->
+    match cf.cf_kind with
+    | Var _ -> Some (cf.cf_name, tc_type_of cf.cf_type)
+    | _ -> None
+  ) c.cl_ordered_fields in
   {
     cm_name = s_type_path c.cl_path;
     cm_var_name = class_name;
@@ -249,6 +256,8 @@ let gen_class_meta (c : tclass) (class_id : int) (vtable_size : int) : tc_class_
     cm_tostring_func = tostring_func;
     cm_vtable_name = if vtable_size > 0 then Some (class_name ^ "_vtable") else None;
     cm_vtable_size = vtable_size;
+    cm_fields = field_descs;
+    cm_methods = [];  (* Populated by genfiberus.ml gen_class, not here *)
   }
 
 (* ============================================================================

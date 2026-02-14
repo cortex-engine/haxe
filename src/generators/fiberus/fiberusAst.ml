@@ -381,6 +381,16 @@ and tc_class_meta = {
   cm_tostring_func: string option;          (* toString function name, or None *)
   cm_vtable_name: string option;            (* Vtable variable name, or None *)
   cm_vtable_size: int;
+  cm_fields: (string * tc_type) list;        (* Instance fields: (name, type) for Reflect *)
+  cm_methods: tc_method_desc list;           (* Instance methods for dynamic dispatch *)
+}
+
+(* Method descriptor for fib_dynamic_get_field runtime lookup *)
+and tc_method_desc = {
+  md_name: string;                           (* Haxe method name (e.g. "iterator") *)
+  md_thunk_name: string;                     (* Typed thunk C function name *)
+  md_dyn_thunk_name: string;                 (* Dynamic thunk C function name *)
+  md_arg_count: int;                         (* Number of params (excluding 'this') *)
 }
 
 and tc_vtable_entry = {
@@ -648,6 +658,11 @@ let is_pointer_type = function
   | TCFibObject | TCFiber | TCFibClass _ | TCFibArray _ 
   | TCFibIntMap | TCFibStringMap | TCFibInt64Map | TCFibObjectMap
   | TCFibBytesData -> true
+  (* Map iterator types are pointers *)
+  | TCRaw "FibIntMapKeyIterator*" | TCRaw "FibIntMapValueIterator*"
+  | TCRaw "FibStringMapKeyIterator*" | TCRaw "FibStringMapValueIterator*"
+  | TCRaw "FibInt64MapKeyIterator*" | TCRaw "FibInt64MapValueIterator*"
+  | TCRaw "FibObjectMapKeyIterator*" | TCRaw "FibObjectMapValueIterator*" -> true
   | _ -> false
 
 (* Check if type is a primitive type *)
@@ -665,4 +680,9 @@ let rec needs_gc_tracking = function
   | TCFibIntMap | TCFibStringMap | TCFibInt64Map | TCFibObjectMap
   | TCFibBytesData -> true
   | TCPointer inner -> needs_gc_tracking inner
+  (* Map iterator types are GC-allocated and need tracking *)
+  | TCRaw "FibIntMapKeyIterator*" | TCRaw "FibIntMapValueIterator*"
+  | TCRaw "FibStringMapKeyIterator*" | TCRaw "FibStringMapValueIterator*"
+  | TCRaw "FibInt64MapKeyIterator*" | TCRaw "FibInt64MapValueIterator*"
+  | TCRaw "FibObjectMapKeyIterator*" | TCRaw "FibObjectMapValueIterator*" -> true
   | _ -> false

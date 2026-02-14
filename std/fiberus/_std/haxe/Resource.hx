@@ -1,0 +1,55 @@
+/*
+ * Copyright (C)2005-2019 Haxe Foundation
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
+ */
+
+package haxe;
+
+/**
+ * Fiberus override for haxe.Resource.
+ *
+ * Resources are embedded as static const byte arrays in the generated C code
+ * by genfiberus.ml and looked up via C runtime functions in resource.c.
+ */
+class Resource {
+	public static function listNames():Array<String> {
+		var count:Int = untyped __fiberus__("fiberus_resource_count");
+		var result = new Array<String>();
+		var i = 0;
+		while (i < count) {
+			var name:String = untyped __fiberus__("fib_string_new(fiberus_resources[", i, "].name)");
+			result.push(name);
+			i++;
+		}
+		return result;
+	}
+
+	public static function getString(name:String):Null<String> {
+		var s:String = untyped __fiberus__("fib_resource_get_string(fib_string_data(", name, "))");
+		return s;
+	}
+
+	public static function getBytes(name:String):Null<haxe.io.Bytes> {
+		var bd:haxe.io.BytesData = untyped __fiberus__("fib_resource_get_bytes(fib_string_data(", name, "))");
+		if (bd == null)
+			return null;
+		return haxe.io.Bytes.ofData(bd);
+	}
+}

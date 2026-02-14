@@ -727,6 +727,7 @@ let get_config com =
 			pf_pad_nulls = true;
 			pf_add_final_return = true;
 			pf_supports_threads = true;
+			pf_supports_atomics = true;
 			pf_uses_utf16 = false;
 			pf_scoping = { default_config.pf_scoping with
 				vs_flags = [NoShadowing];

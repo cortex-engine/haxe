@@ -307,6 +307,13 @@ let array_kind_c_elem_type = function
  * ============================================================================ *)
 
 (* Get box kind for a C-AST type *)
+let is_map_iterator_type = function
+  | TCRaw "FibIntMapKeyIterator*" | TCRaw "FibIntMapValueIterator*"
+  | TCRaw "FibStringMapKeyIterator*" | TCRaw "FibStringMapValueIterator*"
+  | TCRaw "FibInt64MapKeyIterator*" | TCRaw "FibInt64MapValueIterator*"
+  | TCRaw "FibObjectMapKeyIterator*" | TCRaw "FibObjectMapValueIterator*" -> true
+  | _ -> false
+
 let box_kind_of_type = function
   | TCInt32 -> TCBoxInt
   | TCInt64 -> TCBoxInt64
@@ -317,7 +324,13 @@ let box_kind_of_type = function
   | TCFibObject | TCFibClass _ -> TCBoxObject
   | TCFibClosure -> TCBoxClosure
   | TCFibEnum name -> TCBoxEnum name
+  | TCFibIntMap | TCFibStringMap | TCFibInt64Map | TCFibObjectMap -> TCBoxObject
   | TCFibDynamic -> TCBoxDynamic
+  (* Map iterator types have a FibClass as first member, enabling boxing
+     as FIB_TYPE_OBJECT via fib_dynamic_object. Dynamic dispatch through
+     fib_dynamic_get_field finds hasNext/next in the iterator's FibClass
+     method descriptors. *)
+  | tc when is_map_iterator_type tc -> TCBoxObject
   | _ -> TCBoxDynamic
 
 (* Get FibDynamic field suffix for unboxing *)
@@ -353,9 +366,10 @@ let unbox_func_name = function
   | TCInt64 -> "fib_dynamic_to_int64"
   | TCFloat64 | TCFloat32 -> "fib_dynamic_to_float"
   | TCBool -> "fib_dynamic_to_bool"
-  | TCFibString -> "fib_dynamic_extract_string"
+  | TCFibString -> "fib_dynamic_coerce_string"
   | TCFibArray _ -> "fib_dynamic_to_array"
   | TCFibObject | TCFibClass _ | TCFibClosure -> "fib_dynamic_to_object"
+  | TCFibIntMap | TCFibStringMap | TCFibInt64Map | TCFibObjectMap -> "fib_dynamic_to_object"
   | TCFibEnum _ -> "fib_dynamic_to_ptr"  (* Returns void*, needs cast and deref *)
   | _ -> ""
 

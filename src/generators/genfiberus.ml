@@ -87,6 +87,7 @@ let make_conv_ctx ctx =
     FiberusConvert.fiber_mature_vars = ctx.fiber_mature_vars;
     FiberusConvert.stack_alloc_vars = ctx.stack_alloc_vars;
     FiberusConvert.method_thunks = ctx.cast_method_thunks;
+    FiberusConvert.var_type_overrides = Hashtbl.create 0;
     FiberusConvert.debug_level = ctx.debug_level;
     FiberusConvert.last_line = 0;
     FiberusConvert.has_stack_frame = false;
@@ -168,8 +169,14 @@ let gen_static_var_decl ctx c cf =
 			Some (FiberusConvert.convert_expr conv_ctx e)
 		| _ ->
 			(* Default zero-initialization for non-constant fields *)
+			(* Must use file-scope-valid initializers — no function calls *)
 			let zero = match tc with
-				| TCInt32 -> "0" | TCFloat64 -> "0.0" | TCBool -> "false" | _ -> "NULL"
+				| TCInt32 -> "0"
+				| TCFloat64 -> "0.0"
+				| TCBool -> "false"
+				| TCFibDynamic -> "(FibDynamic){0}"
+				| TCFibEnum name -> Printf.sprintf "(%s){ ._meta = NULL, .index = -1 }" name
+				| _ -> "NULL"
 			in
 			Some (mk_expr (TCERaw zero) tc)
 	in
@@ -206,6 +213,9 @@ let gen_class_impl ctx c =
 			| Var _ when not (has_class_field_flag cf CfStatic) ->
 				let type_tc = tc_type_of cf.cf_type in
 				needs_gc_marking_tc type_tc
+			| Method MethDynamic when not (has_class_field_flag cf CfStatic) ->
+				(* Dynamic methods store FibClosure* in void* fields — they need GC marking *)
+				true
 			| _ -> false
 		) c.cl_ordered_fields in
 		let has_mark_func = gc_fields <> [] in
@@ -266,6 +276,53 @@ let gen_class_impl ctx c =
 
 		(* 3. FibClass struct *)
 		let tostring_func = FiberusGenClass.find_tostring_func c in
+		(* Extract instance field descriptors for Reflect *)
+		let field_descs = List.filter_map (fun cf ->
+			match cf.cf_kind with
+			| Var _ -> Some (cf.cf_name, tc_type_of cf.cf_type)
+			| Method MethDynamic ->
+				(* Dynamic methods are fields (closure pointers), visible to Reflect *)
+				Some (cf.cf_name, TCPointer TCVoid)
+			| _ -> None
+		) c.cl_ordered_fields in
+		(* Extract instance method descriptors for dynamic dispatch (fib_dynamic_get_field).
+		   We generate thunks for ALL instance methods so that runtime dynamic field lookup
+		   can create closures on the fly (needed by Lambda, Dynamic dispatch, etc.). *)
+		let method_descs = List.filter_map (fun cf ->
+			match cf.cf_kind with
+			| Method MethNormal | Method MethInline ->
+				(match cf.cf_expr with
+				| Some { eexpr = TFunction _ } ->
+					let method_name = ident cf.cf_name in
+					let thunk_name = Printf.sprintf "__%s_%s_thunk" class_name method_name in
+					let dyn_thunk_name = thunk_name ^ "_dyn" in
+					let arg_types, ret_type = match Type.follow cf.cf_type with
+						| TFun (args, ret) ->
+							(List.map (fun (n, _, t) -> (n, tc_type_of t)) args,
+							 tc_type_of ret)
+						| _ -> ([], TCFibDynamic)
+					in
+					let arg_count = List.length arg_types in
+					(* Register the thunk so it gets generated *)
+					let thunk = {
+						mth_thunk_name = thunk_name;
+						mth_dyn_thunk_name = dyn_thunk_name;
+						mth_is_static = false;
+						mth_class_name = class_name;
+						mth_method_name = method_name;
+						mth_args = arg_types;
+						mth_ret_type = ret_type;
+					} in
+					Hashtbl.replace ctx.cast_method_thunks thunk_name thunk;
+					Some {
+						md_name = cf.cf_name;
+						md_thunk_name = thunk_name;
+						md_dyn_thunk_name = dyn_thunk_name;
+						md_arg_count = arg_count;
+					}
+				| _ -> None)
+			| _ -> None
+		) c.cl_ordered_fields in
 		add (TCDClassMeta {
 			cm_name = s_type_path c.cl_path;
 			cm_var_name = class_name;
@@ -276,6 +333,8 @@ let gen_class_impl ctx c =
 			cm_tostring_func = tostring_func;
 			cm_vtable_name = if vtable_size > 0 then Some (class_name ^ "_vtable") else None;
 			cm_vtable_size = vtable_size;
+			cm_fields = field_descs;
+			cm_methods = method_descs;
 		});
 
 		(* 4. Static variable declarations *)
@@ -290,9 +349,10 @@ let gen_class_impl ctx c =
 			| _ -> ()
 		) c.cl_ordered_statics;
 
-		(* 5. Boot function for runtime static initialization *)
+		(* 5. Boot function for runtime static initialization + __init__ *)
 		let runtime_init_fields = get_runtime_init_fields c in
-		if runtime_init_fields <> [] then begin
+		let cl_init_expr = TClass.get_cl_init c in
+		if runtime_init_fields <> [] || cl_init_expr <> None then begin
 			let conv_ctx = make_conv_ctx ctx in
 			conv_ctx.FiberusConvert.gc_local_count <- 0;
 			conv_ctx.FiberusConvert.in_gc_frame <- true;
@@ -307,6 +367,12 @@ let gen_class_impl ctx c =
 					Some (TCSExpr (mk_expr (TCEAssign (lhs, cexpr)) (tc_type_of cf.cf_type)))
 				| None -> None
 			) runtime_init_fields in
+			(* Append __init__ body (cl_init) after field assignments *)
+			let cl_init_stmts = match cl_init_expr with
+				| Some e ->
+					FiberusConvert.convert_stmt conv_ctx e
+				| None -> []
+			in
 			(* Build GCFrame prologue/epilogue from accumulated slots *)
 			let frame_info = FiberusConvert.gc_frame_build_info conv_ctx in
 			let has_gc_slots = frame_info.gfi_slots <> [] in
@@ -316,11 +382,17 @@ let gen_class_impl ctx c =
 				fd_name = class_name ^ "___boot";
 				fd_ret = TCVoid;
 				fd_args = [];
-				fd_body = prologue @ init_stmts @ epilogue;
+				fd_body = prologue @ init_stmts @ cl_init_stmts @ epilogue;
 				fd_static = false;
 				fd_inline = false;
 				fd_attrs = [];
-			})
+			});
+			(* Sync closures from boot function conversion back to class context.
+			   Static field initializers and __init__ may contain lambdas/IIFEs
+			   (e.g., haxe.xml.Parser.escapes block init) that create closure
+			   definitions which must be emitted as top-level functions in the .c file. *)
+			let new_closures = sync_closures_from_conv ctx conv_ctx in
+			ctx.closures <- new_closures @ ctx.closures
 		end;
 
 		(* 6. Constructor — inlined from gen_constructor *)
@@ -386,15 +458,32 @@ let gen_class_impl ctx c =
 		FiberusSourceWriter.contents w
 	end
 
+let gen_enum_meta (info : enum_info) : string =
+	let buf = Buffer.create 256 in
+	(* Emit constructor metadata array *)
+	Buffer.add_string buf (Printf.sprintf "static const FibEnumConstrMeta %s_constrs[] = {\n" info.ei_name);
+	List.iter (fun ci ->
+		Buffer.add_string buf (Printf.sprintf "\t{ \"%s\", %d, %d },\n"
+			ci.eci_name ci.eci_index (List.length ci.eci_params))
+	) info.ei_constructors;
+	Buffer.add_string buf "};\n";
+	(* Emit enum metadata struct *)
+	let haxe_name = s_type_path info.ei_path in
+	Buffer.add_string buf (Printf.sprintf "const FibEnumMeta %s_meta = { \"%s\", %d, %s_constrs };\n\n"
+		info.ei_name haxe_name (List.length info.ei_constructors) info.ei_name);
+	Buffer.contents buf
+
 let gen_enum_impl _ctx e =
 	if has_enum_flag e EnExtern then "" else begin
 		let info = build_enum_info e in
 		let decls = gen_enum_decls info in
 		(* Skip the first decl (TCDEnum struct def) — that goes in the header *)
 		let impl_decls = List.filter (fun d -> match d with TCDEnum _ -> false | _ -> true) decls in
+		(* Generate metadata tables first *)
+		let meta_str = gen_enum_meta info in
 		let w = FiberusSourceWriter.create () in
 		List.iter (FiberusSourceWriter.write_decl w) impl_decls;
-		FiberusSourceWriter.contents w
+		meta_str ^ FiberusSourceWriter.contents w
 	end
 
 (* Generate the common header file *)
@@ -416,6 +505,7 @@ let gen_header ctx com =
 	spr ctx "#include <string.h>\n";
 	spr ctx "#include <setjmp.h>\n";
 	spr ctx "#include <unistd.h>\n";
+	spr ctx "#include <dirent.h>\n";
 	spr ctx "#include <math.h>\n";
 	spr ctx "#include \"fiber.h\"\n";
 	spr ctx "#include \"scheduler.h\"\n";
@@ -431,6 +521,17 @@ let gen_header ctx com =
 	spr ctx "#include \"counter.h\"\n";
 	spr ctx "#include \"iouring.h\"\n";
 	spr ctx "#include \"date.h\"\n";
+	spr ctx "#include \"process.h\"\n";
+	spr ctx "#include \"reflect.h\"\n";
+	spr ctx "#include \"ereg.h\"\n";
+	spr ctx "#include \"json.h\"\n";
+	spr ctx "#include \"compress.h\"\n";
+	spr ctx "#include \"base64.h\"\n";
+	spr ctx "#include \"resource.h\"\n";
+	spr ctx "#include \"ssl.h\"\n";
+	spr ctx "#include \"thread.h\"\n";
+	spr ctx "#include \"sqlite_fib.h\"\n";
+	spr ctx "#include \"simdutf_c.h\"\n";
 	spr ctx "\n";
 
 	(* Runtime API headers - extracted from inline C to proper .h files *)
@@ -461,8 +562,11 @@ let gen_header ctx com =
 				newline ctx
 			end
 		| TEnumDecl e ->
-			(* Forward declare all enums *)
-			print ctx "typedef struct { int index; FibDynamic params[8]; } %s;" (flat_path e.e_path);
+			(* Forward declare all enums - includes _meta pointer for reflection *)
+			print ctx "typedef struct { const FibEnumMeta* _meta; int index; FibDynamic params[8]; } %s;" (flat_path e.e_path);
+			newline ctx;
+			(* Forward declare the metadata *)
+			print ctx "extern const FibEnumMeta %s_meta;" (flat_path e.e_path);
 			newline ctx
 		| _ -> ()
 	) com.types;
@@ -706,26 +810,7 @@ let gen_runtime_globals gc_roots =
 	Buffer.add_string buf "\t\texit(1);\n";
 	Buffer.add_string buf "\t}\n";
 	Buffer.add_string buf "}\n\n";
-	Buffer.add_string buf "/* haxe.Exception implementation */\n";
-	Buffer.add_string buf "FibClass haxe_Exception_class = {\n";
-	Buffer.add_string buf "\t.name = \"haxe.Exception\",\n";
-	Buffer.add_string buf "\t.classId = 9999,\n";
-	Buffer.add_string buf "\t.instanceSize = sizeof(haxe_Exception),\n";
-	Buffer.add_string buf "\t.super = NULL,\n";
-	Buffer.add_string buf "\t.markFunc = NULL,\n";
-	Buffer.add_string buf "\t.construct = NULL,\n";
-	Buffer.add_string buf "\t.destruct = NULL,\n";
-	Buffer.add_string buf "};\n\n";
-	Buffer.add_string buf "void haxe_Exception_init(haxe_Exception* this, FibString* message, haxe_Exception* previous, FibDynamic native) {\n";
-	Buffer.add_string buf "\t(void)previous; (void)native;\n";
-	Buffer.add_string buf "\t/* clazz already set by gc_alloc_object_with_class */\n";
-	Buffer.add_string buf "\tthis->message = message ? message : fib_string_new(\"Exception\");\n";
-	Buffer.add_string buf "}\n\n";
-	Buffer.add_string buf "haxe_Exception* haxe_Exception_new(FibString* message, haxe_Exception* previous, FibDynamic native) {\n";
-	Buffer.add_string buf "\thaxe_Exception* this = gc_alloc_object_with_class(sizeof(haxe_Exception), &haxe_Exception_class);\n";
-	Buffer.add_string buf "\thaxe_Exception_init(this, message, previous, native);\n";
-	Buffer.add_string buf "\treturn this;\n";
-	Buffer.add_string buf "}\n\n";
+	Buffer.add_string buf "/* haxe.Exception is generated by the codegen from Exception.hx */\n\n";
 	(* Generate GC root registration function *)
 	Buffer.add_string buf "/* GC root registration for static fields */\n";
 	Buffer.add_string buf "void fiberus_register_gc_roots(void) {\n";
@@ -817,6 +902,40 @@ let generate com =
 	close_out ch;
 	generated_files := "fiberus_globals.c" :: !generated_files;
 
+	(* Generate embedded resources file (always emitted, even if empty) *)
+	let resources = Hashtbl.fold (fun name data acc -> (name, data) :: acc) com.resources [] in
+	let resources = List.sort (fun (a, _) (b, _) -> String.compare a b) resources in
+	Buffer.clear ctx.buf;
+	spr ctx "/* Embedded resources - generated by genfiberus */\n";
+	spr ctx "#include \"fiberus_generated.h\"\n\n";
+	(* Emit each resource as a static const byte array *)
+	List.iteri (fun i (_name, data) ->
+		print ctx "static const unsigned char __fib_res_%d[] = {" i;
+		let len = String.length data in
+		for j = 0 to len - 1 do
+			if j > 0 then spr ctx ",";
+			if j mod 16 = 0 then spr ctx "\n\t";
+			print ctx "0x%02x" (Char.code (String.get data j))
+		done;
+		spr ctx "\n};\n\n"
+	) resources;
+	(* Emit the resource registry array *)
+	spr ctx "const FibResource fiberus_resources[] = {\n";
+	List.iteri (fun i (name, data) ->
+		(* Escape the resource name for C string literal *)
+		let escaped_name = String.concat "\\\"" (Str.split_delim (Str.regexp "\"") name) in
+		let escaped_name = String.concat "\\\\" (Str.split_delim (Str.regexp "\\\\") escaped_name) in
+		print ctx "\t{ \"%s\", %d, __fib_res_%d },\n" escaped_name (String.length data) i
+	) resources;
+	spr ctx "\t{ NULL, 0, NULL }\n";
+	spr ctx "};\n";
+	print ctx "const int fiberus_resource_count = %d;\n" (List.length resources);
+	let res_file = src_dir ^ "/fiberus_resources.c" in
+	let ch = open_out_bin res_file in
+	output_string ch (Buffer.contents ctx.buf);
+	close_out ch;
+	generated_files := "fiberus_resources.c" :: !generated_files;
+
 	(* Generate one .c file per class *)
 	List.iter (function
 		| TClassDecl c when not (has_class_flag c CExtern) ->
@@ -846,12 +965,25 @@ let generate com =
 		| _ -> ()
 	) com.types;
 
-	(* Collect classes that need boot functions *)
+	(* Collect classes that need boot functions (runtime-init statics or __init__) *)
 	let boot_classes = List.filter_map (function
 		| TClassDecl c when not (has_class_flag c CExtern) ->
-			let runtime_init_fields = get_runtime_init_fields c in
-			if runtime_init_fields <> [] then Some (flat_path c.cl_path)
+			let has_runtime_init = get_runtime_init_fields c <> [] in
+			let has_cl_init = TClass.get_cl_init c <> None in
+			if has_runtime_init || has_cl_init then Some (flat_path c.cl_path)
 			else None
+		| _ -> None
+	) com.types in
+
+	(* Collect all non-extern class names for registration *)
+	let reg_classes = List.filter_map (function
+		| TClassDecl c when not (has_class_flag c CExtern) -> Some (flat_path c.cl_path)
+		| _ -> None
+	) com.types in
+
+	(* Collect all non-extern enum names for registration *)
+	let reg_enums = List.filter_map (function
+		| TEnumDecl e when not (has_enum_flag e EnExtern) -> Some (flat_path e.e_path)
 		| _ -> None
 	) com.types in
 
@@ -907,6 +1039,22 @@ let generate com =
 	spr ctx "\tscheduler_init((void*)&_gc_stack_base_marker);\n\n";
 	spr ctx "\t/* 3. Register permanent GC roots (static fields) */\n";
 	spr ctx "\tfiberus_register_gc_roots();\n\n";
+	(* Register all classes and enums with the runtime *)
+	if reg_classes <> [] || reg_enums <> [] then begin
+		spr ctx "\t/* 3b. Register classes and enums for Type reflection */\n";
+		List.iter (fun class_name ->
+			print ctx "\tfib_class_register(&%s_class);\n" class_name
+		) reg_classes;
+		List.iter (fun enum_name ->
+			print ctx "\tfib_enum_register(&%s_meta);\n" enum_name
+		) reg_enums;
+		spr ctx "\n"
+	end;
+	(* Register dynamic iterator factory if ArrayIterator was compiled *)
+	if List.mem "haxe_iterators_ArrayIterator" reg_classes then begin
+		spr ctx "\t/* 3c. Register array iterator factory for dynamic dispatch */\n";
+		spr ctx "\tfib_array_dynamic_iterator_new = (FibObject*(*)(FibArray*))haxe_iterators_ArrayIterator_new;\n\n"
+	end;
 	(* Call boot functions to initialize static fields - must happen after scheduler_init *)
 	if boot_classes <> [] then begin
 		spr ctx "\t/* 4. Boot all classes (static field initialization)\n";
@@ -969,18 +1117,9 @@ let generate com =
 		Buffer.add_string build_xml (Printf.sprintf "  <file name=\"%s\"/>\n" filename)
 	) (List.rev !generated_files);
 	Buffer.add_string build_xml "</files>\n\n";
-	Buffer.add_string build_xml "<!-- Build executable -->\n";
-	Buffer.add_string build_xml "<target id=\"default\" output=\"Main\" tool=\"linker\" toolid=\"exe\">\n";
+	Buffer.add_string build_xml "<!-- Append generated code to fiberus target and build as executable -->\n";
+	Buffer.add_string build_xml "<target id=\"fiberus\" output=\"Main\" toolid=\"exe\">\n";
 	Buffer.add_string build_xml "  <files id=\"haxe\"/>\n";
-	Buffer.add_string build_xml "  <files id=\"runtime\"/>\n";
-	Buffer.add_string build_xml "  <files id=\"gc\"/>\n";
-	Buffer.add_string build_xml "  <files id=\"simdutf\"/>\n";
-	if tracy_enabled then
-		Buffer.add_string build_xml "  <files id=\"tracy\"/>\n";
-	Buffer.add_string build_xml "  <lib name=\"-lpthread\" if=\"linux\"/>\n";
-	Buffer.add_string build_xml "  <lib name=\"-ldl\" if=\"linux\"/>\n";
-	if iouring_enabled then
-		Buffer.add_string build_xml "  <lib name=\"-luring\" if=\"linux\"/>\n";
 	Buffer.add_string build_xml "  <outdir name=\"./\"/>\n";
 	Buffer.add_string build_xml "</target>\n\n";
 	Buffer.add_string build_xml "</xml>\n";

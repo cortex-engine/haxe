@@ -12,7 +12,7 @@ class UdpSocket extends Socket {
         super();
         FD.close(getFd());
         var newFd = FD.socket(OpenFlags.AF_INET, OpenFlags.SOCK_DGRAM, 0);
-        if (newFd < 0) throw haxe.io.Error.Custom("Failed to create UDP socket: errno " + (-newFd));
+        if (newFd < 0) throw haxe.io.Error.Custom("Failed to create UDP socket");
         initFromFd(newFd);
     }
     

@@ -161,7 +161,7 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
   | TCENull ->
       (* Null depends on type - enum structs use sentinel, others use NULL *)
       (match t with
-       | TCFibEnum name -> writef w "(%s){ .index = -1 }" name
+       | TCFibEnum name -> writef w "(%s){ ._meta = NULL, .index = -1 }" name
        | TCFibDynamic -> write w "fib_dynamic_null()"
        | _ -> write w "NULL")
   | TCEThis -> write w "this"
@@ -359,21 +359,26 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
       if func = "" then
         write_expr w e  (* Already dynamic *)
       else begin
-        writef w "%s(" func;
         (match kind with
-        | TCBoxObject | TCBoxClosure ->
-            write w "(FibObject*)";
-            write_expr w e
-        | TCBoxArray ->
-            write w "(FibArray*)";
-            write_expr w e
         | TCBoxEnum enum_name ->
-            write w "&";
+            (* Use fib_dynamic_enum_val macro which creates an addressable temp via
+               statement expression. This handles cases like haxe_io_Error_Custom(arg)
+               which returns an rvalue that can't have & applied directly. *)
+            writef w "fib_dynamic_enum_val(%s, " enum_name;
             write_expr w e;
-            writef w ", sizeof(%s)" enum_name
+            write w ")"
         | _ ->
-            write_expr w e);
-        write w ")"
+            writef w "%s(" func;
+            (match kind with
+            | TCBoxObject | TCBoxClosure ->
+                write w "(FibObject*)";
+                write_expr w e
+            | TCBoxArray ->
+                write w "(FibArray*)";
+                write_expr w e
+            | _ ->
+                write_expr w e);
+            write w ")")
       end
   | TCEUnbox (e, target_type) ->
       let func = unbox_func_name target_type in
@@ -385,7 +390,7 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
         let enum_name = match target_type with TCFibEnum n -> n | _ -> "UNKNOWN" in
         writef w "(fib_dynamic_is_null(";
         write_expr w e;
-        writef w ") ? (%s){ .index = -1 } : (*(%s*)fib_dynamic_to_ptr(" enum_name enum_name;
+        writef w ") ? (%s){ ._meta = NULL, .index = -1 } : (*(%s*)fib_dynamic_to_ptr(" enum_name enum_name;
         write_expr w e;
         write w ")))"
       end else begin
@@ -582,6 +587,7 @@ and write_stmt (w : writer) (s : tc_stmt) : unit =
       (match e.cexpr with
       | TCECall _ | TCEAssign _ | TCEUnop _ -> write_expr w e
       | _ when e.ctype = TCVoid -> write_expr w e
+      | TCERaw s when String.length s > 0 && s.[0] = '{' -> write_expr w e  (* Compound block statement — no (void) cast *)
       | _ -> write w "(void)"; write_expr w e);
       write w ";";
       newline w
@@ -927,6 +933,8 @@ let write_decl (w : writer) (d : tc_decl) : unit =
   | TCDEnum ed ->
       writef w "typedef struct %s " ed.ed_name;
       with_block w (fun () ->
+        write w "const FibEnumMeta* _meta;";
+        newline w;
         write w "int index;";
         newline w;
         if ed.ed_max_params > 0 then begin
@@ -947,7 +955,7 @@ let write_decl (w : writer) (d : tc_decl) : unit =
         if ec.ec_params = [] then write w "void";
         write w ") ";
         with_block w (fun () ->
-          writef w "%s _e = { .index = %d };" ed.ed_name ec.ec_index;
+          writef w "%s _e = { ._meta = &%s_meta, .index = %d };" ed.ed_name ed.ed_name ec.ec_index;
           newline w;
           List.iteri (fun i (name, _) ->
             writef w "_e.params[%d] = %s;" i name;
@@ -1043,6 +1051,44 @@ let write_decl (w : writer) (d : tc_decl) : unit =
       newline w;
       newline w
   | TCDClassMeta cm ->
+      (* Emit field descriptor array if this class has instance fields *)
+      (if cm.cm_fields <> [] then begin
+        writef w "static const FibFieldDesc %s_fields[] = " cm.cm_var_name;
+        with_block w (fun () ->
+          List.iter (fun (name, tc_t) ->
+            let type_tag = match tc_t with
+              | TCBool -> "FIB_TYPE_BOOL"
+              | TCInt32 -> "FIB_TYPE_INT"
+              | TCFloat64 | TCFloat32 -> "FIB_TYPE_FLOAT"
+              | TCFibString -> "FIB_TYPE_STRING"
+              | TCFibArray _ -> "FIB_TYPE_ARRAY"
+              | TCFibDynamic -> "FIB_TYPE_NULL"  (* Sentinel: field IS a FibDynamic, copy directly *)
+              | _ -> "FIB_TYPE_OBJECT"  (* pointers to objects/closures *)
+            in
+            (* Use ident-ified field name for offsetof *)
+            let c_field_name = FiberusStrings.ident name in
+            writef w "{ \"%s\", offsetof(%s, %s), %s }," name cm.cm_var_name c_field_name type_tag;
+            newline w
+          ) cm.cm_fields
+        );
+        write w ";";
+        newline w;
+        newline w
+      end);
+      (* Emit method descriptor array for dynamic dispatch (fib_dynamic_get_field) *)
+      (if cm.cm_methods <> [] then begin
+        writef w "static const FibMethodDesc %s_methods[] = " cm.cm_var_name;
+        with_block w (fun () ->
+          List.iter (fun md ->
+            writef w "{ \"%s\", (void*)%s, (void*)%s, %d },"
+              md.md_name md.md_thunk_name md.md_dyn_thunk_name md.md_arg_count;
+            newline w
+          ) cm.cm_methods
+        );
+        write w ";";
+        newline w;
+        newline w
+      end);
       writef w "FibClass %s_class = " cm.cm_var_name;
       with_block w (fun () ->
         writef w ".name = \"%s\"," cm.cm_name;
@@ -1065,9 +1111,12 @@ let write_decl (w : writer) (d : tc_decl) : unit =
         newline w;
         write w ".staticFields = NULL,";
         newline w;
-        write w ".fieldNames = NULL,";
+        (if cm.cm_fields <> [] then
+          writef w ".fields = %s_fields," cm.cm_var_name
+        else
+          write w ".fields = NULL,");
         newline w;
-        write w ".fieldCount = 0,";
+        writef w ".fieldCount = %d," (List.length cm.cm_fields);
         newline w;
         (match cm.cm_tostring_func with
         | Some func -> writef w ".toStringFunc = (FibToStringFunc)%s," func
@@ -1077,7 +1126,14 @@ let write_decl (w : writer) (d : tc_decl) : unit =
         | Some vt -> writef w ".vtable = %s," vt
         | None -> write w ".vtable = NULL,");
         newline w;
-        writef w ".vtableSize = %d" cm.cm_vtable_size;
+        writef w ".vtableSize = %d," cm.cm_vtable_size;
+        newline w;
+        (if cm.cm_methods <> [] then
+          writef w ".methods = %s_methods," cm.cm_var_name
+        else
+          write w ".methods = NULL,");
+        newline w;
+        writef w ".methodCount = %d" (List.length cm.cm_methods);
         newline w
       );
       write w ";";
@@ -1111,6 +1167,7 @@ let box_to_dynamic (var_name : string) (t : tc_type) : string =
   | TCFibString -> Printf.sprintf "fib_dynamic_string(%s)" var_name
   | TCVoid -> "fib_dynamic_null()"
   | TCFibDynamic -> var_name  (* Already a FibDynamic, pass through *)
+  | TCFibEnum name -> Printf.sprintf "fib_dynamic_enum_val(%s, %s)" name var_name
   | _ -> Printf.sprintf "(FibDynamic){.type=FIB_TYPE_OBJECT, .data.ptrVal=%s}" var_name
 
 (* Helper: get C expression for unboxing FibDynamic to typed value *)
@@ -1120,9 +1177,10 @@ let unbox_from_dynamic (arg_name : string) (t : tc_type) : string =
   | TCInt64 -> Printf.sprintf "fib_dynamic_to_int64(%s)" arg_name
   | TCFloat64 -> Printf.sprintf "fib_dynamic_to_float(%s)" arg_name
   | TCBool -> Printf.sprintf "fib_dynamic_to_bool(%s)" arg_name
-  | TCFibString -> Printf.sprintf "fib_dynamic_extract_string(%s)" arg_name
+  | TCFibString -> Printf.sprintf "fib_dynamic_coerce_string(%s)" arg_name
   | TCFibClosure -> Printf.sprintf "(FibClosure*)fib_dynamic_to_object(%s)" arg_name
   | TCFibDynamic -> arg_name  (* Pass through unchanged *)
+  | TCFibEnum name -> Printf.sprintf "*(%s*)fib_dynamic_to_ptr(%s)" name arg_name
   | t -> Printf.sprintf "(%s)fib_dynamic_to_object(%s)" (tc_type_to_string t) arg_name
 
 (* Generate forward declarations for a closure *)

@@ -39,15 +39,13 @@ class Std {
 	public static function parseInt(x:String):Null<Int> {
 		if (x == null)
 			return null;
-		// TODO: Implement proper parseInt
-		return 0;
+		return untyped __fiberus__("fib_string_parse_int(", x, ")");
 	}
 
 	public static function parseFloat(x:String):Float {
 		if (x == null)
 			return Math.NaN;
-		// TODO: Implement proper parseFloat
-		return 0.0;
+		return untyped __fiberus__("fib_string_parse_float(", x, ")");
 	}
 
 	public static function random(x:Int):Int {

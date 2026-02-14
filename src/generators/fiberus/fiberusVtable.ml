@@ -84,7 +84,7 @@ let interface_method_key (iface : tclass) (cf : tclass_field) : method_key =
  *)
 let is_instance_method (cf : tclass_field) : bool =
   match cf.cf_kind with
-  | Method _ ->
+  | Method m when m <> MethDynamic ->
     not (has_class_field_flag cf CfStatic) &&
     not (has_meta Meta.Inline cf.cf_meta)
   | _ -> false
@@ -196,9 +196,17 @@ let build_class_vtable (ctx : vtable_context) (c : tclass) : class_vtable =
              (* Find if we override this method *)
              match List.find_opt (fun cf -> cf.cf_name = info.method_name) c.cl_ordered_fields with
              | Some cf -> cf
-             | None -> 
-               (* Use parent's field - find it *)
-               List.find (fun cf -> cf.cf_name = info.method_name) parent.cl_ordered_fields
+              | None -> 
+                (* Use ancestor's field - walk up the hierarchy *)
+                let rec find_in_ancestors cls =
+                  match List.find_opt (fun cf -> cf.cf_name = info.method_name) cls.cl_ordered_fields with
+                  | Some cf -> cf
+                  | None ->
+                    (match cls.cl_super with
+                     | Some (grandparent, _) -> find_in_ancestors grandparent
+                     | None -> raise Not_found)
+                in
+                find_in_ancestors parent
            )
          ) parent_vt.cv_slots;
          parent_vt.cv_size
