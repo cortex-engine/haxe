@@ -110,6 +110,7 @@ let target_handles_assign_ops com e2 = match com.platform with
 	| Php -> not (has_side_effect e2)
 	| Lua -> false
 	| Cpp when not (Define.defined com.defines Define.Cppia) -> not (has_side_effect e2)
+	| Fiberus -> not (has_side_effect e2)
 	| _ -> true
 
 let target_handles_side_effect_order com = match com.platform with
@@ -554,7 +555,7 @@ module Fusion = struct
 					let el = List.map replace el in
 					let e2 = replace e2 in
 					e2,el
-				| Cpp ->
+				| Cpp | Fiberus ->
 					let e2 = replace e2 in
 					let el = handle_el el in
 					e2,el
@@ -678,7 +679,7 @@ module Fusion = struct
 					let el = handle_el el in
 					(*if not !found && (has_state_write ir || has_any_field_write ir) then raise Exit;*)
 					{e with eexpr = TArrayDecl el}
-				| TBinop(op,e1,e2) when (match com.platform with Cpp -> true | _ -> false) ->
+				| TBinop(op,e1,e2) when (match com.platform with Cpp | Fiberus -> true | _ -> false) ->
 					let e1 = replace e1 in
 					let temp_found = !found in
 					found := false;

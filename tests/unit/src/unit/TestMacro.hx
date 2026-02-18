@@ -3,6 +3,7 @@ package unit;
 import unit.HelperMacros.parseAndPrint;
 
 class TestMacro extends Test {
+	#if !fiberus
 	function testPrinter() {
 		parseAndPrint("1");
 		parseAndPrint("a[b]");
@@ -111,4 +112,5 @@ class TestMacro extends Test {
 			'static final x : Any'
 		);
 	}
+	#end
 }

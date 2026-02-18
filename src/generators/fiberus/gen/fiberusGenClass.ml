@@ -86,7 +86,7 @@ let rec is_compile_time_constant (e : texpr) : bool =
   | TConst (TString _) -> false  (* Strings need runtime alloc *)
   | TConst TThis -> false
   | TConst TSuper -> false
-  | TField (_, FEnum _) -> true  (* Enum constants are compile-time *)
+  | TField (_, FEnum _) -> false  (* Enum struct values are extern const globals — not C constant expressions *)
   | TParenthesis e -> is_compile_time_constant e
   | TUnop (_, _, e) -> is_compile_time_constant e
   | TBinop (_, e1, e2) -> is_compile_time_constant e1 && is_compile_time_constant e2
@@ -221,6 +221,9 @@ let gen_struct_def (c : tclass) : tc_struct_def =
  * Returns the C function name (e.g. "ClassName_toString") or None.
  *)
 let rec find_tostring_func (c : tclass) : string option =
+  (* Interfaces declare method signatures but don't have implementations *)
+  if has_class_flag c CInterface then None
+  else
   let has_tostring = List.exists (fun cf ->
     cf.cf_name = "toString" &&
     (match cf.cf_kind with Method _ -> true | _ -> false) &&
@@ -256,8 +259,13 @@ let gen_class_meta (c : tclass) (class_id : int) (vtable_size : int) : tc_class_
     cm_tostring_func = tostring_func;
     cm_vtable_name = if vtable_size > 0 then Some (class_name ^ "_vtable") else None;
     cm_vtable_size = vtable_size;
+    cm_ivtable_name = None;  (* Populated by genfiberus.ml ivtable generation *)
     cm_fields = field_descs;
     cm_methods = [];  (* Populated by genfiberus.ml gen_class, not here *)
+    cm_static_fields = [];  (* Populated by genfiberus.ml gen_class, not here *)
+    cm_static_methods = [];  (* Populated by genfiberus.ml gen_class, not here *)
+    cm_ctor = None;  (* Populated by genfiberus.ml gen_class_impl *)
+    cm_interfaces = [];  (* Populated by genfiberus.ml gen_class *)
   }
 
 (* ============================================================================
@@ -282,7 +290,12 @@ let gen_mark_function_body (c : tclass) : tc_stmt list =
       let ctx_local = mk_expr (TCELocal "ctx") (TCPointer (TCStruct "MarkContext")) in
       let this_local = mk_expr (TCELocal "this") (TCPointer (TCStruct class_name)) in
       let field_access = mk_expr (TCEField (this_local, sfi.sfi_name)) sfi.sfi_type in
-      TCSExpr (mk_expr (TCECall (TCTFunc "gc_mark_object", [ctx_local; field_access])) TCVoid)
+      if is_fib_dynamic sfi.sfi_type then
+        (* FibDynamic fields need gc_mark_dynamic which takes MarkContext and FibDynamic pointer.
+           Use TCERaw for the address-of since there is no TCEAddrOf in the AST. *)
+        TCSExpr (mk_expr (TCERaw (Printf.sprintf "gc_mark_dynamic(ctx, &this->%s)" sfi.sfi_name)) TCVoid)
+      else
+        TCSExpr (mk_expr (TCECall (TCTFunc "gc_mark_object", [ctx_local; field_access])) TCVoid)
     ) gc_fields in
     cast_stmt :: mark_stmts
 

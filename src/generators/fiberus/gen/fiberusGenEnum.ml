@@ -152,9 +152,15 @@ let box_enum_param (param_name : string) (tc_t : tc_type) : tc_expr =
 let gen_enum_constructor_func (info : enum_info) (ci : enum_constr_info) : tc_func_def =
   let enum_type = TCFibEnum info.ei_name in
   
+  (* Sanitize parameter names that collide with the enum type name —
+     in C, the parameter shadows the typedef, making the type unusable *)
+  let sanitize_param_name name =
+    if name = info.ei_name then "_p_" ^ name else name
+  in
+  
   (* Function arguments *)
   let args = List.map (fun (name, tc_t, _) ->
-    { fa_name = name; fa_type = tc_t }
+    { fa_name = sanitize_param_name name; fa_type = tc_t }
   ) ci.eci_params in
   
   (* Function body *)
@@ -170,7 +176,7 @@ let gen_enum_constructor_func (info : enum_info) (ci : enum_constr_info) : tc_fu
     
     (* Assign each parameter: _e.params[i] = box(param); *)
     let assign_stmts = List.mapi (fun i (name, tc_t, _) ->
-      let boxed = box_enum_param name tc_t in
+      let boxed = box_enum_param (sanitize_param_name name) tc_t in
       let local_e = mk_expr (TCELocal "_e") enum_type in
       let param_access = mk_expr (TCEEnumParam (local_e, i)) TCFibDynamic in
       TCSExpr (mk_expr (TCEAssign (param_access, boxed)) TCFibDynamic)

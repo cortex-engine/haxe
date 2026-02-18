@@ -145,22 +145,28 @@ let needs_virtual_dispatch (c : tclass) (cf : tclass_field) : bool =
 
 (*
  * Collect all interfaces implemented by a class (including inherited).
+ * Recursively follows interface-extends-interface chains (e.g. IChild extends IParent1).
  *)
-let rec collect_interfaces (c : tclass) : tclass list =
-  let direct = List.map fst c.cl_implements in
-  let from_parent = match c.cl_super with
-    | Some (parent, _) -> collect_interfaces parent
-    | None -> []
-  in
-  (* Deduplicate by path *)
+let collect_interfaces (c : tclass) : tclass list =
   let seen = Hashtbl.create 16 in
-  List.filter (fun iface ->
-    if Hashtbl.mem seen iface.cl_path then false
-    else begin
-      Hashtbl.add seen iface.cl_path true;
-      true
-    end
-  ) (direct @ from_parent)
+  let result = ref [] in
+  let rec collect_from_class cls =
+    (* Direct interfaces *)
+    List.iter (fun (iface, _) ->
+      if not (Hashtbl.mem seen iface.cl_path) then begin
+        Hashtbl.add seen iface.cl_path true;
+        result := iface :: !result;
+        (* Recursively collect parent interfaces of this interface *)
+        collect_from_class iface
+      end
+    ) cls.cl_implements;
+    (* Parent class *)
+    (match cls.cl_super with
+     | Some (parent, _) -> collect_from_class parent
+     | None -> ())
+  in
+  collect_from_class c;
+  List.rev !result
 
 (*
  * Assign slots to interface methods.
@@ -173,6 +179,24 @@ let assign_interface_slots (ctx : vtable_context) (iface : tclass) : unit =
         Hashtbl.add ctx.interface_slots key ctx.next_slot;
         ctx.next_slot <- ctx.next_slot + 1
       end
+    end else begin
+      (* Property getters/setters: interface Var fields with AccCall need slots *)
+      (match cf.cf_kind with
+      | Var { v_read = AccCall; _ } ->
+        let key = s_type_path iface.cl_path ^ ".get_" ^ cf.cf_name in
+        if not (Hashtbl.mem ctx.interface_slots key) then begin
+          Hashtbl.add ctx.interface_slots key ctx.next_slot;
+          ctx.next_slot <- ctx.next_slot + 1
+        end
+      | _ -> ());
+      (match cf.cf_kind with
+      | Var { v_write = AccCall; _ } ->
+        let key = s_type_path iface.cl_path ^ ".set_" ^ cf.cf_name in
+        if not (Hashtbl.mem ctx.interface_slots key) then begin
+          Hashtbl.add ctx.interface_slots key ctx.next_slot;
+          ctx.next_slot <- ctx.next_slot + 1
+        end
+      | _ -> ())
     end
   ) iface.cl_ordered_fields
 
@@ -218,35 +242,59 @@ let build_class_vtable (ctx : vtable_context) (c : tclass) : class_vtable =
   
   (* Process interface methods first *)
   let interfaces = collect_interfaces c in
+  (* Helper: assign an interface slot for a method name, finding the implementation in class *)
+  let assign_iface_method iface method_name =
+    (* Build a synthetic key for the interface method *)
+    let ikey = s_type_path iface.cl_path ^ "." ^ method_name in
+    let slot = match Hashtbl.find_opt ctx.interface_slots ikey with
+      | Some s -> s
+      | None ->
+        let s = ctx.next_slot in
+        ctx.next_slot <- ctx.next_slot + 1;
+        Hashtbl.add ctx.interface_slots ikey s;
+        s
+    in
+    (* Find implementing method in class or its ancestors *)
+    let rec find_method_in_hierarchy cls =
+      match List.find_opt (fun cf -> cf.cf_name = method_name && is_instance_method cf) cls.cl_ordered_fields with
+      | Some cf -> Some cf
+      | None ->
+        match cls.cl_super with
+        | Some (parent, _) -> find_method_in_hierarchy parent
+        | None -> None
+    in
+    match find_method_in_hierarchy c with
+    | Some cf ->
+      let (arg_types, ret_type) = get_method_types cf in
+      let info = {
+        slot_index = slot;
+        method_name = cf.cf_name;
+        defining_path = iface.cl_path;
+        return_type = ret_type;
+        arg_types = arg_types;
+      } in
+      Hashtbl.replace slots ikey info;
+      Hashtbl.replace methods slot (ikey, cf);
+      if slot >= !next_slot then next_slot := slot + 1
+    | None ->
+      (* No implementation found - still ensure vtable is large enough for the slot *)
+      if slot >= !next_slot then next_slot := slot + 1
+  in
   List.iter (fun iface ->
     List.iter (fun icf ->
-      if is_instance_method icf then begin
-        let ikey = interface_method_key iface icf in
-        let slot = match Hashtbl.find_opt ctx.interface_slots ikey with
-          | Some s -> s
-          | None ->
-            let s = ctx.next_slot in
-            ctx.next_slot <- ctx.next_slot + 1;
-            Hashtbl.add ctx.interface_slots ikey s;
-            s
-        in
-        (* Find implementing method in class *)
-        match List.find_opt (fun cf -> cf.cf_name = icf.cf_name && is_instance_method cf) c.cl_ordered_fields with
-        | Some cf ->
-          let (arg_types, ret_type) = get_method_types cf in
-          let info = {
-            slot_index = slot;
-            method_name = cf.cf_name;
-            defining_path = iface.cl_path;
-            return_type = ret_type;
-            arg_types = arg_types;
-          } in
-          Hashtbl.replace slots ikey info;
-          Hashtbl.replace methods slot (ikey, cf);
-          if slot >= !next_slot then next_slot := slot + 1
-        | None ->
-          (* Check parent for implementation *)
-          ()
+      if is_instance_method icf then
+        assign_iface_method iface icf.cf_name
+      else begin
+        (* Handle property getters/setters: interface Var fields with AccCall
+           accessor need their get_X/set_X methods assigned vtable slots *)
+        (match icf.cf_kind with
+        | Var { v_read = AccCall; _ } ->
+          assign_iface_method iface ("get_" ^ icf.cf_name)
+        | _ -> ());
+        (match icf.cf_kind with
+        | Var { v_write = AccCall; _ } ->
+          assign_iface_method iface ("set_" ^ icf.cf_name)
+        | _ -> ())
       end
     ) iface.cl_ordered_fields
   ) interfaces;
@@ -332,7 +380,11 @@ let build_all_vtables (types : Type.module_type list) : vtable_context =
   let classes = ref [] in
   let interfaces = ref [] in
   List.iter (function
-    | TClassDecl c when not (has_class_flag c CExtern) ->
+    | TClassDecl c when not (has_class_flag c CExtern) &&
+        (match c.cl_kind with
+         | KAbstractImpl a ->
+           (match Type.follow a.a_this with TInst _ -> false | _ -> true)
+         | _ -> true) ->
       if is_interface c then
         interfaces := c :: !interfaces
       else
@@ -396,3 +448,20 @@ let get_vtable_methods (ctx : vtable_context) (c : tclass) : (int * string * tcl
       (slot, cf.cf_name, cf) :: acc
     ) vt.cv_methods [] in
     List.sort (fun (a, _, _) (b, _, _) -> compare a b) methods
+
+(*
+ * Get IMap interface method slot assignments.
+ * Returns a list of (method_name, slot_index) pairs for all IMap methods
+ * that have been assigned interface slots in this build.
+ * Returns empty list if IMap is not present or has no slots.
+ *)
+let get_imap_slots (ctx : vtable_context) : (string * int) list =
+  let imap_path = "haxe.IMap" in
+  let methods = ["get"; "set"; "exists"; "remove"; "keys"; "iterator";
+                 "keyValueIterator"; "copy"; "toString"; "clear"; "size"] in
+  List.filter_map (fun mname ->
+    let key = imap_path ^ "." ^ mname in
+    match Hashtbl.find_opt ctx.interface_slots key with
+    | Some slot -> Some (mname, slot)
+    | None -> None
+  ) methods

@@ -31,7 +31,7 @@ class Reflect {
 	public static function field(o:Dynamic, field:String):Dynamic {
 		if (o == null || field == null)
 			return null;
-		return untyped __fiberus__("fib_reflect_field(", o, ", fib_string_data(", field, "))");
+		return untyped __fiberus__("fib_dynamic_get_field(", o, ", fib_string_data(", field, "))");
 	}
 
 	public static function setField(o:Dynamic, field:String, value:Dynamic):Void {
@@ -41,27 +41,23 @@ class Reflect {
 	}
 
 	public static function getProperty(o:Dynamic, field:String):Dynamic {
-		// Fiberus doesn't have property accessor dispatch at runtime,
-		// so this behaves the same as field()
 		if (o == null || field == null)
 			return null;
-		return untyped __fiberus__("fib_reflect_field(", o, ", fib_string_data(", field, "))");
+		return untyped __fiberus__("fib_reflect_get_property(", o, ", fib_string_data(", field, "))");
 	}
 
 	public static function setProperty(o:Dynamic, field:String, value:Dynamic):Void {
-		// Same as setField since we don't have runtime property dispatch
 		if (o == null || field == null)
 			return;
-		untyped __fiberus__("fib_reflect_set_field(&", o, ", fib_string_data(", field, "), ", value, ")");
+		untyped __fiberus__("fib_reflect_set_property(&", o, ", fib_string_data(", field, "), ", value, ")");
 	}
 
 	public static function callMethod(o:Dynamic, func:haxe.Constraints.Function, args:Array<Dynamic>):Dynamic {
 		if (func == null)
 			return null;
 		var closure:Dynamic = func;
-		var argArr:Dynamic = args;
 		var argCount:Int = (args != null) ? args.length : 0;
-		return untyped __fiberus__("fib_closure_call_dynamic((FibClosure*)fib_dynamic_to_object(", closure, "), ", argArr, " ? ", argArr, "->data.arrayVal->data : NULL, ", argCount, ")");
+		return untyped __fiberus__("fib_closure_call_dynamic((FibClosure*)fib_dynamic_to_object(", closure, "), ", args, " ? ", args, "->data : NULL, ", argCount, ")");
 	}
 
 	public static function fields(o:Dynamic):Array<String> {
@@ -115,8 +111,6 @@ class Reflect {
 	}
 
 	public static function makeVarArgs<T>(f:Array<Dynamic>->T):Dynamic {
-		// Fiberus doesn't support varargs transformation yet.
-		// Return the function as-is wrapped in a closure.
-		return cast f;
+		return untyped __fiberus__("fib_dynamic_object((FibObject*)fib_make_var_args((FibClosure*)", f, "))");
 	}
 }

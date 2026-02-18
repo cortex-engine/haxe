@@ -729,6 +729,9 @@ let get_config com =
 			pf_supports_threads = true;
 			pf_supports_atomics = true;
 			pf_uses_utf16 = false;
+			pf_exceptions = { default_config.pf_exceptions with
+				ec_avoid_wrapping = false
+			};
 			pf_scoping = { default_config.pf_scoping with
 				vs_flags = [NoShadowing];
 				vs_scope = FunctionScope;

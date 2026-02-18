@@ -1,25 +1,20 @@
 /*
  * Fiberus - Fiber Runtime for Haxe
- * Mutex.hx - Not supported on Fiberus target.
+ * Mutex.hx - No-op implementation for cooperative fiber scheduling.
+ * Since fibers don't preempt each other, mutual exclusion is implicit.
  */
 
 package sys.thread;
 
 @:coreApi
 class Mutex {
-	public function new():Void {
-		throw "sys.thread.Mutex is not supported on Fiberus target";
-	}
+	public function new():Void {}
 
-	public function acquire():Void {
-		throw "sys.thread.Mutex is not supported on Fiberus target";
-	}
+	public function acquire():Void {}
 
 	public function tryAcquire():Bool {
-		throw "sys.thread.Mutex is not supported on Fiberus target";
+		return true;
 	}
 
-	public function release():Void {
-		throw "sys.thread.Mutex is not supported on Fiberus target";
-	}
+	public function release():Void {}
 }

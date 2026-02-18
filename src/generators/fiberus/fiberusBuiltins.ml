@@ -37,7 +37,7 @@ let get_intrinsic (e : texpr) : intrinsic option =
   | TIdent "__fiberus__" -> Some IFiberus
   | TIdent "__fiberus_get_exception_stack" -> Some IExceptionStack
   | TIdent "__fiberus_get_call_stack" -> Some ICallStack
-  | TField (_, FStatic ({ cl_path = (["haxe"], "Log") }, { cf_name = "trace" })) -> Some ITrace
+  (* haxe.Log.trace is MethDynamic - must go through closure dispatch for user reassignment *)
   | TField (_, FStatic ({ cl_path = ([], "Std") }, { cf_name = ("isOfType" | "is") })) -> Some IStdIsOfType
   | TField (_, FStatic ({ cl_path = ([], "Std") }, { cf_name = "int" })) -> Some IStdInt
   | TField (_, FStatic ({ cl_path = ([], "Std") }, { cf_name = "string" })) -> Some IStdString
@@ -191,6 +191,19 @@ let map_method_func (kind : map_kind) (method_ : map_method) : string =
   | MapClear -> prefix ^ "clear"
   | MapSize -> prefix ^ "size"
 
+(* Infer map kind from IMap type parameters.
+   IMap<K, V> where tl = [K; V] - determine kind from the key type K.
+   Used when a variable is typed as IMap<Int, V> etc. *)
+let map_kind_of_imap_params (tl : Type.t list) : map_kind option =
+  match tl with
+  | key_t :: _ ->
+    (match follow key_t with
+     | TAbstract ({ a_path = ([], "Int") }, []) -> Some MapInt
+     | TInst ({ cl_path = ([], "String") }, []) -> Some MapString
+     | TAbstract ({ a_path = (["fiberus"], "Int64") }, []) -> Some MapInt64
+     | _ -> Some MapObject)
+  | [] -> None
+
 (* Get map kind from Haxe type *)
 let map_kind_of_type (t : Type.t) : map_kind option =
   match follow t with
@@ -198,6 +211,15 @@ let map_kind_of_type (t : Type.t) : map_kind option =
   | TInst ({ cl_path = (["haxe"; "ds"], "StringMap") }, _) -> Some MapString
   | TInst ({ cl_path = (["haxe"; "ds"], "Int64Map") }, _) -> Some MapInt64
   | TInst ({ cl_path = (["haxe"; "ds"], "ObjectMap") }, _) -> Some MapObject
+  | _ -> None
+
+(* Get map kind from a class (for FInstance where etype may be abstract Map) *)
+let map_kind_of_class (c : tclass) : map_kind option =
+  match c.cl_path with
+  | (["haxe"; "ds"], "IntMap") -> Some MapInt
+  | (["haxe"; "ds"], "StringMap") -> Some MapString
+  | (["haxe"; "ds"], "Int64Map") -> Some MapInt64
+  | (["haxe"; "ds"], "ObjectMap") -> Some MapObject
   | _ -> None
 
 (* ============================================================================
@@ -235,6 +257,10 @@ let map_value_suffix (t : Type.t) : string =
 let is_string_type (t : Type.t) : bool =
   match follow t with
   | TInst ({ cl_path = ([], "String") }, []) -> true
+  | TAbstract (a, _) ->
+    (match follow a.a_this with
+     | TInst ({ cl_path = ([], "String") }, []) -> true
+     | _ -> false)
   | _ -> false
 
 (* Check if type is Array *)

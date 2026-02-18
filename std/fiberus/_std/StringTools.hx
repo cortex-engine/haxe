@@ -3,7 +3,7 @@
  *
  * Only overrides fastCodeAt/unsafeCodeAt/isEof to use fib_string_char_code_at
  * instead of the default `s.cca(index)` which generates broken dynamic dispatch.
- * fib_string_char_code_at returns -1 for out-of-bounds (same as Java/Python).
+ * fastCodeAt/unsafeCodeAt return 0 for out-of-bounds (matching cpp/hl behavior).
  */
 
 import haxe.iterators.StringIterator;
@@ -11,7 +11,6 @@ import haxe.iterators.StringKeyValueIterator;
 
 @:coreApi class StringTools {
 	public static function urlEncode(s:String):String {
-		// Use pure-Haxe fallback — encode each non-alphanum char
 		var buf = new StringBuf();
 		var i = 0;
 		var len = s.length;
@@ -26,8 +25,23 @@ import haxe.iterators.StringKeyValueIterator;
 				buf.addChar(code);
 			} else if (code == 0x20) {
 				buf.add("%20");
-			} else {
+			} else if (code < 0x80) {
 				buf.add("%" + hex(code, 2));
+			} else {
+				// Encode codepoint to UTF-8 bytes, then percent-encode each byte
+				if (code < 0x800) {
+					buf.add("%" + hex(0xC0 | (code >> 6), 2));
+					buf.add("%" + hex(0x80 | (code & 0x3F), 2));
+				} else if (code < 0x10000) {
+					buf.add("%" + hex(0xE0 | (code >> 12), 2));
+					buf.add("%" + hex(0x80 | ((code >> 6) & 0x3F), 2));
+					buf.add("%" + hex(0x80 | (code & 0x3F), 2));
+				} else {
+					buf.add("%" + hex(0xF0 | (code >> 18), 2));
+					buf.add("%" + hex(0x80 | ((code >> 12) & 0x3F), 2));
+					buf.add("%" + hex(0x80 | ((code >> 6) & 0x3F), 2));
+					buf.add("%" + hex(0x80 | (code & 0x3F), 2));
+				}
 			}
 			i++;
 		}
@@ -35,7 +49,6 @@ import haxe.iterators.StringKeyValueIterator;
 	}
 
 	public static function urlDecode(s:String):String {
-		// Simple implementation — delegate to percent-decode
 		var buf = new StringBuf();
 		var i = 0;
 		var len = s.length;
@@ -50,7 +63,51 @@ import haxe.iterators.StringKeyValueIterator;
 					var hi:Int = hexVal(h1);
 					var lo:Int = hexVal(h2);
 					if (hi >= 0 && lo >= 0) {
-						buf.addChar(hi * 16 + lo);
+						var b0 = hi * 16 + lo;
+						if (b0 < 0x80) {
+							// ASCII byte — emit directly
+							buf.addChar(b0);
+						} else {
+							// UTF-8 multi-byte: determine sequence length from lead byte
+							var cp = 0;
+							var seqLen = 0;
+							if ((b0 & 0xE0) == 0xC0) { cp = b0 & 0x1F; seqLen = 2; }
+							else if ((b0 & 0xF0) == 0xE0) { cp = b0 & 0x0F; seqLen = 3; }
+							else if ((b0 & 0xF8) == 0xF0) { cp = b0 & 0x07; seqLen = 4; }
+							else { buf.addChar(b0); i += 3; continue; } // invalid lead, emit as-is
+							var ok = true;
+							var j = 1;
+							var ni = i + 3; // position after first %XX
+							while (j < seqLen) {
+								if (ni + 2 < len && s.charCodeAt(ni) == 0x25) {
+									var ch1 = s.charCodeAt(ni + 1);
+									var ch2 = s.charCodeAt(ni + 2);
+									if (ch1 != null && ch2 != null) {
+										var hv:Int = hexVal(ch1);
+										var lv:Int = hexVal(ch2);
+										if (hv >= 0 && lv >= 0) {
+											var cont = hv * 16 + lv;
+											if ((cont & 0xC0) == 0x80) {
+												cp = (cp << 6) | (cont & 0x3F);
+												ni += 3;
+												j++;
+												continue;
+											}
+										}
+									}
+								}
+								// Continuation byte missing/invalid — emit lead as-is
+								ok = false;
+								break;
+							}
+							if (ok) {
+								buf.addChar(cp);
+								i = ni;
+								continue;
+							} else {
+								buf.addChar(b0);
+							}
+						}
 						i += 3;
 						continue;
 					}
@@ -187,19 +244,22 @@ import haxe.iterators.StringKeyValueIterator;
 	}
 
 	/**
-	 * Fast character code access. Uses fib_string_char_code_at which returns -1
-	 * for out-of-bounds. This is the Fiberus equivalent of s.cca(index).
+	 * Fast character code access. Returns codepoint at index, or 0 for out-of-bounds.
+	 * charCodeAt returns Null<Int> (null for OOB), so we convert null to 0 here
+	 * to match cpp/hl behavior where isEof(0) == true.
 	 */
 	public static inline function fastCodeAt(s:String, index:Int):Int {
-		return untyped __fiberus__("fib_string_char_code_at(", s, ", ", index, ")");
+		var c = s.charCodeAt(index);
+		return c != null ? (c : Int) : 0;
 	}
 
 	/**
 	 * Unsafe (no bounds checking) character code access.
-	 * Same as fastCodeAt on Fiberus since fib_string_char_code_at handles bounds.
+	 * Same as fastCodeAt on Fiberus.
 	 */
 	public static inline function unsafeCodeAt(s:String, index:Int):Int {
-		return untyped __fiberus__("fib_string_char_code_at(", s, ", ", index, ")");
+		var c = s.charCodeAt(index);
+		return c != null ? (c : Int) : 0;
 	}
 
 	public static inline function iterator(s:String):StringIterator {
@@ -211,10 +271,10 @@ import haxe.iterators.StringKeyValueIterator;
 	}
 
 	/**
-	 * Check for end-of-file. fib_string_char_code_at returns -1 for out-of-bounds.
+	 * Check for end-of-file. Returns true for 0 (matching cpp/hl behavior).
 	 */
 	@:noUsing public static inline function isEof(c:Int):Bool {
-		return c == -1;
+		return c == 0;
 	}
 
 	@:noCompletion

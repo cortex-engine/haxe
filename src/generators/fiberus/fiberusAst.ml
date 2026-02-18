@@ -164,7 +164,9 @@ and tc_expr_kind =
       slot: int;
       this_type: tc_type;
       ret_type: tc_type;
+      cast_arg_types: tc_type list;         (* Types for the function pointer cast - from defining class *)
       args: tc_expr list;
+      is_interface: bool;                   (* True if called through an interface reference *)
     }
   | TCEClosureCall of {                     (* Closure call *)
       closure: tc_expr;
@@ -179,7 +181,9 @@ and tc_expr_kind =
   | TCEClosureCreate of {                   (* Create a FibClosure *)
       cc_name: string;                        (* _closure_N *)
       cc_impl_name: string;                   (* _closure_N_impl *)
-      cc_captures: (string * tc_type) list;   (* (var_name, type) pairs *)
+      cc_captures: (string * string * tc_type) list;   (* (capture_expr, var_name, type) triples:
+                                                           capture_expr = C expression for the value at creation site (may be _gc.name)
+                                                           var_name = bare name used inside the closure body *)
       cc_arg_count: int;
       cc_for_fiber: bool;                     (* Use fib_closure_create_for_fiber *)
     }
@@ -225,6 +229,7 @@ and tc_expr_kind =
   (* String operations *)
   | TCEStringConcat of tc_expr * tc_expr    (* fib_string_concat *)
   | TCEStringEq of tc_expr * tc_expr        (* fib_string_eq *)
+  | TCEStringCompare of tc_expr * tc_expr   (* fib_string_compare - returns int <0, 0, >0 *)
   | TCEStringLength of tc_expr              (* fib_string_length *)
   
   (* Compound expressions *)
@@ -325,6 +330,7 @@ and tc_catch_kind =
   | TCCatchBool              (* Bool *)
   | TCCatchString            (* String *)
   | TCCatchObject of string  (* Class name (for instanceof check) *)
+  | TCCatchEnum of string    (* Enum name (for FIB_TYPE_ENUM + meta check) *)
 
 and tc_catch = {
   catch_var: string;
@@ -381,8 +387,13 @@ and tc_class_meta = {
   cm_tostring_func: string option;          (* toString function name, or None *)
   cm_vtable_name: string option;            (* Vtable variable name, or None *)
   cm_vtable_size: int;
+  cm_ivtable_name: string option;           (* Interface vtable variable name, or None *)
   cm_fields: (string * tc_type) list;        (* Instance fields: (name, type) for Reflect *)
   cm_methods: tc_method_desc list;           (* Instance methods for dynamic dispatch *)
+  cm_static_fields: (string * tc_type) list; (* Static fields: (name, type) for getClassFields *)
+  cm_static_methods: tc_method_desc list;    (* Static methods for class-as-value dispatch *)
+  cm_ctor: tc_method_desc option;            (* Constructor thunk for Type.createInstance *)
+  cm_interfaces: string list;                (* Interface class C names this class implements *)
 }
 
 (* Method descriptor for fib_dynamic_get_field runtime lookup *)
@@ -454,6 +465,10 @@ type tc_method_thunk = {
   mth_method_name: string;          (* C name of the method *)
   mth_args: (string * tc_type) list; (* (param_name, param_type) pairs *)
   mth_ret_type: tc_type;            (* Return type *)
+  mth_c_func: string option;        (* Override C function name, e.g. "fib_array_iterator" *)
+  mth_this_expr: string option;     (* Override this-extract expression, e.g. "fib_dynamic_to_array(...)" *)
+  mth_vtable_slot: int option;      (* Interface vtable slot for dispatch instead of direct call *)
+  mth_defaults: string option list; (* Per-arg default C literal for null substitution in dynamic thunks, e.g. Some "2", Some "4.25" *)
 }
 
 (* ============================================================================
@@ -468,6 +483,7 @@ type tc_closure = {
   cl_ret: tc_type;
   cl_captures: tc_capture list;
   cl_body: tc_stmt list;
+  cl_defaults: tc_expr option list;         (* Per-arg default value for wrapper null checks *)
 }
 
 and tc_capture = {

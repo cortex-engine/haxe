@@ -30,7 +30,10 @@ let c_keywords =
 
 (* Escape identifier if it's a C keyword *)
 let ident s =
-  if Hashtbl.mem c_keywords s then "_hx_" ^ s else s
+  if Hashtbl.mem c_keywords s then "_hx_" ^ s
+  else if s = "_gc" then "_hx_gc"
+  else if s = "init" || s = "new" then "_hx_" ^ s  (* Avoid collision with constructor _init/_new *)
+  else s
 
 (* Convert Haxe path to C identifier (simple form, no escaping) *)
 let s_path (p, s) =

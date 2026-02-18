@@ -14,11 +14,13 @@ class Math {
 	}
 
 	public static inline function min(a:Float, b:Float):Float {
-		return untyped __fiberus__("fmin(", a, ", ", b, ")");
+		// C fmin() ignores NaN (returns the non-NaN arg), but Haxe requires NaN propagation
+		return untyped __fiberus__("(isnan(", a, ") || isnan(", b, ") ? NAN : fmin(", a, ", ", b, "))");
 	}
 
 	public static inline function max(a:Float, b:Float):Float {
-		return untyped __fiberus__("fmax(", a, ", ", b, ")");
+		// C fmax() ignores NaN (returns the non-NaN arg), but Haxe requires NaN propagation
+		return untyped __fiberus__("(isnan(", a, ") || isnan(", b, ") ? NAN : fmax(", a, ", ", b, "))");
 	}
 
 	public static inline function sin(v:Float):Float {
@@ -66,7 +68,7 @@ class Math {
 	}
 
 	public static inline function round(v:Float):Int {
-		return untyped __fiberus__("(int32_t)round(", v, ")");
+		return untyped __fiberus__("(int32_t)floor((", v, ") + 0.5)");
 	}
 
 	public static inline function floor(v:Float):Int {
@@ -86,7 +88,7 @@ class Math {
 	}
 
 	public static inline function fround(v:Float):Float {
-		return untyped __fiberus__("round(", v, ")");
+		return untyped __fiberus__("floor((", v, ") + 0.5)");
 	}
 
 	public static inline function random():Float {

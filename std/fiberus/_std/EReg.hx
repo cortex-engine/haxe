@@ -52,6 +52,9 @@
 	}
 
 	public function matched(n:Int):String {
+		if (last == null) throw "EReg::matched";
+		var ncaptures:Int = untyped __fiberus__("fib_ereg_capture_count(", r, ")");
+		if (n < 0 || n >= ncaptures) throw "EReg::matched";
 		return untyped __fiberus__("fib_ereg_matched(", r, ", ", n, ")");
 	}
 

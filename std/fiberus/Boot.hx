@@ -19,7 +19,7 @@ class Boot {
 		if (untyped __fiberus__("(", o, ").type == FIB_TYPE_STRING"))
 			return untyped __fiberus__("(", o, ").data.stringVal");
 		if (untyped __fiberus__("(", o, ").type == FIB_TYPE_ARRAY"))
-			return "[Array]";
+			return untyped __fiberus__("fib_dynamic_to_string(", o, ")");
 		if (untyped __fiberus__("(", o, ").type == FIB_TYPE_OBJECT"))
 			return "[Object]";
 		if (untyped __fiberus__("(", o, ").type == FIB_TYPE_ENUM"))
@@ -30,7 +30,6 @@ class Boot {
 	}
 
 	public static function __instanceof(v:Dynamic, t:Dynamic):Bool {
-		// TODO: Implement proper type checking
-		return false;
+		return untyped __fiberus__("fib_instanceof_dynamic(", v, ", ", t, ")");
 	}
 }

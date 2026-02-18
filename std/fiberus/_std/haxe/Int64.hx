@@ -15,10 +15,10 @@ abstract Int64(__Int64) from __Int64 to __Int64 {
 	private static inline var MASK:__Int64 = 0xFFFFFFFF;
 
 	public static inline function make(high:Int32, low:Int32):Int64 {
-		// Combine two 32-bit ints into one 64-bit int
-		var h:__Int64 = high;
-		var l:__Int64 = low;
-		return ((h << 32) | (l & MASK));
+		// Combine two 32-bit ints into one 64-bit int.
+		// Use __fiberus__ to emit the uint32_t cast at C level, preventing
+		// the Haxe optimizer from folding away the zero-extension mask.
+		return untyped __fiberus__("(((int64_t)", high, " << 32) | (int64_t)(uint32_t)", low, ")");
 	}
 
 	private inline function new(x:__Int64)
@@ -56,7 +56,7 @@ abstract Int64(__Int64) from __Int64 to __Int64 {
 		return isInt64(val);
 
 	inline public static function isInt64(val:Dynamic):Bool
-		return false; // TODO: implement proper type check when dynamic type info is available
+		return untyped __fiberus__("(", val, ").type == FIB_TYPE_INT64");
 
 	public static inline function toInt(x:Int64):Int {
 		// Use val accessor to avoid recursive implicit cast
@@ -231,10 +231,10 @@ abstract Int64(__Int64) from __Int64 to __Int64 {
 		return Std.string(this);
 
 	public static function parseString(sParam:String):Int64 {
-		return ofInt(Std.parseInt(sParam)); // TODO: proper Int64 parsing
+		return haxe.Int64Helper.parseString(sParam);
 	}
 
 	public static function fromFloat(f:Float):Int64 {
-		return cast f; // TODO: proper float to Int64 conversion
+		return haxe.Int64Helper.fromFloat(f);
 	}
 }

@@ -1,21 +1,31 @@
 /*
  * Fiberus - Fiber Runtime for Haxe
- * Lock.hx - Not supported on Fiberus target.
+ * Lock.hx - Simple lock for cooperative fiber scheduling.
+ * In cooperative mode, wait() returns immediately if already released,
+ * otherwise it would need to yield the fiber (not yet implemented).
  */
 
 package sys.thread;
 
 @:coreApi
 class Lock {
+	var count:Int;
+
 	public function new():Void {
-		throw "sys.thread.Lock is not supported on Fiberus target";
+		count = 0;
 	}
 
 	public function wait(?timeout:Float):Bool {
-		throw "sys.thread.Lock is not supported on Fiberus target";
+		if (count > 0) {
+			count--;
+			return true;
+		}
+		/* In cooperative scheduling without fiber yield support,
+		   a lock wait with no release would deadlock. Return false on timeout. */
+		return false;
 	}
 
 	public function release():Void {
-		throw "sys.thread.Lock is not supported on Fiberus target";
+		count++;
 	}
 }

@@ -38,6 +38,12 @@ enum ValueType {
 		if (o == null)
 			return null;
 		var d:Dynamic = o;
+		// String -> String_class
+		if (untyped __fiberus__("(", d, ").type == FIB_TYPE_STRING"))
+			return untyped __fiberus__("(FibDynamic){ .type = FIB_TYPE_CLASS, .data.ptrVal = &String_class }");
+		// Array -> Array_class (sentinel, matches TTypeExpr Array)
+		if (untyped __fiberus__("(", d, ").type == FIB_TYPE_ARRAY"))
+			return untyped __fiberus__("(FibDynamic){ .type = FIB_TYPE_CLASS, .data.ptrVal = &Array_class }");
 		// Only class instances (FIB_TYPE_OBJECT) have classes, excluding closures
 		if (untyped __fiberus__("(", d, ").type != FIB_TYPE_OBJECT"))
 			return null;
@@ -55,6 +61,8 @@ enum ValueType {
 			return null;
 		var d:Dynamic = o;
 		if (untyped __fiberus__("(", d, ").type != FIB_TYPE_ENUM"))
+			return null;
+		if (untyped __fiberus__("fib_enum_meta(", d, ") == NULL"))
 			return null;
 		var meta:Dynamic = untyped __fiberus__("(FibDynamic){ .type = FIB_TYPE_CLASS, .data.ptrVal = (void*)fib_enum_meta(", d, ") }");
 		return meta;
@@ -81,6 +89,8 @@ enum ValueType {
 		if (e == null)
 			return null;
 		var d:Dynamic = e;
+		if (untyped __fiberus__("(", d, ").data.ptrVal == NULL"))
+			return null;
 		return untyped __fiberus__("fib_string_new(((FibEnumMeta*)(", d, ").data.ptrVal)->name)");
 	}
 
@@ -103,43 +113,81 @@ enum ValueType {
 	}
 
 	public static function createInstance<T>(cl:Class<T>, args:Array<Dynamic>):T {
-		// TODO: Requires calling constructor via FibClass.construct + vtable
-		return null;
+		if (cl == null)
+			return null;
+		var d:Dynamic = cl;
+		// Special case: String_class — just return the first argument as string
+		if (untyped __fiberus__("(FibClass*)(", d, ").data.ptrVal == &String_class")) {
+			if (args != null && args.length > 0)
+				return args[0];
+			return untyped __fiberus__("fib_dynamic_string(fib_string_new(\"\"))");
+		}
+		var a:Dynamic = args;
+		return untyped __fiberus__("(FibDynamic){ .type = FIB_TYPE_OBJECT, .data.ptrVal = fib_create_instance((FibClass*)(", d,
+			").data.ptrVal, ((FibArray*)(", a, ").data.ptrVal)->data, ((FibArray*)(", a, ").data.ptrVal)->length) }");
 	}
 
 	public static function createEmptyInstance<T>(cl:Class<T>):T {
-		// TODO: Requires FibClass.construct
-		return null;
+		if (cl == null)
+			return null;
+		var d:Dynamic = cl;
+		return untyped __fiberus__("(FibDynamic){ .type = FIB_TYPE_OBJECT, .data.ptrVal = fib_create_empty_instance((FibClass*)(", d, ").data.ptrVal) }");
 	}
 
 	public static function createEnum<T>(e:Enum<T>, constr:String, ?params:Array<Dynamic>):T {
-		// TODO: Requires runtime enum construction from metadata
-		return null;
+		if (e == null || constr == null)
+			return null;
+		var d:Dynamic = e;
+		// Find constructor by name
+		var count:Int = untyped __fiberus__("((FibEnumMeta*)(", d, ").data.ptrVal)->constr_count");
+		var i = 0;
+		while (i < count) {
+			var cname:String = untyped __fiberus__("fib_string_new(((FibEnumMeta*)(", d, ").data.ptrVal)->constrs[", i, "].name)");
+			if (cname == constr) {
+				var expectedParams:Int = untyped __fiberus__("((FibEnumMeta*)(", d, ").data.ptrVal)->constrs[", i, "].param_count");
+				var actualParams:Int = (params != null) ? params.length : 0;
+				if (expectedParams != actualParams)
+					throw "Invalid enum constructor parameters for " + constr;
+				if (actualParams > 0) {
+					var a:Dynamic = params;
+					return untyped __fiberus__("fib_enum_create((FibEnumMeta*)(", d, ").data.ptrVal, ", i,
+						", ((FibArray*)(", a, ").data.ptrVal)->data, ((FibArray*)(", a, ").data.ptrVal)->length)");
+				} else {
+					return untyped __fiberus__("fib_enum_create((FibEnumMeta*)(", d, ").data.ptrVal, ", i, ", NULL, 0)");
+				}
+			}
+			i++;
+		}
+		throw "Unknown enum constructor " + constr;
 	}
 
 	public static function createEnumIndex<T>(e:Enum<T>, index:Int, ?params:Array<Dynamic>):T {
-		// TODO: Requires runtime enum construction from metadata
-		return null;
+		if (e == null)
+			return null;
+		var d:Dynamic = e;
+		if (params != null && params.length > 0) {
+			var a:Dynamic = params;
+			return untyped __fiberus__("fib_enum_create((FibEnumMeta*)(", d, ").data.ptrVal, ", index,
+				", ((FibArray*)(", a, ").data.ptrVal)->data, ((FibArray*)(", a, ").data.ptrVal)->length)");
+		} else {
+			return untyped __fiberus__("fib_enum_create((FibEnumMeta*)(", d, ").data.ptrVal, ", index, ", NULL, 0)");
+		}
 	}
 
 	public static function getInstanceFields(c:Class<Dynamic>):Array<String> {
 		if (c == null)
 			return [];
 		var d:Dynamic = c;
-		var count:Int = untyped __fiberus__("((FibClass*)(", d, ").data.ptrVal)->fieldCount");
-		var result:Array<String> = [];
-		var i = 0;
-		while (i < count) {
-			var name:String = untyped __fiberus__("fib_string_new(((FibClass*)(", d, ").data.ptrVal)->fields[", i, "].name)");
-			result.push(name);
-			i++;
-		}
-		return result;
+		var arr:Dynamic = untyped __fiberus__("fib_dynamic_array(fib_class_get_instance_fields((FibClass*)(", d, ").data.ptrVal))");
+		return arr;
 	}
 
 	public static function getClassFields(c:Class<Dynamic>):Array<String> {
-		// TODO: Static fields are not yet tracked in FibClass metadata
-		return [];
+		if (c == null)
+			return [];
+		var d:Dynamic = c;
+		var arr:Dynamic = untyped __fiberus__("fib_dynamic_array(fib_class_get_class_fields((FibClass*)(", d, ").data.ptrVal))");
+		return arr;
 	}
 
 	public static function getEnumConstructs(e:Enum<Dynamic>):Array<String> {
@@ -162,10 +210,16 @@ enum ValueType {
 			return TNull;
 		if (untyped __fiberus__("(", v, ").type == FIB_TYPE_BOOL"))
 			return TBool;
+		if (untyped __fiberus__("(", v, ").type == FIB_TYPE_INT64"))
+			return TInt64;
 		if (untyped __fiberus__("(", v, ").type == FIB_TYPE_INT"))
 			return TInt;
-		if (untyped __fiberus__("(", v, ").type == FIB_TYPE_FLOAT"))
+		if (untyped __fiberus__("(", v, ").type == FIB_TYPE_FLOAT")) {
+			// Haxe convention: a float with no fractional part that fits in Int32 is TInt
+			if (untyped __fiberus__("(", v, ").data.floatVal == (double)(int32_t)(", v, ").data.floatVal"))
+				return TInt;
 			return TFloat;
+		}
 		if (untyped __fiberus__("(", v, ").type == FIB_TYPE_STRING")) {
 			var stringClass:Dynamic = untyped __fiberus__("(FibDynamic){ .type = FIB_TYPE_CLASS, .data = { .ptrVal = &String_class } }");
 			return TClass(stringClass);
@@ -184,10 +238,16 @@ enum ValueType {
 			var arrayClass:Dynamic = untyped __fiberus__("(FibDynamic){ .type = FIB_TYPE_CLASS, .data = { .ptrVal = &Array_class } }");
 			return TClass(arrayClass);
 		}
+		if (untyped __fiberus__("(", v, ").type == FIB_TYPE_CLASS"))
+			return TObject;
 		return TUnknown;
 	}
 
 	public static function enumEq<T:EnumValue>(a:T, b:T):Bool {
+		if (a == null && b == null)
+			return true;
+		if (a == null || b == null)
+			return false;
 		var da:Dynamic = a;
 		var db:Dynamic = b;
 		return untyped __fiberus__("fib_enum_eq(", da, ", ", db, ")");
@@ -223,7 +283,21 @@ enum ValueType {
 	}
 
 	public static function allEnums<T>(e:Enum<T>):Array<T> {
-		// TODO: Requires runtime enum construction
-		return [];
+		if (e == null)
+			return [];
+		var d:Dynamic = e;
+		var count:Int = untyped __fiberus__("((FibEnumMeta*)(", d, ").data.ptrVal)->constr_count");
+		var result:Array<T> = [];
+		var i = 0;
+		while (i < count) {
+			var paramCount:Int = untyped __fiberus__("((FibEnumMeta*)(", d, ").data.ptrVal)->constrs[", i, "].param_count");
+			if (paramCount == 0) {
+				// No-param constructor: create it with no params
+				var val:T = untyped __fiberus__("fib_enum_create((FibEnumMeta*)(", d, ").data.ptrVal, ", i, ", NULL, 0)");
+				result.push(val);
+			}
+			i++;
+		}
+		return result;
 	}
 }

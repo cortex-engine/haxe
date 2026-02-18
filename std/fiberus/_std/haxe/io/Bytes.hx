@@ -25,14 +25,20 @@ class Bytes {
 	}
 
 	public function blit(pos:Int, src:Bytes, srcpos:Int, len:Int):Void {
+		if (pos < 0 || srcpos < 0 || len < 0 || pos + len > length || srcpos + len > src.length)
+			throw Error.OutsideBounds;
 		untyped __fiberus__("fib_bytes_blit(", src.b, ", ", srcpos, ", ", b, ", ", pos, ", ", len, ")");
 	}
 
-	public inline function fill(pos:Int, len:Int, value:Int):Void {
+	public function fill(pos:Int, len:Int, value:Int):Void {
+		if (pos < 0 || len < 0 || pos + len > length)
+			throw Error.OutsideBounds;
 		untyped __fiberus__("fib_bytes_fill(", b, ", ", pos, ", ", len, ", (uint8_t)", value, ")");
 	}
 
 	public function sub(pos:Int, len:Int):Bytes {
+		if (pos < 0 || len < 0 || pos + len > length)
+			throw Error.OutsideBounds;
 		var newData:BytesData = untyped __fiberus__("fib_bytes_sub(", b, ", ", pos, ", ", len, ")");
 		return new Bytes(len, newData);
 	}
@@ -41,31 +47,31 @@ class Bytes {
 		return untyped __fiberus__("fib_bytes_compare(", b, ", ", other.b, ")");
 	}
 
-	public inline function getDouble(pos:Int):Float {
+	public function getDouble(pos:Int):Float {
 		return untyped __fiberus__("fib_bytes_get_double(", b, ", ", pos, ")");
 	}
 
-	public inline function getFloat(pos:Int):Float {
+	public function getFloat(pos:Int):Float {
 		return untyped __fiberus__("fib_bytes_get_float(", b, ", ", pos, ")");
 	}
 
-	public inline function setDouble(pos:Int, v:Float):Void {
+	public function setDouble(pos:Int, v:Float):Void {
 		untyped __fiberus__("fib_bytes_set_double(", b, ", ", pos, ", ", v, ")");
 	}
 
-	public inline function setFloat(pos:Int, v:Float):Void {
+	public function setFloat(pos:Int, v:Float):Void {
 		untyped __fiberus__("fib_bytes_set_float(", b, ", ", pos, ", ", v, ")");
 	}
 
-	public inline function getUInt16(pos:Int):Int {
+	public function getUInt16(pos:Int):Int {
 		return untyped __fiberus__("((int32_t)fib_bytes_get_int16(", b, ", ", pos, ") & 0xFFFF)");
 	}
 
-	public inline function setUInt16(pos:Int, v:Int):Void {
+	public function setUInt16(pos:Int, v:Int):Void {
 		untyped __fiberus__("fib_bytes_set_int16(", b, ", ", pos, ", (int16_t)", v, ")");
 	}
 
-	public inline function getInt32(pos:Int):Int {
+	public function getInt32(pos:Int):Int {
 		return untyped __fiberus__("fib_bytes_get_int32(", b, ", ", pos, ")");
 	}
 
@@ -75,7 +81,7 @@ class Bytes {
 		return haxe.Int64.make(high, low);
 	}
 
-	public inline function setInt32(pos:Int, v:Int):Void {
+	public function setInt32(pos:Int, v:Int):Void {
 		untyped __fiberus__("fib_bytes_set_int32(", b, ", ", pos, ", ", v, ")");
 	}
 
@@ -85,7 +91,9 @@ class Bytes {
 	}
 
 	public function getString(pos:Int, len:Int, ?encoding:Encoding):String {
-		if (len <= 0) return "";
+		if (pos < 0 || len < 0 || pos + len > length)
+			throw Error.OutsideBounds;
+		if (len == 0) return "";
 		var subData:BytesData = untyped __fiberus__("fib_bytes_sub(", b, ", ", pos, ", ", len, ")");
 		return untyped __fiberus__("fib_bytes_to_string(", subData, ")");
 	}

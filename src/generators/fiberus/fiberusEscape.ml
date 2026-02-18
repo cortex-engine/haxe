@@ -64,8 +64,12 @@ let analyze_escapes (f : tfunc) : (int, tclass) Hashtbl.t =
     match e.eexpr with
     (* Track new allocations assigned to local variables *)
     | TVar (v, Some { eexpr = TNew (c, _, args) }) when can_stack_alloc_class c ->
-        (* Only track if not already escaped *)
-        if not (Hashtbl.mem escaped_vars v.v_id) then
+        (* Only track if not already escaped, and only if the variable's declared
+           type is compatible with concrete class access. Variables typed as Dynamic
+           will be used with dynamic dispatch (fib_dynamic_get_field etc.) which
+           requires FibDynamic boxing, not a concrete class pointer. *)
+        let v_tc = FiberusTypeUtils.tc_type_of (follow v.v_type) in
+        if not (Hashtbl.mem escaped_vars v.v_id) && v_tc <> FiberusAst.TCFibDynamic then
           Hashtbl.replace stack_vars v.v_id c;
         (* Analyze constructor arguments - they might reference tracked vars *)
         List.iter analyze args
@@ -74,7 +78,8 @@ let analyze_escapes (f : tfunc) : (int, tclass) Hashtbl.t =
     | TBinop (OpAssign, { eexpr = TLocal v }, ({ eexpr = TNew (c, _, args) })) 
         when can_stack_alloc_class c ->
         (* If reassigning, keep tracking if it's still a direct TNew *)
-        if not (Hashtbl.mem escaped_vars v.v_id) then
+        let v_tc = FiberusTypeUtils.tc_type_of (follow v.v_type) in
+        if not (Hashtbl.mem escaped_vars v.v_id) && v_tc <> FiberusAst.TCFibDynamic then
           Hashtbl.replace stack_vars v.v_id c;
         List.iter analyze args
     

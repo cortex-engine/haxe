@@ -26,15 +26,31 @@ let rec tc_type_of t =
   | TAbstract ({ a_path = ([], "Float") }, []) -> TCFloat64
   | TAbstract ({ a_path = ([], "Bool") }, []) -> TCBool
   | TAbstract ({ a_path = ([], "Null") }, [inner]) ->
-      (* Nullable primitives need FibDynamic to hold null *)
-      (match follow inner with
-      | TAbstract ({ a_path = ([], "Int") }, [])
-      | TAbstract ({ a_path = ([], "Float") }, [])
-      | TAbstract ({ a_path = ([], "Bool") }, []) -> TCFibDynamic
-      | _ -> tc_type_of inner)
+      (* Nullable primitives need FibDynamic to hold null.
+         Check the resolved tc_type, not just the Haxe type, because abstracts
+         like EnumFlags wrap Int but follow does not unwrap them. *)
+      let inner_tc = tc_type_of inner in
+      (match inner_tc with
+      | TCInt32 | TCFloat64 | TCFloat32 | TCBool | TCInt8 | TCInt16 | TCInt64
+      | TCUInt8 | TCUInt16 | TCUInt32 | TCUInt64 | TCChar | TCSizeT -> TCFibDynamic
+      | _ -> inner_tc)
   | TInst ({ cl_path = ([], "String") }, []) -> TCFibString
-  | TInst ({ cl_path = ([], "Array") }, [elem_t]) ->
-      (* Specialized arrays for primitive types *)
+   | TInst ({ cl_path = ([], "Array") }, [elem_t]) ->
+      (* Specialized arrays for primitive types.
+       * Null<T> must use generic array since elements can be null.
+       * Use follow on elem_t first to resolve TMono wrappers before the Null check. *)
+      (* Check elem_t for Null<> BEFORE follow, because follow erases Null<T> to T.
+       * Null<primitive> arrays must use generic (FibArray) to represent null elements.
+       * Also check through TMono wrappers without using follow (which erases Null). *)
+      let rec is_nullable_elem t =
+        match t with
+        | TAbstract ({ a_path = ([], "Null") }, _) -> true
+        | TMono r -> (match r.tm_type with Some t -> is_nullable_elem t | None -> false)
+        | TType (td, tl) -> is_nullable_elem (apply_typedef td tl)
+        | _ -> false
+      in
+      if is_nullable_elem elem_t then TCFibArray TCArrGeneric
+      else
       (match follow elem_t with
       | TAbstract ({ a_path = ([], "Int") }, []) -> TCFibArray TCArrInt
       | TAbstract ({ a_path = ([], "Float") }, []) -> TCFibArray TCArrFloat
@@ -91,9 +107,15 @@ let rec tc_type_of t =
       | (["fiberus"], "AtomicInt") -> TCAtomicInt
       | _ ->
           (* Check for @:native metadata before falling back to underlying type *)
+          let underlying = Abstract.get_underlying_type a tl in
           match get_meta_string a.a_meta Meta.Native with
-          | Some native_str -> TCRaw native_str
-          | None -> tc_type_of (Abstract.get_underlying_type a tl))
+          | Some native_str ->
+              (* If the underlying type is a class, the abstract is erased at runtime —
+                 use the underlying class type, not the @:native name *)
+              (match follow underlying with
+               | TInst _ -> tc_type_of underlying
+               | _ -> TCRaw native_str)
+          | None -> tc_type_of underlying)
   | TLazy f -> tc_type_of (lazy_type f)
 
 (* Convert a tvar to tc_type *)
@@ -262,7 +284,18 @@ let is_enum_type t =
 (* Get array kind from Haxe type *)
 let get_array_kind t =
   match follow t with
-  | TInst ({ cl_path = ([], "Array") }, [elem_t]) ->
+   | TInst ({ cl_path = ([], "Array") }, [elem_t]) ->
+      (* Check elem_t for Null<> BEFORE follow, because follow erases Null<T> to T.
+       * Also check through TMono/TType wrappers. *)
+      let rec is_nullable_elem t =
+        match t with
+        | TAbstract ({ a_path = ([], "Null") }, _) -> true
+        | TMono r -> (match r.tm_type with Some t -> is_nullable_elem t | None -> false)
+        | TType (td, tl) -> is_nullable_elem (apply_typedef td tl)
+        | _ -> false
+      in
+      if is_nullable_elem elem_t then TCArrGeneric
+      else
       (match follow elem_t with
       | TAbstract ({ a_path = ([], "Int") }, []) -> TCArrInt
       | TAbstract ({ a_path = ([], "Float") }, []) -> TCArrFloat
@@ -301,6 +334,18 @@ let array_kind_c_elem_type = function
   | TCArrInt64 -> "int64_t"
   | TCArrUInt64 -> "uint64_t"
   | TCArrFloat32 -> "float"
+
+(* Get tc_type for array kind elements.
+ * Uses types that have proper unbox_func_name mappings for FibDynamic coercion. *)
+let array_kind_elem_tc = function
+  | TCArrGeneric -> TCFibDynamic
+  | TCArrInt -> TCInt32
+  | TCArrFloat -> TCFloat64
+  | TCArrBool -> TCBool
+  | TCArrUInt8 -> TCInt32     (* uint8_t coerced via int; C truncates *)
+  | TCArrInt64 -> TCInt64
+  | TCArrUInt64 -> TCInt64    (* uint64_t coerced via int64; C reinterprets *)
+  | TCArrFloat32 -> TCFloat64 (* float coerced via double; C truncates *)
 
 (* ============================================================================
  * Boxing/Unboxing Utilities

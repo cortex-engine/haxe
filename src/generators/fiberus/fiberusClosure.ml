@@ -104,6 +104,18 @@ let find_free_vars (f : tfunc) : tvar list =
   scan f.tf_expr;
   !free
 
+(* Check if a function body uses TConst TThis *)
+let uses_this (f : tfunc) : bool =
+  let found = ref false in
+  let rec scan e =
+    if not !found then
+      match e.eexpr with
+      | TConst TThis -> found := true
+      | _ -> Type.iter scan e
+  in
+  scan f.tf_expr;
+  !found
+
 (* ============================================================================
  * Closure Context Management
  * ============================================================================ *)
@@ -217,6 +229,7 @@ let box_to_dynamic_func (t : Type.t) : string =
   | TAbstract ({ a_path = ([], "Bool") }, []) -> "fib_dynamic_bool"
   | TInst ({ cl_path = ([], "String") }, []) -> "fib_dynamic_string"
   | TAbstract ({ a_path = (["fiberus"], "Int64") }, []) -> "fib_dynamic_int64"
+  | TInst ({ cl_path = ([], "Array") }, _) -> "fib_dynamic_array"
   | TFun _ -> "fib_dynamic_object"  (* Closures are objects *)
   | TDynamic _ -> ""  (* Already dynamic, no conversion needed *)
   | _ -> "fib_dynamic_object"
@@ -229,6 +242,7 @@ let unbox_from_dynamic_func (t : Type.t) : string =
   | TAbstract ({ a_path = ([], "Bool") }, []) -> "fib_dynamic_to_bool"
   | TInst ({ cl_path = ([], "String") }, []) -> "fib_dynamic_to_string"
   | TAbstract ({ a_path = (["fiberus"], "Int64") }, []) -> "fib_dynamic_to_int64"
+  | TInst ({ cl_path = ([], "Array") }, _) -> "fib_dynamic_to_array"
   | TFun _ -> "fib_dynamic_to_object"  (* Returns FibObject*, needs cast to FibClosure* *)
   | TDynamic _ -> ""  (* No conversion needed *)
   | _ -> "fib_dynamic_to_object"
@@ -242,4 +256,4 @@ let unbox_needs_cast (t : Type.t) : bool =
   | TInst ({ cl_path = ([], "String") }, []) -> false
   | TAbstract ({ a_path = (["fiberus"], "Int64") }, []) -> false
   | TDynamic _ -> false
-  | _ -> true  (* Object types need cast from FibObject* *)
+  | _ -> true  (* Object/array types need cast *)

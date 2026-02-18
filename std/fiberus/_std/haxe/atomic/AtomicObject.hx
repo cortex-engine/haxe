@@ -10,15 +10,19 @@ private final class ObjectData {
 
 abstract AtomicObject<T:{}>(ObjectData) {
 	public inline function new(value:T) {
-		this = new ObjectData(untyped __fiberus__("(int64_t)(void*)", value));
+		var v:T = value;
+		this = new ObjectData(untyped __fiberus__("(int64_t)(void*)", v));
 	}
 
 	public inline function compareExchange(expected:T, replacement:T):T {
-		return untyped __fiberus__("(void*)fib_atomic_ptr_compare_exchange((void**)&", this.ptr, ",(void*)(intptr_t)", expected, ",(void*)(intptr_t)", replacement, ")");
+		var e:T = expected;
+		var r:T = replacement;
+		return untyped __fiberus__("(void*)fib_atomic_ptr_compare_exchange((void**)&", this.ptr, ",(void*)", e, ",(void*)", r, ")");
 	}
 
 	public inline function exchange(value:T):T {
-		return untyped __fiberus__("(void*)fib_atomic_ptr_exchange((void**)&", this.ptr, ",(void*)(intptr_t)", value, ")");
+		var v:T = value;
+		return untyped __fiberus__("(void*)fib_atomic_ptr_exchange((void**)&", this.ptr, ",(void*)", v, ")");
 	}
 
 	public inline function load():T {
@@ -26,6 +30,7 @@ abstract AtomicObject<T:{}>(ObjectData) {
 	}
 
 	public inline function store(value:T):T {
-		return untyped __fiberus__("(void*)fib_atomic_ptr_store((void**)&", this.ptr, ",(void*)(intptr_t)", value, ")");
+		var v:T = value;
+		return untyped __fiberus__("(void*)fib_atomic_ptr_store((void**)&", this.ptr, ",(void*)", v, ")");
 	}
 }
