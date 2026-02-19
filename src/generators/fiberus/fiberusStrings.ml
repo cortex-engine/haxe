@@ -69,9 +69,9 @@ let escape_string s =
     | '\r' -> Buffer.add_string b "\\r"
     | '\t' -> Buffer.add_string b "\\t"
     | '\000' -> Buffer.add_string b "\\0"
-    | c when Char.code c < 32 || Char.code c > 126 ->
-        (* Non-printable characters as hex escapes *)
-        Buffer.add_string b (Printf.sprintf "\\x%02x" (Char.code c))
+    | c when (Char.code c < 32 || Char.code c > 126) ->
+        (* Non-printable characters as octal escapes (fixed 3 digits) *)
+        Buffer.add_string b (Printf.sprintf "\\%03o" (Char.code c))
     | c -> Buffer.add_char b c
   ) s;
   Buffer.contents b

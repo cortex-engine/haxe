@@ -15,7 +15,7 @@ class MyClass {
 
 	public var ref : MyClass;
 	public var intValue : Int;
-	public var stringValue : String;
+	@:keep public var stringValue : String;
 
 	public function new(v) {
 		val = v;

@@ -263,10 +263,10 @@ let coerce_to_type expr target_tc =
         mk_expr (TCEBox (expr, box_kind_of_type expr.ctype)) TCFibDynamic
       else if expr.ctype = TCFibDynamic && target_tc <> TCFibDynamic then begin
         (* Unbox from FibDynamic.
-           For arrays: always unbox to generic FibArray since fib_dynamic_to_array
-           returns FibArray* regardless of the actual specialization. Casting to a
-           specialized array type (e.g. FibIntArray) would misinterpret FibDynamic data
-           as int32_t data. *)
+           For arrays: fib_dynamic_to_array always returns FibArray* (generic).
+           Downgrade specialized targets to generic to prevent type-punning
+           (e.g. reading FibDynamic elements as int32_t). The var-declaration
+           path registers a type override so subsequent accesses use generic. *)
         let actual_target = match target_tc with
           | TCFibArray _ -> TCFibArray TCArrGeneric
           | _ -> target_tc
@@ -1263,9 +1263,18 @@ let rec convert_expr (ctx : conv_ctx) (e : texpr) : tc_expr =
         inner_expr
       else begin
         let result =
-          if from_tc = TCFibDynamic then
-            (* Unbox from FibDynamic to target type *)
-            mk_expr_pos (TCEUnbox (inner_expr, tc)) tc pos
+          if from_tc = TCFibDynamic then begin
+            (* Unbox from FibDynamic to target type.
+               For arrays, fib_dynamic_to_array always returns a generic FibArray*,
+               so downgrade specialized targets to generic -- same as coerce_to_type.
+               The var-declaration path will register a type override so subsequent
+               accesses use the generic path. *)
+            let actual_tc = match tc with
+              | TCFibArray _ -> TCFibArray TCArrGeneric
+              | _ -> tc
+            in
+            mk_expr_pos (TCEUnbox (inner_expr, actual_tc)) actual_tc pos
+          end
           else if tc = TCFibDynamic then
             (* Box to FibDynamic *)
             let box_kind = box_kind_of_type from_tc in
@@ -1920,6 +1929,16 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
       let e1_expr = convert_expr ctx e1 in
       let e2_expr = convert_expr ctx e2 in
       let rhs = box_if_needed e1_expr.ctype e2_expr in
+      (* Static field assignment: if a Dynamic array is assigned to an Array<Int>
+         static field, convert generic elements to preserve correct reads. *)
+      let rhs = match e1.Type.eexpr, e1_expr.ctype, rhs.ctype with
+        | Type.TField (_, Type.FStatic _), TCFibArray TCArrInt, TCFibArray TCArrGeneric ->
+            let conv = mk_expr (TCECall (TCTFunc "fib_array_to_int_array", [rhs])) e1_expr.ctype in
+            if rhs.pending_stmts <> [] then
+              { conv with pending_stmts = rhs.pending_stmts; gc_roots = rhs.gc_roots + conv.gc_roots }
+            else conv
+        | _ -> rhs
+      in
       (* Check if RHS is an assignment that may modify the same lvalue.
          In C, (x = (x += 1)) is undefined behavior — sequence via temporary. *)
       let rhs_is_assign = match e2.Type.eexpr with
@@ -2532,28 +2551,47 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
             pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
             gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
         end else begin
-          (* One side is Dynamic, other is concrete. Need null guard:
-             OpEq:    (dyn.type != FIB_TYPE_NULL && extract(dyn) == other)
-             OpNotEq: (dyn.type == FIB_TYPE_NULL || extract(dyn) != other)
-             This ensures null != any_concrete_value. *)
-          let dyn_expr = if e1_expr.ctype = TCFibDynamic then e1_expr else e2_expr in
-          let e1_ex = extract_fib_dynamic e1_expr target_tc in
-          let e2_ex = extract_fib_dynamic e2_expr target_tc in
-          let c_op = convert_binop op in
-          let cmp = mk_expr_pos (TCEBinop (c_op, e1_ex, e2_ex)) TCBool pos in
-          let null_type = mk_expr_pos (TCERaw "FIB_TYPE_NULL") TCInt32 pos in
-          let type_field = mk_expr_pos (TCEDot (dyn_expr, "type")) TCInt32 pos in
-          let result = if op = OpEq then
-            let not_null = mk_expr_pos (TCEBinop (TCOpNeq, type_field, null_type)) TCBool pos in
-            mk_expr_pos (TCEBinop (TCOpBoolAnd, not_null, cmp)) TCBool pos
-          else
-            let is_null = mk_expr_pos (TCEBinop (TCOpEq, type_field, null_type)) TCBool pos in
-            mk_expr_pos (TCEBinop (TCOpBoolOr, is_null, cmp)) TCBool pos
+          (* One side is Dynamic, other is concrete. *)
+          let is_extractable_primitive = match target_tc with
+            | TCInt32 | TCInt64 | TCFloat64 | TCBool -> true
+            | _ -> false
           in
-          (* Propagate pending_stmts from both operands *)
-          { result with 
-            pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
-            gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
+          if is_extractable_primitive then begin
+            (* Primitive target: extract Dynamic to primitive and compare with null guard.
+               OpEq:    (dyn.type != FIB_TYPE_NULL && extract(dyn) == other)
+               OpNotEq: (dyn.type == FIB_TYPE_NULL || extract(dyn) != other) *)
+            let dyn_expr = if e1_expr.ctype = TCFibDynamic then e1_expr else e2_expr in
+            let e1_ex = extract_fib_dynamic e1_expr target_tc in
+            let e2_ex = extract_fib_dynamic e2_expr target_tc in
+            let c_op = convert_binop op in
+            let cmp = mk_expr_pos (TCEBinop (c_op, e1_ex, e2_ex)) TCBool pos in
+            let null_type = mk_expr_pos (TCERaw "FIB_TYPE_NULL") TCInt32 pos in
+            let type_field = mk_expr_pos (TCEDot (dyn_expr, "type")) TCInt32 pos in
+            let result = if op = OpEq then
+              let not_null = mk_expr_pos (TCEBinop (TCOpNeq, type_field, null_type)) TCBool pos in
+              mk_expr_pos (TCEBinop (TCOpBoolAnd, not_null, cmp)) TCBool pos
+            else
+              let is_null = mk_expr_pos (TCEBinop (TCOpEq, type_field, null_type)) TCBool pos in
+              mk_expr_pos (TCEBinop (TCOpBoolOr, is_null, cmp)) TCBool pos
+            in
+            { result with 
+              pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+              gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
+          end else begin
+            (* Object/string/array/map/etc target: box the concrete side to
+               FibDynamic and use fib_dynamic_equals for proper type-aware comparison. *)
+            let e1_dyn = if e1_expr.ctype = TCFibDynamic then e1_expr
+              else mk_expr (TCEBox (e1_expr, box_kind_of_type e1_expr.ctype)) TCFibDynamic in
+            let e2_dyn = if e2_expr.ctype = TCFibDynamic then e2_expr
+              else mk_expr (TCEBox (e2_expr, box_kind_of_type e2_expr.ctype)) TCFibDynamic in
+            let eq_call = mk_expr_pos (TCECall (TCTFunc "fib_dynamic_equals", [e1_dyn; e2_dyn])) TCBool pos in
+            let result = if op = OpNotEq then
+              mk_expr_pos (TCEUnop (TCUNot, eq_call)) TCBool pos
+            else eq_call in
+            { result with
+              pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+              gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
+          end
         end
       end else begin
         (* Check if either operand is an enum struct - C structs can't use ==/!= directly *)
@@ -2728,7 +2766,8 @@ and convert_array_assign ctx e1 e2 pos =
         end else begin
           (* Generic array: box value to FibDynamic.
              Strip val_expr pending and include separately since TCEBox doesn't propagate them.
-             For already-dynamic values, cache_if_side_effects handles pending. *)
+             Always cache the boxed value in a temp to avoid double-evaluation when the
+             assigned value reads from the same array (Issue9746). *)
           let val_pre_pending, boxed =
             if val_expr.ctype = TCFibDynamic then
               ([], val_expr)
@@ -2736,11 +2775,13 @@ and convert_array_assign ctx e1 e2 pos =
               (val_expr.pending_stmts,
                mk_expr (TCEBox ({ val_expr with pending_stmts = [] }, box_kind_of_type val_expr.ctype)) TCFibDynamic)
           in
-          let boxed_safe, boxed_cache = cache_if_side_effects boxed in
-          let access = { arr = arr_expr; idx = idx_expr; arr_kind; elem_type = boxed_safe.ctype } in
-          let set_expr = mk_expr (TCEArraySet (access, boxed_safe)) TCBool in
-          { (mk_expr_pos (TCEComma [set_expr; boxed_safe]) TCFibDynamic pos) with
-            pending_stmts = arr_expr.pending_stmts @ idx_expr.pending_stmts @ val_pre_pending @ boxed_cache }
+          let tmp_name = gen_gc_temp_name () in
+          let tmp_decl = TCSVar { vd_name = tmp_name; vd_type = TCFibDynamic; vd_init = Some boxed; vd_static = false; vd_const = false; vd_volatile = false } in
+          let tmp_ref = mk_expr (TCELocal tmp_name) TCFibDynamic in
+          let access = { arr = arr_expr; idx = idx_expr; arr_kind; elem_type = tmp_ref.ctype } in
+          let set_expr = mk_expr (TCEArraySet (access, tmp_ref)) TCBool in
+          { (mk_expr_pos (TCEComma [set_expr; tmp_ref]) TCFibDynamic pos) with
+            pending_stmts = arr_expr.pending_stmts @ idx_expr.pending_stmts @ val_pre_pending @ [tmp_decl] }
         end
       in
       { result with gc_roots = sub_gc_roots + result.gc_roots }
@@ -2764,6 +2805,43 @@ and mark_anon_heap_alloc (e : tc_expr) : tc_expr =
 and convert_field_assign ctx e1 e2 pos =
   match e1.Type.eexpr with
   | Type.TField (obj, fa) ->
+      (* Interface field assignment: use fib_reflect_set_field to dispatch through
+         the actual class's field descriptor, avoiding type reinterpretation mismatches
+         (e.g. I.v:Float vs C.v:Int both at same struct offset).
+         Check this BEFORE converting obj/e2 to avoid redundant convert_expr calls. *)
+      let is_interface_field = match fa with
+        | Type.FInstance (c, _, _) -> FiberusVtable.is_interface c
+        | _ -> false
+      in
+      if is_interface_field then begin
+        (* Interface field assign: box the interface pointer to FibDynamic, then use
+           fib_reflect_set_field so the write goes through the real class's field descriptor.
+           We cannot use convert_anon_field_assign because obj is a typed interface pointer
+           (e.g. IFoo_obj ptr), not a FibDynamic. *)
+        let cf = match fa with Type.FInstance (_, _, cf) -> cf | _ -> assert false in
+        let field_name_str = cf.cf_name in
+        let val_tc = tc_type_of e1.Type.etype in
+        let obj_expr = convert_expr ctx obj in
+        let val_expr = convert_expr ctx e2 in
+        (* Box value to FibDynamic *)
+        let boxed_val = coerce_to_type val_expr TCFibDynamic in
+        let field_name = mk_raw_string field_name_str in
+        (* Box obj to FibDynamic via fib_dynamic_object( (FibObject-ptr) obj ) *)
+        let cast_obj = mk_expr (TCECast (TCFibObject, obj_expr)) TCFibObject in
+        let obj_as_dyn = mk_expr (TCECall (TCTFunc "fib_dynamic_object", [cast_obj])) TCFibDynamic in
+        (* Store FibDynamic in a temp so we can take &temp *)
+        let tmp_name = gen_gc_temp_name () in
+        let tmp_decl = TCSVar { vd_name = tmp_name; vd_type = TCFibDynamic; vd_init = Some obj_as_dyn; vd_static = false; vd_const = false; vd_volatile = false } in
+        let tmp_ref = mk_expr (TCELocal tmp_name) TCFibDynamic in
+        let obj_ptr = mk_expr (TCEAddrOf tmp_ref) (TCPointer TCFibDynamic) in
+        (* Cache boxed_val if it has side effects *)
+        let boxed_safe, boxed_cache = cache_if_side_effects boxed_val in
+        let set_call = mk_expr_pos (TCECall (TCTFunc "fib_reflect_set_field", [obj_ptr; field_name; boxed_safe])) TCVoid pos in
+        let result = coerce_to_type boxed_safe val_tc in
+        { result with
+          pending_stmts = obj_expr.pending_stmts @ [tmp_decl] @ val_expr.pending_stmts @ boxed_cache @ [TCSExpr set_call];
+          gc_roots = obj_expr.gc_roots + val_expr.gc_roots }
+      end else
       let obj_expr = convert_expr ctx obj in
       let val_expr = mark_anon_heap_alloc (convert_expr ctx e2) in
       let lhs_tc = tc_type_of e1.Type.etype in
@@ -2810,6 +2888,16 @@ and convert_field_assign ctx e1 e2 pos =
             convert_expr ctx e1, lhs_tc
       in
       let rhs = box_if_needed effective_lhs_tc val_expr in
+      (* If assigning a generic FibArray (often from Dynamic) into a specialized
+         Array<Int> field, convert elements to preserve correct reads. *)
+      let rhs = match effective_lhs_tc, rhs.ctype with
+        | TCFibArray TCArrInt, TCFibArray TCArrGeneric ->
+            let conv = mk_expr (TCECall (TCTFunc "fib_array_to_int_array", [rhs])) effective_lhs_tc in
+            if rhs.pending_stmts <> [] then
+              { conv with pending_stmts = rhs.pending_stmts; gc_roots = rhs.gc_roots + conv.gc_roots }
+            else conv
+        | _ -> rhs
+      in
       (* If RHS is itself an assignment/compound assignment, sequence via a
          temporary to avoid undefined behavior (e.g., x = x += 1). *)
       let rhs_is_assign = match e2.Type.eexpr with
@@ -2877,8 +2965,12 @@ and convert_anon_field_assign ctx e1 e2 pos =
   match e1.Type.eexpr with
   | Type.TField (obj, fa) ->
       let field_name_str = (match fa with Type.FAnon cf -> cf.cf_name | Type.FDynamic n -> n | _ -> assert false) in
-      let is_fdynamic = (match fa with Type.FDynamic _ -> true | _ -> false) in
-      let set_func = if is_fdynamic then "fib_reflect_set_field" else "fib_anon_set" in
+      (* Use fib_reflect_set_field for both FAnon and FDynamic: the runtime value
+         may be FIB_TYPE_OBJECT (e.g. @:nativeGen class through structural type),
+         and fib_anon_set silently skips non-anon objects. fib_reflect_set_field
+         handles both FIB_TYPE_ANON and FIB_TYPE_OBJECT correctly. *)
+      let _is_fdynamic = (match fa with Type.FDynamic _ -> true | _ -> false) in
+      let set_func = "fib_reflect_set_field" in
       let obj_expr = convert_expr ctx obj in
       let val_expr = convert_expr ctx e2 in
       let val_tc = tc_type_of e1.Type.etype in
@@ -2922,8 +3014,8 @@ and convert_anon_field_compound_assign ctx inner_op e1 e2 pos =
   match e1.Type.eexpr with
   | Type.TField (obj, _fa) ->
       let field_name_str = (match _fa with Type.FAnon cf -> cf.cf_name | Type.FDynamic n -> n | _ -> assert false) in
-      let is_fdynamic = (match _fa with Type.FDynamic _ -> true | _ -> false) in
-      let set_func = if is_fdynamic then "fib_reflect_set_field" else "fib_anon_set" in
+      let _is_fdynamic = (match _fa with Type.FDynamic _ -> true | _ -> false) in
+      let set_func = "fib_reflect_set_field" in
       let val_tc = tc_type_of e1.Type.etype in
       let obj_expr = convert_expr ctx obj in
       (* Cache obj_expr if it has side effects — used in both get and set *)
@@ -3043,6 +3135,10 @@ and convert_array_compound_assign ctx inner_op e1 e2 pos =
             let rhs_str = ensure_string ctx e2 val_expr in
             let concat = mk_expr (TCEStringConcat (old_str, rhs_str)) TCFibString in
             mk_expr (TCECall (TCTFunc "fib_dynamic_string", [concat])) TCFibDynamic
+          end else if inner_op = Ast.OpMod then begin
+            (* Dynamic modulus: use runtime helper to handle int/float correctly *)
+            let rhs_dyn = coerce_to_type val_expr TCFibDynamic in
+            mk_expr (TCECall (TCTFunc "fib_dynamic_mod", [get_call; rhs_dyn])) TCFibDynamic
           end else begin
             (* Numeric operation: fib_dynamic_int(fib_dynamic_to_int(old) op rhs) *)
             let extracted = mk_expr (TCECall (TCTFunc "fib_dynamic_to_int", [get_call])) TCInt32 in
@@ -3163,7 +3259,11 @@ and convert_unop_expr ctx op flag inner result_tc pos =
        | TField (obj, fa) ->
            let field_name_str = (match fa with FAnon cf -> cf.cf_name | FDynamic n -> n | _ -> assert false) in
            let is_fdynamic = (match fa with FDynamic _ -> true | _ -> false) in
-           let set_func = if is_fdynamic then "fib_reflect_set_field" else "fib_anon_set" in
+      (* Use fib_reflect_set_field for both FAnon and FDynamic: the runtime value
+         may be FIB_TYPE_OBJECT (e.g. @:nativeGen class through structural type),
+         and fib_anon_set silently skips non-anon objects. fib_reflect_set_field
+         handles both FIB_TYPE_ANON and FIB_TYPE_OBJECT correctly. *)
+      let set_func = "fib_reflect_set_field" in
            let obj_expr = convert_expr ctx obj in
            (* Cache obj_expr if it has side effects — used in both get and set *)
            let obj_safe, obj_cache_stmts = cache_if_side_effects obj_expr in
@@ -3441,7 +3541,12 @@ and convert_expr_as_stmt ctx (e : texpr) : tc_stmt list =
       let exc_expr = convert_expr ctx exc in
       let boxed_expr = 
         if exc_expr.ctype = TCFibDynamic then exc_expr
-        else mk_expr (TCEBox (exc_expr, box_kind_of_type exc_expr.ctype)) TCFibDynamic
+        else
+          let b = mk_expr (TCEBox (exc_expr, box_kind_of_type exc_expr.ctype)) TCFibDynamic in
+          (* Propagate pending_stmts from the inner expression to the box node,
+             since write_expr does not emit pending_stmts of sub-expressions. *)
+          { b with pending_stmts = exc_expr.pending_stmts @ b.pending_stmts;
+                   gc_roots = exc_expr.gc_roots + b.gc_roots }
       in
       (* Extract pending_stmts and clear them from boxed_expr so the writer
          does not emit them a second time via emit_pending_stmts in TCSThrow. *)
@@ -3603,14 +3708,15 @@ and convert_field_access ctx obj fa result_tc pos =
            let defaults = match cf.cf_expr with
             | Some { Type.eexpr = Type.TFunction f } ->
               let filtered = filter_void_args f.tf_args in
-              List.map (fun (_, d) -> match d with
-                | Some { Type.eexpr = Type.TConst c } -> (match c with
-                  | Type.TInt i -> Some (Int32.to_string i)
-                  | Type.TFloat s -> Some s
-                  | Type.TBool true -> Some "true"
-                  | Type.TBool false -> Some "false"
-                  | _ -> None)
-                | _ -> None) filtered
+               List.map (fun (_, d) -> match d with
+                 | Some { Type.eexpr = Type.TConst c } -> (match c with
+                   | Type.TInt i -> Some (Int32.to_string i)
+                   | Type.TFloat s -> Some s
+                   | Type.TBool true -> Some "true"
+                   | Type.TBool false -> Some "false"
+                   | Type.TString s -> Some ("fib_string_new(\"" ^ escape_string s ^ "\")")
+                   | _ -> None)
+                 | _ -> None) filtered
             | _ -> []
           in
           let thunk = {
@@ -3677,42 +3783,62 @@ and convert_field_access ctx obj fa result_tc pos =
         ) obj_expr
       end
       else begin
-        (* Regular instance field access - use GC-safe extraction if obj is volatile.
-         * This ensures that if obj came from an array element access or method call,
-         * the intermediate pointer is rooted before we dereference it. *)
-        let needs_cast = match Type.follow obj.Type.etype with
-          | Type.TInst (obj_class, _) -> obj_class.cl_path <> c.cl_path
-          | _ -> false
-        in
-        (* Field's storage type may differ from expression type in generics:
-         * e.g., Node<T>.next has storage type FibDynamic but expression type Node<Int>* *)
+        (* For interface field reads, use reflection to avoid storage type mismatches
+           (e.g. interface declares Float but class stores Int). Do not use reflection
+           for enum-typed fields because enum values are stored by value and field
+           descriptors currently tag them as FIB_TYPE_OBJECT. *)
         let field_storage_tc = tc_type_of cf.cf_type in
-        let arrow_tc = if field_storage_tc <> result_tc then field_storage_tc else result_tc in
-        wrap_single_gc_extraction_ctx (Some ctx) (fun safe_obj ->
-          (* If the object is FibDynamic (e.g. field of a generic class with erased type params),
-             unbox to the declaring class pointer before arrow access. *)
-          let safe_obj =
-            if safe_obj.ctype = TCFibDynamic then
-              let class_tc = TCFibClass (flat_path c.cl_path) in
-              let obj_ptr = mk_expr (TCECall (TCTFunc "fib_dynamic_to_object", [safe_obj])) TCFibObject in
-              mk_expr (TCECast (class_tc, obj_ptr)) class_tc
-            else safe_obj
-          in
-          let arrow_expr =
-            if needs_cast then begin
-              (* Cast to parent class type for inherited field access *)
-              let class_name = flat_path c.cl_path in
-              let cast_expr = mk_expr (TCECast (TCFibClass class_name, safe_obj)) (TCFibClass class_name) in
-              mk_expr_pos (TCEArrow (cast_expr, ident cf.cf_name)) arrow_tc pos
-            end else
-              mk_expr_pos (TCEArrow (safe_obj, ident cf.cf_name)) arrow_tc pos
-          in
-          (* Unbox from storage type if needed, e.g. FibDynamic to Node pointer *)
-          if arrow_tc <> result_tc then
-            coerce_to_type arrow_expr result_tc
+        let use_reflect =
+          FiberusVtable.is_interface c &&
+          (match field_storage_tc with TCFibEnum _ -> false | _ -> true)
+        in
+        if use_reflect then begin
+          let field_name = mk_raw_string cf.cf_name in
+          let raw = wrap_single_gc_extraction_ctx (Some ctx) (fun safe_obj ->
+            let dyn_obj = coerce_to_type safe_obj TCFibDynamic in
+            mk_expr_inherit (TCECall (TCTFunc "fib_field_get", [dyn_obj; field_name])) TCFibDynamic [dyn_obj]
+          ) obj_expr in
+          if result_tc <> TCFibDynamic then
+            coerce_to_type raw result_tc
           else
-            arrow_expr
-        ) obj_expr
+            raw
+        end else begin
+          (* Regular instance field access - use GC-safe extraction if obj is volatile.
+           * This ensures that if obj came from an array element access or method call,
+           * the intermediate pointer is rooted before we dereference it. *)
+          let needs_cast = match Type.follow obj.Type.etype with
+            | Type.TInst (obj_class, _) -> obj_class.cl_path <> c.cl_path
+            | _ -> false
+          in
+          (* Field's storage type may differ from expression type in generics:
+           * e.g., Node<T>.next has storage type FibDynamic but expression type Node<Int>* *)
+          let arrow_tc = if field_storage_tc <> result_tc then field_storage_tc else result_tc in
+          wrap_single_gc_extraction_ctx (Some ctx) (fun safe_obj ->
+            (* If the object is FibDynamic (e.g. field of a generic class with erased type params),
+               unbox to the declaring class pointer before arrow access. *)
+            let safe_obj =
+              if safe_obj.ctype = TCFibDynamic then
+                let class_tc = TCFibClass (flat_path c.cl_path) in
+                let obj_ptr = mk_expr (TCECall (TCTFunc "fib_dynamic_to_object", [safe_obj])) TCFibObject in
+                mk_expr (TCECast (class_tc, obj_ptr)) class_tc
+              else safe_obj
+            in
+            let arrow_expr =
+              if needs_cast then begin
+                (* Cast to parent class type for inherited field access *)
+                let class_name = flat_path c.cl_path in
+                let cast_expr = mk_expr (TCECast (TCFibClass class_name, safe_obj)) (TCFibClass class_name) in
+                mk_expr_pos (TCEArrow (cast_expr, ident cf.cf_name)) arrow_tc pos
+              end else
+                mk_expr_pos (TCEArrow (safe_obj, ident cf.cf_name)) arrow_tc pos
+            in
+            (* Unbox from storage type if needed, e.g. FibDynamic to Node pointer *)
+            if arrow_tc <> result_tc then
+              coerce_to_type arrow_expr result_tc
+            else
+              arrow_expr
+          ) obj_expr
+        end
       end
   
   (* Enum field *)
@@ -3875,14 +4001,15 @@ and convert_field_access ctx obj fa result_tc pos =
       let defaults = match cf.cf_expr with
         | Some { Type.eexpr = Type.TFunction f } ->
           let filtered = filter_void_args f.tf_args in
-          List.map (fun (_, d) -> match d with
-            | Some { Type.eexpr = Type.TConst c } -> (match c with
-              | Type.TInt i -> Some (Int32.to_string i)
-              | Type.TFloat s -> Some s
-              | Type.TBool true -> Some "true"
-              | Type.TBool false -> Some "false"
-              | _ -> None)
-            | _ -> None) filtered
+           List.map (fun (_, d) -> match d with
+             | Some { Type.eexpr = Type.TConst c } -> (match c with
+               | Type.TInt i -> Some (Int32.to_string i)
+               | Type.TFloat s -> Some s
+               | Type.TBool true -> Some "true"
+               | Type.TBool false -> Some "false"
+               | Type.TString s -> Some ("fib_string_new(\"" ^ escape_string s ^ "\")")
+               | _ -> None)
+             | _ -> None) filtered
         | _ -> []
       in
       let thunk = {
@@ -3969,30 +4096,12 @@ and convert_array_access ctx arr idx result_tc pos =
         elem_type = TCFibDynamic;
       } in
       let get_expr = mk_expr_pos (TCEArrayGet access) TCFibDynamic pos in
-      (* Unbox based on expected element type using field suffix *)
-      let suffix = fib_dynamic_field_suffix result_tc in
-      if suffix = "" then
-        get_expr
-      else
-        (* For object types, need cast to extract objectVal from FibDynamic *)
-        match result_tc with
-        | TCFibClass _ | TCFibObject ->
-            let data_field = mk_expr (TCEDot (get_expr, "data")) TCFibDynamic in
-            let obj_val = mk_expr (TCEDot (data_field, "objectVal")) TCFibObject in
-            mk_expr_pos (TCECast (result_tc, obj_val)) result_tc pos
-        | _ ->
-            (* For primitives: fib_array_get(...).data.intVal etc *)
-            let data_field = mk_expr (TCEDot (get_expr, "data")) TCFibDynamic in
-            let field_name = 
-              match result_tc with
-              | TCInt32 -> "intVal"
-              | TCInt64 -> "int64Val"
-              | TCFloat64 -> "floatVal"
-              | TCBool -> "boolVal"
-              | TCFibString -> "stringVal"
-              | _ -> "ptrVal"
-            in
-            mk_expr_pos (TCEDot (data_field, field_name)) result_tc pos
+      (* Unbox the FibDynamic element to the expected result type.
+         Use coerce_to_type which emits proper fib_dynamic_to_* calls,
+         handling cross-type conversions (e.g. int boxed as FIB_TYPE_INT
+         but read as Float needs fib_dynamic_to_float, not .data.floatVal). *)
+      if result_tc = TCFibDynamic then get_expr
+      else coerce_to_type get_expr result_tc
     end
   in
   (* Propagate pending_stmts from sub-expressions *)
@@ -4228,7 +4337,8 @@ and convert_string_call ctx str_expr args arg_exprs method_name result_tc pos =
   
   | "lastIndexOf" ->
       let needle_expr = arg_or_string_default 0 "" in
-      let start_expr = arg_or_int_default 1 (-1) in
+      (* Default startIndex: use max int so it clamps to string length *)
+      let start_expr = arg_or_int_default 1 0x7FFFFFFF in
       (* Wrap with GC extraction to protect allocating string arguments *)
       wrap_call_with_gc_extraction_ctx (Some ctx)
         (fun args -> mk_expr_pos (TCECall (TCTFunc "fib_string_last_index_of", args)) TCInt32 pos)
@@ -4743,7 +4853,9 @@ and convert_fiber_spawn_with_stack ctx size_expr arg pos =
       mk_expr_pos (TCECall (TCTFunc "Fiber_spawnWithStack", [size_expr; arg_expr])) TCFiber pos
 
 and convert_call ctx callee args result_tc pos =
-  let arg_exprs = List.map (convert_expr ctx) args in
+  (* Heap-allocate any anonymous objects in call arguments to prevent dangling
+     stack pointers if the callee stores them (e.g. PosInfos in exceptions). *)
+  let arg_exprs = List.map (fun a -> mark_anon_heap_alloc (convert_expr ctx a)) args in
   
   (* Check for builtin intrinsics first *)
   match FiberusBuiltins.get_intrinsic callee with
@@ -4914,14 +5026,25 @@ and convert_call ctx callee args result_tc pos =
                         mk_expr_pos (TCEBool true) TCBool pos
                       else
                         mk_expr_pos (TCEBool false) TCBool pos
-                 | ([], "Dynamic") ->
-                      if val_expr.ctype = TCFibDynamic then
-                        let is_null = mk_expr (TCECall (TCTFunc "fib_dynamic_is_null", [val_expr])) TCBool in
-                        let result = mk_expr_pos (TCEUnop (TCUNot, is_null)) TCBool pos in
-                        { result with pending_stmts = val_expr.pending_stmts @ result.pending_stmts }
-                      else
-                        mk_expr_pos (TCEBool true) TCBool pos
-                  | _ -> mk_expr_pos (TCEBool false) TCBool pos)
+                  | ([], "Dynamic") ->
+                       if val_expr.ctype = TCFibDynamic then
+                         let is_null = mk_expr (TCECall (TCTFunc "fib_dynamic_is_null", [val_expr])) TCBool in
+                         let result = mk_expr_pos (TCEUnop (TCUNot, is_null)) TCBool pos in
+                         { result with pending_stmts = val_expr.pending_stmts @ result.pending_stmts }
+                       else
+                         mk_expr_pos (TCEBool true) TCBool pos
+                  | ([], ("Class" | "Enum")) ->
+                       (* Class/Enum sentinel checks: Std.isOfType(v, Class) or Std.isOfType(v, Enum)
+                          Class and Enum are @:coreType abstracts in Haxe, so they arrive as TAbstractDecl.
+                          Must use fib_instanceof_dynamic which handles FIB_TYPE_CLASS values
+                          and distinguishes Class vs Enum via FIB_ENUM_META_MAGIC. *)
+                       let sentinel_name = (match a.a_path with (_, n) -> n) ^ "_class" in
+                       let dyn_val = coerce_to_type val_expr TCFibDynamic in
+                       let dyn_type = mk_expr (TCERaw (Printf.sprintf
+                         "(FibDynamic){ .type = FIB_TYPE_CLASS, .data = { .ptrVal = &%s } }" sentinel_name)) TCFibDynamic in
+                       let call = mk_expr_pos (TCECall (TCTFunc "fib_instanceof_dynamic", [dyn_val; dyn_type])) TCBool pos in
+                       { call with pending_stmts = collect_pending [dyn_val] @ call.pending_stmts }
+                   | _ -> mk_expr_pos (TCEBool false) TCBool pos)
              | _ ->
                  (* Abstract type not recognized — fall through to runtime check *)
                  let type_expr = convert_expr ctx type_arg in
@@ -5381,24 +5504,41 @@ and convert_call ctx callee args result_tc pos =
      fn_dynamic takes all args as FibDynamic and handles unboxing inside the thunk. *)
   | TField (obj, FInstance (c, _, cf)) when (match cf.cf_kind with Method MethDynamic -> true | _ -> false) ->
       let obj_expr = convert_expr ctx obj in
-      let class_name = flat_path c.cl_path in
-      let field_name = ident cf.cf_name in
       let args_pending = collect_pending arg_exprs in
       let boxed_args = box_args_for_dynamic_call arg_exprs in
-      let call_result = wrap_single_gc_extraction_ctx (Some ctx) (fun safe_obj ->
-        (* Cast object to declaring class type if needed *)
-        let this_type = TCFibClass class_name in
-        let cast_obj = if safe_obj.ctype <> this_type then
-          mk_expr (TCECast (this_type, safe_obj)) this_type
-        else safe_obj in
-        (* Read the void* field, cast to FibObject, box as FibDynamic for _fib_dyn_call_N *)
-        let field_access = mk_expr (TCEArrow (cast_obj, field_name)) (TCPointer TCVoid) in
-        let closure_as_dyn = mk_expr (TCECall (TCTFunc "fib_dynamic_object", [
-          mk_expr (TCECast (TCFibObject, field_access)) TCFibObject
-        ])) TCFibDynamic in
-        let dyn_call = mk_expr_pos (TCEDynamicCall { closure = closure_as_dyn; args = boxed_args }) TCFibDynamic pos in
-        unwrap_dynamic_result dyn_call result_tc
-      ) obj_expr in
+      let call_result =
+        if FiberusVtable.is_interface c then begin
+          (* Interface dynamic method: struct layout differs per concrete class, so we
+             cannot use direct ->field access. Read via fib_field_get (dynamic dispatch)
+             which looks up by name through the actual object's field descriptor. *)
+          let field_name_str = mk_raw_string cf.cf_name in
+          wrap_single_gc_extraction_ctx (Some ctx) (fun safe_obj ->
+            let dyn_obj = coerce_to_type safe_obj TCFibDynamic in
+            let closure_as_dyn = mk_expr_inherit
+              (TCECall (TCTFunc "fib_field_get", [dyn_obj; field_name_str]))
+              TCFibDynamic [dyn_obj] in
+            let dyn_call = mk_expr_pos (TCEDynamicCall { closure = closure_as_dyn; args = boxed_args }) TCFibDynamic pos in
+            unwrap_dynamic_result dyn_call result_tc
+          ) obj_expr
+        end else begin
+          let class_name = flat_path c.cl_path in
+          let field_name = ident cf.cf_name in
+          wrap_single_gc_extraction_ctx (Some ctx) (fun safe_obj ->
+            (* Cast object to declaring class type if needed *)
+            let this_type = TCFibClass class_name in
+            let cast_obj = if safe_obj.ctype <> this_type then
+              mk_expr (TCECast (this_type, safe_obj)) this_type
+            else safe_obj in
+            (* Read the void* field, cast to FibObject, box as FibDynamic for _fib_dyn_call_N *)
+            let field_access = mk_expr (TCEArrow (cast_obj, field_name)) (TCPointer TCVoid) in
+            let closure_as_dyn = mk_expr (TCECall (TCTFunc "fib_dynamic_object", [
+              mk_expr (TCECast (TCFibObject, field_access)) TCFibObject
+            ])) TCFibDynamic in
+            let dyn_call = mk_expr_pos (TCEDynamicCall { closure = closure_as_dyn; args = boxed_args }) TCFibDynamic pos in
+            unwrap_dynamic_result dyn_call result_tc
+          ) obj_expr
+        end
+      in
       { call_result with pending_stmts = args_pending @ call_result.pending_stmts }
 
   (* Instance method call - only match actual methods, not function-typed Var fields.
@@ -5410,10 +5550,41 @@ and convert_call ctx callee args result_tc pos =
       let class_name = flat_path c.cl_path in
       let method_name = ident cf.cf_name in
       let param_types = get_param_tc_types cf.cf_type in
-      let coerced_args = coerce_args ~cf_opt:(Some cf) arg_exprs param_types in
       let is_interface_call = FiberusVtable.is_interface c in
+      let has_missing_optional =
+        (* Extern classes have no fn_dynamic thunk; defaults must be filled at call site
+           by the Haxe compiler, so never use dynamic dispatch for them. *)
+        if has_class_flag c CExtern then false
+        else
+        match Type.follow cf.cf_type with
+        | Type.TFun (params, _) ->
+            let arg_count = List.length arg_exprs in
+            let param_count = List.length params in
+            let is_null_arg e = match e.cexpr with
+              | TCENull -> true
+              | TCECall (TCTFunc "fib_dynamic_null", []) -> true
+              | _ -> false
+            in
+            let rec all_optional idx =
+              if idx >= param_count then true
+              else
+                let (_, opt, _) = List.nth params idx in
+                opt && all_optional (idx + 1)
+            in
+            let rec any_missing idx =
+              if idx >= param_count then false
+              else if idx >= arg_count then all_optional idx
+              else
+                let (_, opt, _) = List.nth params idx in
+                if opt && is_null_arg (List.nth arg_exprs idx) then true
+                else any_missing (idx + 1)
+            in
+            any_missing 0
+        | _ -> false
+      in
+      let coerced_args = coerce_args ~cf_opt:(Some cf) arg_exprs param_types in
       (* Collect pending_stmts from arguments - these must be emitted before the call *)
-      let args_pending = collect_pending coerced_args in
+      let args_pending = if has_missing_optional then collect_pending arg_exprs else collect_pending coerced_args in
       
       (* Wrap the method call generation with GC-safe extraction of the object.
        * This ensures that if the object came from an array element access or
@@ -5436,6 +5607,16 @@ and convert_call ctx callee args result_tc pos =
         let cast_obj = if safe_obj.ctype <> this_type then
           mk_expr (TCECast (this_type, safe_obj)) this_type
         else safe_obj in
+        (* If optional args are omitted, use dynamic field lookup and fn_dynamic so
+           defaults are applied by the actual method implementation at runtime. *)
+        if has_missing_optional then begin
+          let field_name = mk_raw_string cf.cf_name in
+          let boxed_args = box_args_for_dynamic_call arg_exprs in
+          let dyn_obj = coerce_to_type safe_obj TCFibDynamic in
+          let closure_as_dyn = mk_expr_inherit (TCECall (TCTFunc "fib_field_get", [dyn_obj; field_name])) TCFibDynamic [dyn_obj] in
+          let dyn_call = mk_expr_pos (TCEDynamicCall { closure = closure_as_dyn; args = boxed_args }) TCFibDynamic pos in
+          unwrap_dynamic_result dyn_call result_tc
+        end else
         (* Check if this needs vtable dispatch *)
         (* For generic classes like Tls<T>, the function definition uses the erased
            type (FibDynamic) for type parameters, but the call site has the monomorphized
@@ -6179,7 +6360,12 @@ and convert_stmt (ctx : conv_ctx) (e : texpr) : tc_stmt list =
       (* Box to FibDynamic if not already *)
       let boxed_expr = 
         if exc_expr.ctype = TCFibDynamic then exc_expr
-        else mk_expr (TCEBox (exc_expr, box_kind_of_type exc_expr.ctype)) TCFibDynamic
+        else
+          let b = mk_expr (TCEBox (exc_expr, box_kind_of_type exc_expr.ctype)) TCFibDynamic in
+          (* Propagate pending_stmts from the inner expression to the box node,
+             since write_expr does not emit pending_stmts of sub-expressions. *)
+          { b with pending_stmts = exc_expr.pending_stmts @ b.pending_stmts;
+                   gc_roots = exc_expr.gc_roots + b.gc_roots }
       in
       (* Extract pending_stmts and clear them from boxed_expr so the writer
          does not emit them a second time via emit_pending_stmts in TCSThrow. *)
@@ -6532,6 +6718,15 @@ let convert_class_method ctx name (func : tfunc) is_static class_name =
           let boxed = coerce_to_type converted TCFibDynamic in
           let null_check = mk_expr (TCECall (TCTFunc "fib_dynamic_is_null", [init_expr])) TCBool in
           mk_expr (TCETernary (null_check, boxed, init_expr)) TCFibDynamic
+      | TCFibString, Some { Type.eexpr = Type.TConst (Type.TString s) } ->
+          let default_str = mk_expr (TCEString s) TCFibString in
+          let null_check = mk_expr (TCEBinop (TCOpEq, init_expr, mk_expr TCENull TCFibString)) TCBool in
+          mk_expr (TCETernary (null_check, default_str, init_expr)) TCFibString
+      | TCFibString, Some default_e when (match default_e.Type.eexpr with Type.TConst Type.TNull -> false | _ -> true) ->
+          let converted = convert_expr ctx default_e in
+          let default_str = coerce_to_type converted TCFibString in
+          let null_check = mk_expr (TCEBinop (TCOpEq, init_expr, mk_expr TCENull TCFibString)) TCBool in
+          mk_expr (TCETernary (null_check, default_str, init_expr)) TCFibString
       | TCFibEnum _, Some default_e when (match default_e.Type.eexpr with Type.TConst Type.TNull -> false | _ -> true) ->
           let converted = convert_expr ctx default_e in
           let index_field = mk_expr (TCERaw (vname ^ ".index")) TCInt32 in
@@ -6677,7 +6872,11 @@ let convert_constructor ctx (c : tclass) =
             etype = cf2.cf_type; epos = cf2.cf_pos } in
           let assign_expr = { eexpr = TBinop (OpAssign, field_access, func_expr);
             etype = cf2.cf_type; epos = cf2.cf_pos } in
-          acc @ (convert_expr_as_stmt init_body_ctx assign_expr)
+          let this_local = mk_expr (TCELocal "this") (TCFibClass class_name) in
+          let field_expr = mk_expr (TCEArrow (this_local, ident cf2.cf_name)) (TCPointer TCVoid) in
+          let null_expr = mk_expr TCENull (TCPointer TCVoid) in
+          let cond = mk_expr (TCEBinop (TCOpEq, field_expr, null_expr)) TCBool in
+          acc @ [TCSIf (cond, convert_expr_as_stmt init_body_ctx assign_expr, None)]
         | _ -> acc
       ) [] c.cl_ordered_fields in
       ctx.closures <- init_body_ctx.closures @ ctx.closures;
@@ -6780,7 +6979,7 @@ let convert_constructor ctx (c : tclass) =
             let dyn_init_stmts = List.fold_left (fun acc cf ->
               match cf.cf_kind, cf.cf_expr with
               | Method MethDynamic, Some ({ eexpr = TFunction _ } as func_expr) ->
-                (* Synthesize: this.fieldName = <default closure> *)
+                (* Synthesize: if (this.fieldName == NULL) this.fieldName = <default closure> *)
                 let this_expr = { eexpr = TConst TThis;
                   etype = TInst (c, extract_param_types c.cl_params);
                   epos = c.cl_pos } in
@@ -6788,7 +6987,11 @@ let convert_constructor ctx (c : tclass) =
                   etype = cf.cf_type; epos = cf.cf_pos } in
                 let assign_expr = { eexpr = TBinop (OpAssign, field_access, func_expr);
                   etype = cf.cf_type; epos = cf.cf_pos } in
-                acc @ (convert_expr_as_stmt init_body_ctx assign_expr)
+                let this_local = mk_expr (TCELocal "this") (TCFibClass class_name) in
+                let field_expr = mk_expr (TCEArrow (this_local, ident cf.cf_name)) (TCPointer TCVoid) in
+                let null_expr = mk_expr TCENull (TCPointer TCVoid) in
+                let cond = mk_expr (TCEBinop (TCOpEq, field_expr, null_expr)) TCBool in
+                acc @ [TCSIf (cond, convert_expr_as_stmt init_body_ctx assign_expr, None)]
               | _ -> acc
             ) [] c.cl_ordered_fields in
             let init_body_stmts = convert_stmt init_body_ctx func.tf_expr in

@@ -712,39 +712,50 @@ let gen_class_impl ctx c =
 			match cf.cf_kind with
 			| Method MethNormal | Method MethInline ->
 				(match cf.cf_expr with
-				| Some { eexpr = TFunction f } ->
-					let method_name = ident cf.cf_name in
-					let thunk_name = Printf.sprintf "__%s_%s_thunk" class_name method_name in
-					let dyn_thunk_name = thunk_name ^ "_dyn" in
-					(* Derive parameter types from the TFunction expression's tf_args rather than
-					   cf.cf_type — for @:generic specializations, cf.cf_type may have stale type
-					   parameters while tf_args has the actual concrete types. *)
-					let filtered_args = filter_void_args f.tf_args in
-					let arg_types = List.map (fun (v, _) -> (v.v_name, tc_type_of v.v_type)) filtered_args in
-					let ret_type = tc_type_of f.tf_type in
-					let arg_count = List.length arg_types in
-					(* Register the thunk so it gets generated *)
-					let thunk = {
-						mth_thunk_name = thunk_name;
-						mth_dyn_thunk_name = dyn_thunk_name;
-						mth_is_static = false;
-						mth_class_name = class_name;
-						mth_method_name = method_name;
-						mth_args = arg_types;
-						mth_ret_type = ret_type;
-						mth_c_func = None;
-						mth_this_expr = None;
-						mth_vtable_slot = None;
-						mth_defaults = extract_thunk_defaults filtered_args;
-					} in
-					Hashtbl.replace ctx.cast_method_thunks thunk_name thunk;
-					Some {
-						md_name = cf.cf_name;
-						md_thunk_name = thunk_name;
-						md_dyn_thunk_name = dyn_thunk_name;
-						md_arg_count = arg_count;
-					}
-				| _ -> None)
+			| Some { eexpr = TFunction f } ->
+				let method_name = ident cf.cf_name in
+				let thunk_name = Printf.sprintf "__%s_%s_thunk" class_name method_name in
+				let dyn_thunk_name = thunk_name ^ "_dyn" in
+				(* Derive parameter types from the TFunction expression's tf_args rather than
+				   cf.cf_type — for @:generic specializations, cf.cf_type may have stale type
+				   parameters while tf_args has the actual concrete types. *)
+				let filtered_args = filter_void_args f.tf_args in
+				let arg_types = List.map (fun (v, _) -> (v.v_name, tc_type_of v.v_type)) filtered_args in
+				let ret_type = tc_type_of f.tf_type in
+				let arg_count = List.length arg_types in
+				(* Register the thunk so it gets generated *)
+				let thunk = {
+					mth_thunk_name = thunk_name;
+					mth_dyn_thunk_name = dyn_thunk_name;
+					mth_is_static = false;
+					mth_class_name = class_name;
+					mth_method_name = method_name;
+					mth_args = arg_types;
+					mth_ret_type = ret_type;
+					mth_c_func = None;
+					mth_this_expr = None;
+					mth_vtable_slot = None;
+					mth_defaults = extract_thunk_defaults filtered_args;
+				} in
+				Hashtbl.replace ctx.cast_method_thunks thunk_name thunk;
+				Some {
+					md_name = cf.cf_name;
+					md_thunk_name = thunk_name;
+					md_dyn_thunk_name = dyn_thunk_name;
+					md_arg_count = arg_count;
+				}
+			| _ when has_class_flag c CInterface ->
+				(* Interface abstract methods have no body, but we still need
+				   descriptors so Type.getInstanceFields returns their names. *)
+				let arg_count = match Type.follow cf.cf_type with
+					| TFun (args, _) -> List.length args | _ -> 0 in
+				Some {
+					md_name = cf.cf_name;
+					md_thunk_name = "NULL";
+					md_dyn_thunk_name = "NULL";
+					md_arg_count = arg_count;
+				}
+			| _ -> None)
 			| _ -> None
 		) c.cl_ordered_fields in
 		(* Extract static field descriptors for Type.getClassFields and Reflect.field on Class values.

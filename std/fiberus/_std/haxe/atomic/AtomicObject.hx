@@ -17,7 +17,7 @@ abstract AtomicObject<T:{}>(ObjectData) {
 	public inline function compareExchange(expected:T, replacement:T):T {
 		var e:T = expected;
 		var r:T = replacement;
-		return untyped __fiberus__("(void*)fib_atomic_ptr_compare_exchange((void**)&", this.ptr, ",(void*)", e, ",(void*)", r, ")");
+		return untyped __fiberus__("(void*)fib_atomic_obj_compare_exchange((void**)&", this.ptr, ",(void*)", e, ",(void*)", r, ")");
 	}
 
 	public inline function exchange(value:T):T {

@@ -411,7 +411,7 @@ class Serializer {
 						v.hxSerialize != null
 					catch (e:Dynamic)
 						false
-					#elseif (java || python)
+					#elseif (java || python || fiberus)
 					Reflect.hasField(v, "hxSerialize")
 					#elseif php
 					php.Global.method_exists(v, 'hxSerialize')
@@ -521,7 +521,7 @@ class Serializer {
 						#end
 					}
 				}
-				#elseif (java || python || hl || eval)
+				#elseif (java || python || hl || eval || fiberus)
 				if (useEnumIndex) {
 					buf.add(":");
 					buf.add(Type.enumIndex(v));

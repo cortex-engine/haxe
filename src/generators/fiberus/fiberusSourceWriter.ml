@@ -12,6 +12,7 @@
 
 open FiberusAst
 open FiberusTypeUtils
+open FiberusStrings
 
 (* ============================================================================
  * Writer State
@@ -155,8 +156,16 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
   | TCEInt i -> writef w "%ld" i
   | TCEInt64 i -> writef w "%LdLL" i
   | TCEFloat s -> write w s
-  | TCEString s -> writef w "fib_string_new(\"%s\")" (StringHelper.s_escape s)
-  | TCERawString s -> writef w "\"%s\"" (StringHelper.s_escape s)
+  | TCEString s ->
+      if String.contains s '\000' then
+        writef w "fib_string_new_len(\"%s\", %d)" (escape_string s) (String.length s)
+      else
+        writef w "fib_string_new(\"%s\")" (escape_string s)
+  | TCERawString s ->
+      if String.contains s '\000' then
+        writef w "\"%s\"" (escape_string s)
+      else
+        writef w "\"%s\"" (escape_string s)
   | TCEBool b -> write w (if b then "true" else "false")
   | TCENull ->
       (* Null depends on type - enum structs use sentinel, others use NULL *)
@@ -288,7 +297,26 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
       ) args;
       write w ")"
   | TCEClosureCall { closure; arg_types; ret_type; args } ->
-      let cast = tc_func_ptr_cast ret_type arg_types in
+      let use_dynamic = ret_type = TCFibDynamic in
+      let call_arg_types =
+        if use_dynamic then List.map (fun _ -> TCFibDynamic) arg_types else arg_types
+      in
+      let cast = tc_func_ptr_cast (if use_dynamic then TCFibDynamic else ret_type) call_arg_types in
+      let write_arg =
+        if use_dynamic then (fun arg arg_type ->
+          match arg_type with
+          | TCFibDynamic -> write_expr w arg
+          | _ ->
+              let box_func = box_func_name (box_kind_of_type arg_type) in
+              if box_func = "" then
+                write_expr w arg
+              else begin
+                writef w "%s(" box_func;
+                write_expr w arg;
+                write w ")"
+              end
+        ) else (fun arg _arg_type -> write_expr w arg)
+      in
       (* Check if closure is a simple expression that can be safely evaluated twice *)
       let is_simple = match closure.cexpr with
         | TCELocal _ | TCEStatic _ | TCEThis -> true
@@ -300,11 +328,11 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
         write w "({ FibClosure* _fc = (FibClosure*)(";
         write_expr w closure;
         write w "); if (__builtin_expect(!_fc, 0)) fib_throw(fib_dynamic_string(fib_string_new(\"Cannot call null function\")));";
-        writef w " ((%s_fc->fn)(_fc" cast;
-        List.iter (fun arg ->
+        writef w " ((%s_fc->%s)(_fc" cast (if use_dynamic then "fn_dynamic" else "fn");
+        List.iter2 (fun arg arg_type ->
           write w ", ";
-          write_expr w arg
-        ) args;
+          write_arg arg arg_type
+        ) args arg_types;
         write w ")); })"
       end else begin
         (* Complex case: closure expression has side effects, use GCC statement
@@ -313,11 +341,11 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
         write w "({ FibClosure* _fc = (FibClosure*)(";
         write_expr w closure;
         write w "); if (__builtin_expect(!_fc, 0)) fib_throw(fib_dynamic_string(fib_string_new(\"Cannot call null function\")));";
-        writef w " ((%s_fc->fn)(_fc" cast;
-        List.iter (fun arg ->
+        writef w " ((%s_fc->%s)(_fc" cast (if use_dynamic then "fn_dynamic" else "fn");
+        List.iter2 (fun arg arg_type ->
           write w ", ";
-          write_expr w arg
-        ) args;
+          write_arg arg arg_type
+        ) args arg_types;
         write w ")); })"
       end
   | TCEDynamicCall { closure; args } ->
@@ -399,10 +427,13 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
         | TCBoxEnum enum_name ->
             (* Use a GCC statement expression to create an addressable temp.
                We avoid fib_dynamic_enum_val macro because compound literals with commas
-               inside braces confuse the preprocessor's argument splitting. *)
+               inside braces confuse the preprocessor's argument splitting.
+               Check for null sentinel (index == -1) to preserve nullability through
+               the unbox-rebox round-trip that occurs when Null<EnumType> is passed
+               to a generic Dynamic parameter. *)
             writef w "({ %s _enum_tmp = (" enum_name;
             write_expr w e;
-            writef w "); fib_dynamic_enum(&_enum_tmp, sizeof(%s)); })" enum_name
+            writef w "); _enum_tmp.index == -1 ? fib_dynamic_null() : fib_dynamic_enum(&_enum_tmp, sizeof(%s)); })" enum_name
         | _ ->
             writef w "%s(" func;
             (match kind with
@@ -1348,7 +1379,8 @@ let unbox_from_dynamic (arg_name : string) (t : tc_type) : string =
   | TCFibClosure -> Printf.sprintf "(FibClosure*)fib_dynamic_to_object(%s)" arg_name
   | TCFibDynamic -> arg_name  (* Pass through unchanged *)
   | TCFibEnum name -> Printf.sprintf "*(%s*)fib_dynamic_to_ptr(%s)" name arg_name
-  | TCFibArray _ -> Printf.sprintf "(%s)fib_dynamic_to_array(%s)" (tc_type_to_string t) arg_name
+  | TCFibArray TCArrInt -> Printf.sprintf "fib_array_to_int_array((FibArray*)fib_dynamic_to_array(%s))" arg_name
+  | TCFibArray _ -> Printf.sprintf "(FibArray*)fib_dynamic_to_array(%s)" arg_name
   | t -> Printf.sprintf "(%s)fib_dynamic_to_object(%s)" (tc_type_to_string t) arg_name
 
 (* Generate forward declarations for a closure *)
@@ -1581,12 +1613,18 @@ let write_method_thunk_dynamic (w : writer) (thunk : tc_method_thunk) : unit =
     let arg_name = Printf.sprintf "_arg%d" i in
     let default_opt = try List.nth defaults i with _ -> None in
     write_type w typ;
-    (match default_opt with
-    | Some default_lit when typ <> TCFibDynamic ->
-      writef w " _typed%d = (%s.type == FIB_TYPE_NULL) ? %s : %s;"
-        i arg_name default_lit (unbox_from_dynamic arg_name typ)
+    (match typ with
+    | TCFibEnum enum_name ->
+        writef w " _typed%d = (%s.type == FIB_TYPE_NULL) ? (%s){ ._meta = NULL, .index = -1 } : (*(%s*)fib_dynamic_to_ptr(%s));"
+          i arg_name enum_name enum_name arg_name
     | _ ->
-      writef w " _typed%d = %s;" i (unbox_from_dynamic arg_name typ));
+      (match default_opt with
+      | Some default_lit when typ <> TCFibDynamic ->
+        writef w " _typed%d = (%s.type == FIB_TYPE_NULL) ? %s : %s;"
+          i arg_name default_lit (unbox_from_dynamic arg_name typ)
+      | _ ->
+        writef w " _typed%d = %s;" i (unbox_from_dynamic arg_name typ))
+    );
     newline w
   ) thunk.mth_args;
   (* Call the typed thunk *)

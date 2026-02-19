@@ -1,4 +1,4 @@
-#if sys
+#if (sys && !fiberus)
 
 // bind & listen
 var s = new sys.net.Socket();
