@@ -614,12 +614,10 @@ class TestMisc extends Test {
 	static var nf1:Base = null;
 	static var nf2:{s:String} = null;
 
-	#if !fiberus
 	function testNullFieldAccess() {
 		eq("NPE", try nf1.s catch (e:Any) "NPE");
 		eq("NPE", try nf2.s catch (e:Any) "NPE");
 	}
-	#end
 
 	function testAbstractEnumTools() {
 		var values = AbstractEnumTools.getValues(MyEnumAbstract);

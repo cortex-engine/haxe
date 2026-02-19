@@ -2110,10 +2110,13 @@ let generate com =
 		) reg_enums;
 		spr ctx "\n"
 	end;
-	(* Register dynamic iterator factory if ArrayIterator was compiled *)
+	(* Register dynamic iterator factories if ArrayIterator / ArrayKeyValueIterator were compiled *)
 	if List.mem "haxe_iterators_ArrayIterator" reg_classes then begin
 		spr ctx "\t/* 3c. Register array iterator factory for dynamic dispatch */\n";
 		spr ctx "\tfib_array_dynamic_iterator_new = (FibObject*(*)(FibArray*))haxe_iterators_ArrayIterator_new;\n\n"
+	end;
+	if List.mem "haxe_iterators_ArrayKeyValueIterator" reg_classes then begin
+		spr ctx "\tfib_array_dynamic_kv_iterator_new = (FibObject*(*)(FibArray*))haxe_iterators_ArrayKeyValueIterator_new;\n\n"
 	end;
 	(* Initialize IMap vtables for hash map extern classes *)
 	if map_vtable_content <> "" then begin

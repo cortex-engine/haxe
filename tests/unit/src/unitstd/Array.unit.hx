@@ -308,8 +308,7 @@ a.resize(0);
 a.length == 0;
 a == [];
 
-#if !fiberus
-// keyValueIterator - not yet implemented for fiberus target
+// keyValueIterator
 var a : Array<Int> = [1,2,3,5,8];
 [for (k=>v in a) k] == [0,1,2,3,4];
 [for (k=>v in a) v] == [1,2,3,5,8];
@@ -350,5 +349,4 @@ var itf : () -> KeyValueIterator<Int, Int> = a.keyValueIterator;
 var it = itf();
 a2 = [for (k=>v in it) k*v];
 a2 == [0,2,6,15,32];
-#end
 #end

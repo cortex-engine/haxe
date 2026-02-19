@@ -3938,6 +3938,10 @@ and convert_field_access ctx obj fa result_tc pos =
                    instead of stack-allocated FibArrayIterator *)
                 ("haxe_iterators_ArrayIterator_new",
                  Some (TCFibClass "haxe_iterators_ArrayIterator"))
+            | "keyValueIterator" ->
+                (* Use heap-allocated ArrayKeyValueIterator (GC object with vtable/methods) *)
+                ("haxe_iterators_ArrayKeyValueIterator_new",
+                 Some (TCFibClass "haxe_iterators_ArrayKeyValueIterator"))
             | _ -> ("fib_array_" ^ method_name, None)
           in
           let effective_ret = match override_ret with Some r -> r | None -> ret_type in
@@ -4270,8 +4274,12 @@ and convert_array_call ctx arr arr_expr args arg_exprs method_name result_tc pos
       mk_expr_pos (TCECall (TCTFunc (prefix ^ "to_string"), [arr_expr])) TCFibString pos
   
   | "keyValueIterator" ->
-      (* For now, fall through to generic - will need runtime support *)
-      mk_expr_pos (TCECall (TCTMethod ("Array", ident method_name), arr_expr :: arg_exprs)) result_tc pos
+      (* Use heap-allocated haxe_iterators_ArrayKeyValueIterator (proper GC object with vtable)
+         same pattern as iterator() above *)
+      let iter_tc = TCFibClass "haxe_iterators_ArrayKeyValueIterator" in
+      let call = mk_expr_pos (TCECall (TCTFunc "haxe_iterators_ArrayKeyValueIterator_new", [arr_expr])) iter_tc pos in
+      if result_tc <> iter_tc then coerce_to_type call result_tc
+      else call
   
   | _ ->
       (* Fallback to generic Array_method call *)

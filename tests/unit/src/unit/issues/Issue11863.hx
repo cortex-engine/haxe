@@ -1,6 +1,5 @@
 package unit.issues;
 
-#if !fiberus
 private enum E {
 	C(r:R);
 }
@@ -8,10 +7,8 @@ private enum E {
 private typedef R = {
 	f:Null<E>
 }
-#end
 
 class Issue11863 extends Test {
-	#if !fiberus
 	function checkIdentity(e:E) {
 		switch (e) {
 			case C(r1):
@@ -30,5 +27,4 @@ class Issue11863 extends Test {
 		var e2 = haxe.runtime.Copy.copy(e);
 		t(checkIdentity(e2));
 	}
-	#end
 }

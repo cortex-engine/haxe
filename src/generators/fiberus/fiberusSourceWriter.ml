@@ -179,13 +179,13 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
   (* Variables & Fields *)
   | TCELocal name -> write w name
   | TCEStatic (cls, field) -> writef w "%s_%s" cls field
-  | TCEField (obj, field) -> write_expr w obj; writef w "->%s" field
-  | TCEArrow (obj, field) -> write_expr w obj; writef w "->%s" field
+  | TCEField (obj, field) -> write w "fib_null_check("; write_expr w obj; writef w ")->%s" field
+  | TCEArrow (obj, field) -> write w "fib_null_check("; write_expr w obj; writef w ")->%s" field
   | TCEDot (obj, field) -> write_expr w obj; writef w ".%s" field
   | TCEDeref e -> write w "(*"; write_expr w e; write w ")"
   | TCEAddrOf e -> write w "(&"; write_expr w e; write w ")"
   | TCEParentField (obj, parent_type, field) ->
-      writef w "((%s*)(" parent_type;
+      writef w "((%s*)fib_null_check(" parent_type;
       write_expr w obj;
       writef w "))->%s" field
   
@@ -327,7 +327,7 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
            Add null check to avoid SIGSEGV on null function calls. *)
         write w "({ FibClosure* _fc = (FibClosure*)(";
         write_expr w closure;
-        write w "); if (__builtin_expect(!_fc, 0)) fib_throw(fib_dynamic_string(fib_string_new(\"Cannot call null function\")));";
+        write w "); if (__builtin_expect(!_fc, 0)) { fib_exception_begin(); fib_throw(fib_dynamic_string(fib_string_new(\"Cannot call null function\"))); }";
         writef w " ((%s_fc->%s)(_fc" cast (if use_dynamic then "fn_dynamic" else "fn");
         List.iter2 (fun arg arg_type ->
           write w ", ";
@@ -340,7 +340,7 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
            Add null check to avoid SIGSEGV on null function calls. *)
         write w "({ FibClosure* _fc = (FibClosure*)(";
         write_expr w closure;
-        write w "); if (__builtin_expect(!_fc, 0)) fib_throw(fib_dynamic_string(fib_string_new(\"Cannot call null function\")));";
+        write w "); if (__builtin_expect(!_fc, 0)) { fib_exception_begin(); fib_throw(fib_dynamic_string(fib_string_new(\"Cannot call null function\"))); }";
         writef w " ((%s_fc->%s)(_fc" cast (if use_dynamic then "fn_dynamic" else "fn");
         List.iter2 (fun arg arg_type ->
           write w ", ";
