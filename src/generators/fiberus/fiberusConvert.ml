@@ -279,11 +279,14 @@ let coerce_to_type expr target_tc =
       else if (expr.ctype = TCFloat64 || expr.ctype = TCFloat32) && (target_tc = TCInt32 || target_tc = TCInt64) then
         (* Numeric truncation: Float -> Int *)
         mk_expr (TCECast (target_tc, expr)) target_tc
-      else match expr.ctype, target_tc with
-      | TCFibClass src_name, TCFibClass tgt_name when src_name <> tgt_name ->
-        (* Class/interface pointer cast (e.g., concrete class to interface) *)
-        mk_expr (TCECast (target_tc, expr)) target_tc
-      | TCFibArray src_kind, TCFibArray tgt_kind when src_kind <> tgt_kind ->
+	  else match expr.ctype, target_tc with
+	  | TCFibClass src_name, TCFibClass tgt_name when src_name <> tgt_name ->
+		(* Class/interface pointer cast (e.g., concrete class to interface) *)
+		mk_expr (TCECast (target_tc, expr)) target_tc
+	  | (TCFibIntMap | TCFibStringMap | TCFibInt64Map | TCFibObjectMap), TCFibClass _ ->
+		(* Map object to interface/class pointer cast (e.g., IntMap to IMap) *)
+		mk_expr (TCECast (target_tc, expr)) target_tc
+	  | TCFibArray src_kind, TCFibArray tgt_kind when src_kind <> tgt_kind ->
         if src_kind = TCArrGeneric && tgt_kind <> TCArrGeneric then
           (* Generic -> Specialized: must convert elements (FibDynamic -> typed).
              This happens when generic functions like Lambda.array return FibArray
@@ -2673,25 +2676,62 @@ and convert_binop_expr ctx op e1 e2 result_tc pos =
           gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
       end
   
-  (* Boolean operations - extract FibDynamic to bool *)
+  (* Boolean operations - extract FibDynamic to bool.
+   *
+   * When the RHS has pending_stmts (temp var declarations from field access
+   * chains, etc.), we CANNOT hoist them before the expression because that
+   * breaks short-circuit evaluation. For example:
+   *
+   *   if (info.schema != null && info.schema.hide == true) ...
+   *
+   * Naively hoisting both sides produces:
+   *   tmp1 = fib_field_get(info, "schema");
+   *   tmp2 = fib_field_get(tmp1, "hide");  // NPE when schema is null!
+   *   if (!is_null(tmp1) && to_bool(tmp2)) ...
+   *
+   * Instead, when e2 has pending_stmts, we lower to:
+   *   bool _tmp = false;        (or true for OpBoolOr)
+   *   <e1 pending_stmts>
+   *   if (e1) {                 (or if (!e1) for OpBoolOr)
+   *       <e2 pending_stmts>
+   *       _tmp = e2;
+   *   }
+   *   // use _tmp
+   *
+   * This follows the same pattern as the ternary lowering (see TIf above). *)
   | (OpBoolAnd | OpBoolOr) ->
       let e1_expr = convert_expr ctx e1 in
       let e2_expr = convert_expr ctx e2 in
-      if e1_expr.ctype = TCFibDynamic || e2_expr.ctype = TCFibDynamic then begin
-        let e1_ex = extract_fib_dynamic e1_expr TCBool in
-        let e2_ex = extract_fib_dynamic e2_expr TCBool in
-        let c_op = convert_binop op in
-        let result = mk_expr_pos (TCEBinop (c_op, e1_ex, e2_ex)) TCBool pos in
-        (* Propagate pending_stmts from both operands *)
-        { result with 
-          pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+      (* Prepare bool-coerced versions for the expression value *)
+      let e1_bool = if e1_expr.ctype = TCFibDynamic then extract_fib_dynamic e1_expr TCBool else e1_expr in
+      let e2_bool = if e2_expr.ctype = TCFibDynamic then extract_fib_dynamic e2_expr TCBool else e2_expr in
+      if e2_expr.pending_stmts <> [] then begin
+        (* RHS has pending_stmts -- must lower to if-statement form *)
+        let tmp = ctx.temp_counter in
+        ctx.temp_counter <- ctx.temp_counter + 1;
+        let tmp_name = Printf.sprintf "_gc_tmp%d" tmp in
+        (* Default value: false for &&, true for || *)
+        let default_val = match op with OpBoolAnd -> false | _ -> true in
+        let tmp_decl = TCSVar { vd_name = tmp_name; vd_type = TCBool; vd_init = Some (mk_expr (TCEBool default_val) TCBool); vd_static = false; vd_const = false; vd_volatile = false } in
+        (* Condition: e1 for &&, !e1 for || *)
+        let cond = match op with
+          | OpBoolAnd -> { e1_bool with pending_stmts = [] }
+          | _ -> mk_expr (TCEUnop (TCUNot, { e1_bool with pending_stmts = [] })) TCBool
+        in
+        (* Assignment inside the branch: _tmp = e2 *)
+        let assign = TCSExpr (mk_expr (TCEAssign (mk_expr (TCELocal tmp_name) TCBool, { e2_bool with pending_stmts = [] })) TCBool) in
+        let branch_stmts = e2_expr.pending_stmts @ [assign] in
+        let if_stmt = TCSIf (cond, branch_stmts, None) in
+        let all_stmts = e1_expr.pending_stmts @ [tmp_decl; if_stmt] in
+        { (mk_expr_pos (TCELocal tmp_name) TCBool pos) with
+          pending_stmts = all_stmts;
           gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
       end else begin
+        (* Simple case: no pending_stmts on RHS, safe to use C &&/|| directly *)
         let c_op = convert_binop op in
-        let result = mk_expr_pos (TCEBinop (c_op, e1_expr, e2_expr)) TCBool pos in
-        (* Propagate pending_stmts from both operands *)
+        let result = mk_expr_pos (TCEBinop (c_op, e1_bool, e2_bool)) TCBool pos in
         { result with 
-          pending_stmts = e1_expr.pending_stmts @ e2_expr.pending_stmts @ result.pending_stmts;
+          pending_stmts = e1_expr.pending_stmts @ result.pending_stmts;
           gc_roots = e1_expr.gc_roots + e2_expr.gc_roots }
       end
   
@@ -3971,22 +4011,31 @@ and convert_field_access ctx obj fa result_tc pos =
             | FiberusBuiltins.MapInt64 -> "FibInt64Map"
             | FiberusBuiltins.MapObject -> "FibObjectMap"
           in
-          let override_ret = match method_name with
-            | "keys" -> Some (match kind with
-                | FiberusBuiltins.MapInt -> TCRaw "FibIntMapKeyIterator*"
-                | FiberusBuiltins.MapString -> TCRaw "FibStringMapKeyIterator*"
-                | FiberusBuiltins.MapInt64 -> TCRaw "FibInt64MapKeyIterator*"
-                | FiberusBuiltins.MapObject -> TCRaw "FibObjectMapKeyIterator*")
-            | "iterator" -> Some (match kind with
-                | FiberusBuiltins.MapInt -> TCRaw "FibIntMapValueIterator*"
-                | FiberusBuiltins.MapString -> TCRaw "FibStringMapValueIterator*"
-                | FiberusBuiltins.MapInt64 -> TCRaw "FibInt64MapValueIterator*"
-                | FiberusBuiltins.MapObject -> TCRaw "FibObjectMapValueIterator*")
-            | _ -> None
-          in
-          let effective_ret = match override_ret with Some r -> r | None -> ret_type in
-          let this_cast = Printf.sprintf "(%s*)fib_dynamic_to_object(_c->captures[0])" c_type in
-          (Some (prefix ^ method_name), Some this_cast, effective_ret)
+			let override_ret = match method_name with
+				| "keys" -> Some (match kind with
+					| FiberusBuiltins.MapInt -> TCRaw "FibIntMapKeyIterator*"
+					| FiberusBuiltins.MapString -> TCRaw "FibStringMapKeyIterator*"
+					| FiberusBuiltins.MapInt64 -> TCRaw "FibInt64MapKeyIterator*"
+					| FiberusBuiltins.MapObject -> TCRaw "FibObjectMapKeyIterator*")
+				| "iterator" -> Some (match kind with
+					| FiberusBuiltins.MapInt -> TCRaw "FibIntMapValueIterator*"
+					| FiberusBuiltins.MapString -> TCRaw "FibStringMapValueIterator*"
+					| FiberusBuiltins.MapInt64 -> TCRaw "FibInt64MapValueIterator*"
+					| FiberusBuiltins.MapObject -> TCRaw "FibObjectMapValueIterator*")
+				| "keyValueIterator" -> Some (TCFibClass "haxe_iterators_MapKeyValueIterator")
+				| _ -> None
+			in
+			let effective_ret = match override_ret with Some r -> r | None -> ret_type in
+			let this_cast = Printf.sprintf "(%s*)fib_dynamic_to_object(_c->captures[0])" c_type in
+			let this_expr = match method_name with
+				| "keyValueIterator" -> Some "fib_dynamic_object((FibObject*)fib_dynamic_to_object(_c->captures[0]))"
+				| _ -> Some this_cast
+			in
+			let c_func = match method_name with
+				| "keyValueIterator" -> Some "haxe_iterators_MapKeyValueIterator_new"
+				| _ -> Some (prefix ^ method_name)
+			in
+			(c_func, this_expr, effective_ret)
         | None ->
           (None, None, ret_type)
       in
@@ -4468,14 +4517,20 @@ and convert_map_call ctx map_expr args arg_exprs kind method_name value_type res
       in
       mk_expr_pos (TCECall (TCTFunc (prefix ^ "keys"), [map_expr])) iter_type pos
   
-  | "iterator" ->
-      let iter_type = match kind with
-        | FiberusBuiltins.MapInt -> TCRaw "FibIntMapValueIterator*"
-        | FiberusBuiltins.MapString -> TCRaw "FibStringMapValueIterator*"
-        | FiberusBuiltins.MapInt64 -> TCRaw "FibInt64MapValueIterator*"
-        | FiberusBuiltins.MapObject -> TCRaw "FibObjectMapValueIterator*"
-      in
-      mk_expr_pos (TCECall (TCTFunc (prefix ^ "iterator"), [map_expr])) iter_type pos
+	| "iterator" ->
+		let iter_type = match kind with
+			| FiberusBuiltins.MapInt -> TCRaw "FibIntMapValueIterator*"
+			| FiberusBuiltins.MapString -> TCRaw "FibStringMapValueIterator*"
+			| FiberusBuiltins.MapInt64 -> TCRaw "FibInt64MapValueIterator*"
+			| FiberusBuiltins.MapObject -> TCRaw "FibObjectMapValueIterator*"
+		in
+		mk_expr_pos (TCECall (TCTFunc (prefix ^ "iterator"), [map_expr])) iter_type pos
+
+	| "keyValueIterator" ->
+		let iter_tc = TCFibClass "haxe_iterators_MapKeyValueIterator" in
+		let map_dyn = coerce_to_type map_expr TCFibDynamic in
+		let call = mk_expr_pos (TCECall (TCTFunc "haxe_iterators_MapKeyValueIterator_new", [map_dyn])) iter_tc pos in
+		if result_tc <> iter_tc then coerce_to_type call result_tc else call
   
   | "copy" ->
       mk_expr_pos (TCECall (TCTFunc (prefix ^ "copy"), [map_expr])) result_tc pos
@@ -6061,10 +6116,23 @@ and convert_tvar_stmt (ctx : conv_ctx) (v : tvar) (init_opt : texpr option) : tc
       (* Normal heap allocation path *)
       match init_opt with
       | None ->
-          (* No initializer - just declare the variable *)
-          let var_stmt = TCSVar { vd_name = name; vd_type = vtype; vd_init = None; vd_static = false; vd_const = false; vd_volatile = false } in
-          let gc_stmts = gc_push_if_needed ctx name vtype in
-          var_stmt :: gc_stmts
+          if needs_gc_root_tc vtype && ctx.in_gc_frame then begin
+            (* GCFrame mode, no initializer: just register the slot in the
+               frame struct.  The frame declaration already initializes it to
+               NULL/{0}, so we need neither a local variable nor an assignment.
+               Emitting the bare local would trigger -Wunused-variable, and
+               assigning it to _gc would trigger -Wuninitialized. *)
+            gc_frame_add_slot ctx name vtype;
+            []
+          end else begin
+            (* Non-GC type or legacy mode: emit the local variable declaration *)
+            let var_stmt = TCSVar { vd_name = name; vd_type = vtype; vd_init = None; vd_static = false; vd_const = false; vd_volatile = false } in
+            if needs_gc_root_tc vtype then begin
+              ctx.gc_local_count <- ctx.gc_local_count + 1;
+              var_stmt :: [TCSGCPush (mk_expr (TCELocal name) vtype)]
+            end else
+              [var_stmt]
+          end
       | Some init_e ->
           (* Convert the initializer expression *)
           let cexpr = convert_expr ctx init_e in
@@ -7009,6 +7077,12 @@ let convert_constructor ctx (c : tclass) =
             ctx.closure_counter <- init_body_ctx.closure_counter;
             ctx.spawn_counter <- init_body_ctx.spawn_counter;
             let init_prologue = ref [TCSGCCtx] in
+            (* Suppress -Wunused-parameter for scalar (non-GC) constructor params
+               that may not be referenced in the body (mirrors convert_class_method). *)
+            List.iter (fun arg ->
+              if not (Hashtbl.mem frame_rooted_vars arg.fa_name) then
+                init_prologue := !init_prologue @ [TCSExpr (mk_expr (TCECast (TCVoid, mk_expr (TCELocal arg.fa_name) arg.fa_type)) TCVoid)]
+            ) tc_args;
             let init_epilogue = ref [] in
             let frame_info = gc_frame_build_info_with_inits init_body_ctx !param_inits in
             let has_gc_slots = frame_info.gfi_slots <> [] in

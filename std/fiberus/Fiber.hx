@@ -140,13 +140,3 @@ extern class Fiber {
 	 */
 	public static function spawnMany(count:Int, body:(index:Int, args:Dynamic) -> Void, args:Dynamic):Int;
 }
-
-/**
- * Fiber state enumeration.
- */
-enum FiberState {
-	Ready;
-	Running;
-	Waiting;
-	Dead;
-}

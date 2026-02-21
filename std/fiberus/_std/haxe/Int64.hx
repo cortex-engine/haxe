@@ -16,9 +16,10 @@ abstract Int64(__Int64) from __Int64 to __Int64 {
 
 	public static inline function make(high:Int32, low:Int32):Int64 {
 		// Combine two 32-bit ints into one 64-bit int.
-		// Use __fiberus__ to emit the uint32_t cast at C level, preventing
-		// the Haxe optimizer from folding away the zero-extension mask.
-		return untyped __fiberus__("(((int64_t)", high, " << 32) | (int64_t)(uint32_t)", low, ")");
+		// Cast both halves to uint32_t then uint64_t before shifting to avoid
+		// -Wshift-negative-value when high is negative.  The final (int64_t)
+		// cast reinterprets the unsigned result as signed.
+		return untyped __fiberus__("(int64_t)(((uint64_t)(uint32_t)", high, " << 32) | (uint64_t)(uint32_t)", low, ")");
 	}
 
 	private inline function new(x:__Int64)

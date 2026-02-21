@@ -71,8 +71,11 @@ let analyze_escapes (f : tfunc) : (int, tclass) Hashtbl.t =
         let v_tc = FiberusTypeUtils.tc_type_of (follow v.v_type) in
         if not (Hashtbl.mem escaped_vars v.v_id) && v_tc <> FiberusAst.TCFibDynamic then
           Hashtbl.replace stack_vars v.v_id c;
-        (* Analyze constructor arguments - they might reference tracked vars *)
-        List.iter analyze args
+        (* Constructor arguments escape - they're stored in the new object's fields *)
+        List.iter (fun arg ->
+          mark_if_tracked arg;
+          analyze arg
+        ) args
     
     (* Reassignment to a tracked variable - the NEW value might escape *)
     | TBinop (OpAssign, { eexpr = TLocal v }, ({ eexpr = TNew (c, _, args) })) 
@@ -81,7 +84,11 @@ let analyze_escapes (f : tfunc) : (int, tclass) Hashtbl.t =
         let v_tc = FiberusTypeUtils.tc_type_of (follow v.v_type) in
         if not (Hashtbl.mem escaped_vars v.v_id) && v_tc <> FiberusAst.TCFibDynamic then
           Hashtbl.replace stack_vars v.v_id c;
-        List.iter analyze args
+        (* Constructor arguments escape - they're stored in the new object's fields *)
+        List.iter (fun arg ->
+          mark_if_tracked arg;
+          analyze arg
+        ) args
     
     (* Assignment to field - RHS escapes *)
     | TBinop (OpAssign, { eexpr = TField _ }, rhs) ->
@@ -135,6 +142,13 @@ let analyze_escapes (f : tfunc) : (int, tclass) Hashtbl.t =
     | TArray (arr, idx) ->
         analyze arr;
         analyze idx
+    
+    (* Constructor call in other contexts - arguments escape *)
+    | TNew (_, _, args) ->
+        List.iter (fun arg ->
+          mark_if_tracked arg;
+          analyze arg
+        ) args
     
     (* Default: recurse into sub-expressions *)
     | _ ->

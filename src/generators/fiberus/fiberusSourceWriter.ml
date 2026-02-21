@@ -541,7 +541,10 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
       write_expr w rhs;
       write w ")"
   | TCEStringLength str ->
-      write w "fib_string_length(";
+      (* Cast to int32_t: fib_string_length returns size_t (unsigned) but Haxe
+         String.length is Int (signed).  Without the cast, comparisons with
+         int32_t variables trigger -Wsign-compare.  Matches TCEArrayLength. *)
+      write w "(int32_t)fib_string_length(";
       write_expr w str;
       write w ")"
   
@@ -608,7 +611,11 @@ and write_expr_kind (w : writer) (ek : tc_expr_kind) (t : tc_type) : unit =
           | TCBool -> writef w "fib_dynamic_bool(%s)" capture_expr
           | TCFibString -> writef w "fib_dynamic_string(%s)" capture_expr
           | TCFibDynamic -> write w capture_expr
-          | _ -> writef w "(FibDynamic){.type=FIB_TYPE_OBJECT, .data.ptrVal=%s}" capture_expr
+          (* Use fib_dynamic_object() instead of a compound literal to avoid
+             -Wclobbered when the closure creation sits inside a setjmp scope
+             (try/catch).  Compound literals have automatic storage that GCC
+             warns may be clobbered by longjmp. *)
+          | _ -> writef w "fib_dynamic_object((FibObject*)%s)" capture_expr
         ) cc.cc_captures;
         write w ")"
       end
@@ -1366,7 +1373,7 @@ let box_to_dynamic (var_name : string) (t : tc_type) : string =
   | TCFibDynamic -> var_name  (* Already a FibDynamic, pass through *)
   | TCFibEnum name -> Printf.sprintf "fib_dynamic_enum_val(%s, %s)" name var_name
   | TCFibArray _ -> Printf.sprintf "fib_dynamic_array((FibArray*)%s)" var_name
-  | _ -> Printf.sprintf "(FibDynamic){.type=FIB_TYPE_OBJECT, .data.ptrVal=%s}" var_name
+  | _ -> Printf.sprintf "fib_dynamic_object((FibObject*)%s)" var_name
 
 (* Helper: get C expression for unboxing FibDynamic to typed value *)
 let unbox_from_dynamic (arg_name : string) (t : tc_type) : string =

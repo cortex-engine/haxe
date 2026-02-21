@@ -1632,8 +1632,11 @@ let gen_map_imap_vtables vtable_ctx =
 					bf "\tfib_%s_map_clear((%s*)self);\n" prefix c_struct;
 					b "}\n"
 				| "keyValueIterator" ->
-					(* Not implemented in hash map runtime - skip *)
-					()
+					(* FibDynamic wrapper_keyValueIterator(void* self) -- returns MapKeyValueIterator boxed as object *)
+					bf "static FibDynamic _fib_imap_%s_keyValueIterator(void* self) {\n" prefix;
+					b "\tFibDynamic self_dyn = fib_dynamic_object((FibObject*)self);\n";
+					b "\treturn (FibDynamic){.type=FIB_TYPE_OBJECT, .data.ptrVal=haxe_iterators_MapKeyValueIterator_new(self_dyn)};\n";
+					b "}\n"
 				| "size" ->
 					(* FibDynamic wrapper_size(void* self) -- returns int boxed *)
 					bf "static FibDynamic _fib_imap_%s_size(void* self) {\n" prefix;
@@ -1651,9 +1654,8 @@ let gen_map_imap_vtables vtable_ctx =
 				let entry = List.find_opt (fun (_, slot) -> slot = i) imap_slots in
 				match entry with
 				| Some (mname, _) ->
-					(* Check if this method has a wrapper (skip keyValueIterator) *)
+					(* Check if this method has a wrapper *)
 					let has_wrapper = match mname with
-						| "keyValueIterator" -> false
 						| _ -> true
 					in
 					if has_wrapper then
