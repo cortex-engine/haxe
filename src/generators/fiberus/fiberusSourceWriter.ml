@@ -85,6 +85,10 @@ let with_block (w : writer) (f : unit -> unit) : unit =
   dedent w;
   write w "}"
 
+(* Write raw string directly to buffer (no indentation, used for pre-formatted blocks) *)
+let write_raw (w : writer) (s : string) : unit =
+  Buffer.add_string w.buf s
+
 (* ============================================================================
  * Type Emission
  * ============================================================================ *)
@@ -1379,8 +1383,13 @@ let box_to_dynamic (var_name : string) (t : tc_type) : string =
 let unbox_from_dynamic (arg_name : string) (t : tc_type) : string =
   match t with
   | TCInt32 -> Printf.sprintf "fib_dynamic_to_int(%s)" arg_name
+  | TCInt8 | TCInt16 | TCUInt8 | TCUInt16 ->
+    Printf.sprintf "(%s)fib_dynamic_to_int(%s)" (tc_type_to_string t) arg_name
   | TCInt64 -> Printf.sprintf "fib_dynamic_to_int64(%s)" arg_name
+  | TCUInt32 | TCUInt64 | TCSizeT ->
+    Printf.sprintf "(%s)fib_dynamic_to_int64(%s)" (tc_type_to_string t) arg_name
   | TCFloat64 -> Printf.sprintf "fib_dynamic_to_float(%s)" arg_name
+  | TCFloat32 -> Printf.sprintf "(float)fib_dynamic_to_float(%s)" arg_name
   | TCBool -> Printf.sprintf "fib_dynamic_to_bool(%s)" arg_name
   | TCFibString -> Printf.sprintf "fib_dynamic_coerce_string(%s)" arg_name
   | TCFibClosure -> Printf.sprintf "(FibClosure*)fib_dynamic_to_object(%s)" arg_name
@@ -1388,6 +1397,8 @@ let unbox_from_dynamic (arg_name : string) (t : tc_type) : string =
   | TCFibEnum name -> Printf.sprintf "*(%s*)fib_dynamic_to_ptr(%s)" name arg_name
   | TCFibArray TCArrInt -> Printf.sprintf "fib_array_to_int_array((FibArray*)fib_dynamic_to_array(%s))" arg_name
   | TCFibArray _ -> Printf.sprintf "(FibArray*)fib_dynamic_to_array(%s)" arg_name
+  | TCPointer _ | TCConstPointer _ | TCRaw _ | TCFibClass _ | TCFibObject _ ->
+    Printf.sprintf "(%s)fib_dynamic_to_object(%s)" (tc_type_to_string t) arg_name
   | t -> Printf.sprintf "(%s)fib_dynamic_to_object(%s)" (tc_type_to_string t) arg_name
 
 (* Generate forward declarations for a closure *)

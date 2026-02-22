@@ -109,6 +109,144 @@ let exc_pop_stmts n =
 (* Global counters - simple and avoids all context propagation issues *)
 let global_closure_counter = ref 0
 let global_spawn_counter = ref 0
+let global_cb_arg_counter = ref 0
+
+(* ============================================================================
+ * Callback Trampoline Generation
+ *
+ * When an extern method takes a function-typed parameter (callback), the
+ * codegen generates a static C trampoline function + a global FibCallbackCtx*
+ * variable. At the call site, the Haxe closure is wrapped in a FibCallbackCtx
+ * and stored in the global; the trampoline function pointer is passed to C.
+ *
+ * The trampoline exits the GC-free zone, marshals C args to FibDynamic,
+ * invokes the Haxe closure via fib_callback_invoke, then re-enters the zone.
+ * ============================================================================ *)
+
+(* Generated trampoline: a raw C code string emitted at file scope *)
+type callback_trampoline = {
+  cb_global_decl: string;     (* e.g. "static FibCallbackCtx* _cb_init_0 = NULL;" *)
+  cb_trampoline_code: string; (* Full trampoline function definition *)
+  cb_trampoline_name: string; (* Name for referencing at call site *)
+  cb_global_name: string;     (* Name of the global FibCallbackCtx* *)
+}
+
+(* Global table: trampoline_name -> trampoline definition. Prevents duplicates. *)
+let global_callback_trampolines : (string, callback_trampoline) Hashtbl.t = Hashtbl.create 16
+
+(* Map a Haxe tc_type to the C type used in callback trampoline parameters.
+   This differs from normal tc_type_to_string because strings come as const char*
+   from native C code, not FibString*. *)
+let cb_param_c_type tc =
+  match tc with
+  | TCFibString -> "const char*"
+  | TCFibClosure -> "void*"  (* unlikely but safe *)
+  | TCFibDynamic -> "void*"  (* shouldn't happen in extern callbacks *)
+  | _ -> tc_type_to_string tc
+
+(* Map a Haxe tc_type to the C type used for callback trampoline return values. *)
+let cb_ret_c_type tc =
+  match tc with
+  | TCFibString -> "const char*"
+  | _ -> tc_type_to_string tc
+
+(* Generate the fib_extern_from_* marshalling expression to convert a C param
+   to FibDynamic for callback invocation. *)
+let cb_marshal_to_dynamic param_name tc =
+  match tc with
+  | TCBool -> Printf.sprintf "fib_extern_from_bool(%s)" param_name
+  | TCInt8 | TCInt16 | TCInt32 | TCUInt8 | TCUInt16 -> Printf.sprintf "fib_extern_from_int(%s)" param_name
+  | TCInt64 | TCUInt32 | TCUInt64 -> Printf.sprintf "fib_extern_from_int64(%s)" param_name
+  | TCSizeT -> Printf.sprintf "fib_extern_from_int64((int64_t)%s)" param_name
+  | TCFloat64 -> Printf.sprintf "fib_extern_from_float(%s)" param_name
+  | TCFloat32 -> Printf.sprintf "fib_extern_from_float((double)%s)" param_name
+  | TCFibString -> Printf.sprintf "fib_extern_from_string(%s)" param_name
+  | TCPointer _ | TCRaw _ | TCFibClass _ | TCFibObject _ ->
+    Printf.sprintf "fib_extern_from_ptr(%s)" param_name
+  | TCConstPointer _ ->
+    Printf.sprintf "fib_extern_from_ptr((void*)%s)" param_name
+  | _ -> Printf.sprintf "fib_extern_from_ptr((void*)%s)" param_name
+
+(* Generate a callback trampoline for an extern method's function-typed parameter.
+   native_name: the C function name (from @:native)
+   param_idx: which parameter is the callback
+   param_types: the Haxe function type's parameter types (tc_type list)
+   ret_type: the Haxe function type's return type (tc_type) *)
+let gen_callback_trampoline native_name param_idx param_types ret_type =
+  let trampoline_name = Printf.sprintf "_trampoline_%s_%d" native_name param_idx in
+  let global_name = Printf.sprintf "_cb_%s_%d" native_name param_idx in
+  (* Check if already generated *)
+  if Hashtbl.mem global_callback_trampolines trampoline_name then
+    Hashtbl.find global_callback_trampolines trampoline_name
+  else begin
+    let n_params = List.length param_types in
+    (* Generate parameter list for the trampoline signature *)
+    let param_decls = List.mapi (fun i tc ->
+      Printf.sprintf "%s _p%d" (cb_param_c_type tc) i
+    ) param_types in
+    let param_list = String.concat ", " (if param_decls = [] then ["void"] else param_decls) in
+    let ret_c = cb_ret_c_type ret_type in
+    let is_void = ret_type = TCVoid in
+    (* Generate marshalling lines *)
+    let marshal_lines = List.mapi (fun i tc ->
+      Printf.sprintf "    _args[%d] = %s;" i (cb_marshal_to_dynamic (Printf.sprintf "_p%d" i) tc)
+    ) param_types in
+    (* Build the trampoline function body *)
+    let body_lines = [
+      Printf.sprintf "static %s %s(%s) {" ret_c trampoline_name param_list;
+    ] @ (if n_params > 0 then [
+      Printf.sprintf "    FibDynamic _args[%d];" n_params;
+    ] else []) @ marshal_lines @ [
+      (if is_void then
+        Printf.sprintf "    fib_callback_invoke(%s, %s, %d);"
+          global_name (if n_params > 0 then "_args" else "NULL") n_params
+      else
+        Printf.sprintf "    FibDynamic _result = fib_callback_invoke(%s, %s, %d);"
+          global_name (if n_params > 0 then "_args" else "NULL") n_params);
+    ] @ (if not is_void then [
+      (* Marshal return value back to C type *)
+      (match ret_type with
+       | TCBool -> "    return fib_extern_to_bool(_result);"
+       | TCInt8 | TCInt16 | TCInt32 | TCUInt8 | TCUInt16 -> "    return fib_extern_to_int(_result);"
+       | TCInt64 | TCUInt32 | TCUInt64 -> "    return fib_extern_to_int64(_result);"
+       | TCFloat64 | TCFloat32 -> "    return (float)fib_extern_to_float(_result);"
+       | TCFibString -> "    return fib_extern_to_cstring(_result);"
+       | _ -> "    return fib_extern_to_ptr(_result);")
+    ] else []) @ [
+      "}";
+    ] in
+    let trampoline_code = String.concat "\n" body_lines in
+    let global_decl = Printf.sprintf "static FibCallbackCtx* %s = NULL;" global_name in
+    let trampoline = {
+      cb_global_decl = global_decl;
+      cb_trampoline_code = trampoline_code;
+      cb_global_name = global_name;
+      cb_trampoline_name = trampoline_name;
+    } in
+    Hashtbl.replace global_callback_trampolines trampoline_name trampoline;
+    trampoline
+  end
+
+(* Get all generated trampolines as a raw C string for emission *)
+let get_callback_trampolines_code () =
+  let trampolines = Hashtbl.fold (fun _name t acc -> t :: acc) global_callback_trampolines [] in
+  if trampolines = [] then ""
+  else begin
+    let buf = Buffer.create 1024 in
+    Buffer.add_string buf "\n/* ===== Callback trampolines (generated) ===== */\n";
+    List.iter (fun t ->
+      Buffer.add_string buf t.cb_global_decl;
+      Buffer.add_char buf '\n';
+      Buffer.add_string buf t.cb_trampoline_code;
+      Buffer.add_char buf '\n';
+      Buffer.add_char buf '\n';
+    ) trampolines;
+    Buffer.contents buf
+  end
+
+(* Clear trampolines (called per class/file) *)
+let clear_callback_trampolines () =
+  Hashtbl.clear global_callback_trampolines
 
 (* Reset counters at start of each class/file *)
 let reset_counters () =
@@ -3789,8 +3927,20 @@ and convert_field_access ctx obj fa result_tc pos =
           else
             raw
       | _ ->
-          (* Regular static field/variable access *)
-          mk_expr_pos (TCEStatic (class_name, ident cf.cf_name)) result_tc pos)
+          (* Enum abstract values with @:native: emit the raw C constant name.
+             Enum abstracts generate an impl class (KAbstractImpl) with static fields
+             for each constructor. When the field has @:native("YGDirectionLTR"), we
+             emit that name directly instead of the mangled Haxe field name. *)
+          (match c.cl_kind with
+          | KAbstractImpl _ when Meta.has Meta.Native cf.cf_meta ->
+              let native_name = match get_meta_string cf.cf_meta Meta.Native with
+                | Some name -> name
+                | None -> ident cf.cf_name
+              in
+              mk_expr_pos (TCERaw native_name) result_tc pos
+          | _ ->
+              (* Regular static field/variable access *)
+              mk_expr_pos (TCEStatic (class_name, ident cf.cf_name)) result_tc pos))
   
   (* Instance field - special cases for Array.length and String.length *)
   | FInstance (c, _, cf) ->
@@ -5483,6 +5633,130 @@ and convert_call ctx callee args result_tc pos =
        let dyn_call = mk_expr_pos (TCEDynamicCall { closure = dyn_var; args = boxed_args }) TCFibDynamic pos in
        let call = { dyn_call with pending_stmts = args_pending @ dyn_call.pending_stmts } in
        if result_tc <> TCFibDynamic then coerce_to_type call result_tc else call
+
+   (* Extern static method call with @:native — direct C function call.
+      This only triggers when the method itself has @:native metadata,
+      which indicates a user-defined extern mapping to a specific C function.
+      Fiberus runtime extern classes (Counter, GC, Fiber, etc.) don't use
+      @:native on methods, so they fall through to the regular TCTMethod path.
+
+      Callback handling: if any parameter has a function type (TFun), the
+      codegen generates a trampoline function + global FibCallbackCtx* and
+      replaces the closure argument with the trampoline function pointer.
+      The trampoline exits the GC-free zone, marshals C args to FibDynamic,
+      invokes the closure via fib_callback_invoke, and re-enters the zone.
+
+      When callbacks are present, @:gcBlocking is implied — the call is
+      always wrapped in enter/exit gc_free zone because the trampoline
+      expects to be called from within a gc_free zone. *)
+   | TField (_, FStatic (c, cf)) when has_class_flag c CExtern && Meta.has Meta.Native cf.cf_meta ->
+       let native_name = match get_meta_string cf.cf_meta Meta.Native with
+         | Some name -> name
+         | None -> cf.cf_name  (* shouldn't happen given the guard, but safe fallback *)
+       in
+       (* Determine return type *)
+       let ret_tc = match Type.follow cf.cf_type with
+         | Type.TFun (_, ret) -> tc_type_of ret
+         | _ -> result_tc
+       in
+       (* Get parameter Haxe types from the function signature *)
+       let haxe_param_types = match Type.follow cf.cf_type with
+         | Type.TFun (params, _) -> List.map (fun (_, _, t) -> Type.follow t) params
+         | _ -> []
+       in
+       (* Detect callback parameters: any parameter whose Haxe type is TFun *)
+       let has_callbacks = List.exists (fun t ->
+         match t with Type.TFun _ -> true | _ -> false
+       ) haxe_param_types in
+       (* Check for @:gcBlocking metadata — implied when callbacks present *)
+       let is_gc_blocking = has_callbacks || Meta.has (Meta.Custom ":gcBlocking") cf.cf_meta in
+       (* Process arguments, replacing callback closures with trampoline pointers *)
+       let callback_setup_stmts = ref [] in
+       let processed_args = List.mapi (fun i arg_expr ->
+         let haxe_t = if i < List.length haxe_param_types then
+           List.nth haxe_param_types i
+         else
+           Type.TDynamic None  (* shouldn't happen *)
+         in
+         match haxe_t with
+         | Type.TFun (cb_params, cb_ret) ->
+           (* This parameter is a callback — generate a trampoline *)
+           let cb_param_tcs = List.map (fun (_, _, t) -> tc_type_of (Type.follow t)) cb_params in
+           let cb_ret_tc = tc_type_of (Type.follow cb_ret) in
+           let trampoline = gen_callback_trampoline native_name i cb_param_tcs cb_ret_tc in
+           (* At the call site: create callback context BEFORE entering gc_free zone.
+              fib_callback_create must be called from managed code. *)
+           let create_stmt = TCSRaw (Printf.sprintf
+             "%s = fib_callback_create((FibClosure*)%s);"
+             trampoline.cb_global_name
+             (* The arg_expr is the closure expression — we need its C representation.
+                For now, emit it as a raw expression. The pending_stmts from the arg
+                are collected separately. *)
+             (match arg_expr.cexpr with
+              | TCERaw s -> s
+              | TCELocal name -> name
+               | _ ->
+                 (* For complex expressions, we need to lift them to a temp var.
+                    Use a global counter to avoid name collisions when multiple
+                    callback registrations happen in the same C function scope. *)
+                 let cb_id = !global_cb_arg_counter in
+                 global_cb_arg_counter := cb_id + 1;
+                 let tmp = Printf.sprintf "_cb_arg_%d" cb_id in
+                callback_setup_stmts := !callback_setup_stmts @ [
+                  TCSVar { vd_name = tmp; vd_type = TCFibClosure;
+                           vd_init = Some arg_expr;
+                           vd_const = false; vd_static = false; vd_volatile = false }
+                ];
+                tmp)
+           ) in
+           callback_setup_stmts := !callback_setup_stmts @ arg_expr.pending_stmts @ [create_stmt];
+           (* Replace the argument with the trampoline function pointer *)
+           mk_expr_pos (TCERaw trampoline.cb_trampoline_name)
+             (TCRaw (Printf.sprintf "void*")) pos
+          | _ ->
+            (* For non-callback args, coerce FibString* to const char* for extern C calls.
+               C functions expect const char*, not FibString*. We use fib_string_data() to extract. *)
+            if arg_expr.ctype = TCFibString then
+              mk_expr_pos (TCECall (TCTFunc "fib_string_data", [arg_expr])) (TCConstPointer TCChar) pos
+            else
+              arg_expr
+       ) arg_exprs in
+       let args_pending = collect_pending processed_args in
+       let extra_pending = !callback_setup_stmts in
+       let call_expr = mk_expr_pos (TCECall (TCTFunc native_name, processed_args)) ret_tc pos in
+       let call_expr = { call_expr with pending_stmts = args_pending @ call_expr.pending_stmts } in
+       if is_gc_blocking then begin
+         (* Wrap with GC-free zone enter/exit.
+            For non-void returns: lift the call into pending_stmts with a temp var,
+            so enter/exit bracket the call properly.
+            Callback setup (fib_callback_create) MUST happen before enter_gc_free. *)
+         let enter_stmt = TCSRaw "fib_extern_enter_gc_free();" in
+         let exit_stmt = TCSRaw "fib_extern_exit_gc_free();" in
+         if ret_tc = TCVoid then begin
+           (* void return: setup, enter, call, exit — all in pending_stmts *)
+           let call_stmt = TCSExpr call_expr in
+           let result = mk_expr_pos (TCERaw "((void)0)") TCVoid pos in
+           { result with pending_stmts = extra_pending @ call_expr.pending_stmts @ [enter_stmt; call_stmt; exit_stmt] }
+         end else begin
+           (* non-void: setup, enter, type _r = call, exit *)
+           let tmp_name = Printf.sprintf "_ext_%d" (abs (Hashtbl.hash pos)) in
+           let decl_stmt = TCSVar {
+             vd_name = tmp_name;
+             vd_type = ret_tc;
+             vd_init = Some call_expr;
+             vd_const = false;
+             vd_static = false;
+             vd_volatile = false;
+           } in
+           let result = mk_expr_pos (TCERaw tmp_name) ret_tc pos in
+           { result with pending_stmts = extra_pending @ call_expr.pending_stmts @ [enter_stmt; decl_stmt; exit_stmt] }
+         end
+       end else begin
+         let call_expr = { call_expr with pending_stmts = extra_pending @ call_expr.pending_stmts } in
+         if ret_tc <> result_tc then
+           coerce_to_type call_expr result_tc
+         else call_expr
+       end
 
    (* Static method call *)
    | TField (_, FStatic (c, cf)) ->

@@ -1047,6 +1047,12 @@ let gen_class_impl ctx c =
 		let all_decls = List.rev !decls in
 		let w = FiberusSourceWriter.create () in
 
+		(* Callback trampolines must be emitted before any code that references them *)
+		let trampoline_code = FiberusConvert.get_callback_trampolines_code () in
+		FiberusConvert.clear_callback_trampolines ();
+		if trampoline_code <> "" then
+			FiberusSourceWriter.write_raw w trampoline_code;
+
 		(* Closure/thunk forward declarations must come before main content *)
 		let method_thunks = Hashtbl.fold (fun _name thunk acc -> thunk :: acc) ctx.cast_method_thunks [] in
 		let has_closures = ctx.closures <> [] in
@@ -1245,6 +1251,8 @@ let gen_header ctx com =
 	spr ctx "#include \"thread.h\"\n";
 	spr ctx "#include \"sqlite_fib.h\"\n";
 	spr ctx "#include \"simdutf_c.h\"\n";
+	spr ctx "#include \"extern.h\"\n";
+	spr ctx "#include \"callback.h\"\n";
 	spr ctx "\n";
 
 	(* Runtime API headers - extracted from inline C to proper .h files *)
@@ -1253,6 +1261,36 @@ let gen_header ctx com =
 	spr ctx "#include \"fiber_api.h\"\n";
 	spr ctx "#include \"gc_api.h\"\n";
 	spr ctx "\n";
+
+	(* Collect and emit @:include directives from extern classes.
+	   This allows extern Haxe classes to inject #include directives for their C headers. *)
+	let extern_includes = List.fold_left (fun acc t ->
+		match t with
+		| TClassDecl c when has_class_flag c CExtern ->
+			(* Collect all @:include metadata strings from this extern class *)
+			let rec collect_includes meta acc = match meta with
+				| [] -> acc
+				| (m, [EConst (String(name,_)),_], _) :: rest when m = Meta.Include ->
+					if List.mem name acc then collect_includes rest acc
+					else collect_includes rest (name :: acc)
+				| _ :: rest -> collect_includes rest acc
+			in
+			collect_includes c.cl_meta acc
+		| _ -> acc
+	) [] com.types in
+	let extern_includes = List.rev extern_includes in
+	if extern_includes <> [] then begin
+		spr ctx "/* Extern library includes (from @:include metadata) */\n";
+		List.iter (fun inc ->
+			(* Use angle brackets if the include starts with '<', otherwise use quotes *)
+			if String.length inc > 0 && inc.[0] = '<' then
+				print ctx "#include %s" inc
+			else
+				print ctx "#include \"%s\"" inc;
+			newline ctx
+		) extern_includes;
+		spr ctx "\n"
+	end;
 
 	(* Cross-platform attribute for functions used only via function pointer *)
 	spr ctx "/* Mark static functions whose address is taken (closures) */\n";
@@ -1555,13 +1593,18 @@ let gen_header ctx com =
  * dispatch needs real function pointers. This generates bridge wrappers from the
  * erased IMap calling convention (FibDynamic keys/values) to concrete C runtime
  * functions, plus vtable arrays and an init function to patch the sentinel FibClasses. *)
-let gen_map_imap_vtables vtable_ctx =
+let gen_map_imap_vtables vtable_ctx com =
 	let imap_slots = FiberusVtable.get_imap_slots vtable_ctx in
 	if imap_slots = [] then ""  (* IMap not used in this build *)
 	else begin
 		let buf = Buffer.create 4096 in
 		let b s = Buffer.add_string buf s in
 		let bf fmt = Printf.kprintf (Buffer.add_string buf) fmt in
+		(* Check whether MapKeyValueIterator survived DCE *)
+		let has_kv_iterator = List.exists (function
+			| TClassDecl c -> c.cl_path = (["haxe";"iterators"], "MapKeyValueIterator")
+			| _ -> false
+		) com.types in
 
 		(* Find the max slot index to size the vtable arrays *)
 		let max_slot = List.fold_left (fun acc (_, slot) -> max acc slot) 0 imap_slots in
@@ -1631,13 +1674,14 @@ let gen_map_imap_vtables vtable_ctx =
 					bf "static void _fib_imap_%s_clear(void* self) {\n" prefix;
 					bf "\tfib_%s_map_clear((%s*)self);\n" prefix c_struct;
 					b "}\n"
-				| "keyValueIterator" ->
-					(* FibDynamic wrapper_keyValueIterator(void* self) -- returns MapKeyValueIterator boxed as object *)
-					bf "static FibDynamic _fib_imap_%s_keyValueIterator(void* self) {\n" prefix;
-					b "\tFibDynamic self_dyn = fib_dynamic_object((FibObject*)self);\n";
-					b "\treturn (FibDynamic){.type=FIB_TYPE_OBJECT, .data.ptrVal=haxe_iterators_MapKeyValueIterator_new(self_dyn)};\n";
-					b "}\n"
-				| "size" ->
+			| "keyValueIterator" when has_kv_iterator ->
+				(* FibDynamic wrapper_keyValueIterator(void* self) -- returns MapKeyValueIterator boxed as object *)
+				bf "static FibDynamic _fib_imap_%s_keyValueIterator(void* self) {\n" prefix;
+				b "\tFibDynamic self_dyn = fib_dynamic_object((FibObject*)self);\n";
+				b "\treturn (FibDynamic){.type=FIB_TYPE_OBJECT, .data.ptrVal=haxe_iterators_MapKeyValueIterator_new(self_dyn)};\n";
+				b "}\n"
+			| "keyValueIterator" -> () (* MapKeyValueIterator was DCE'd - skip *)
+			| "size" ->
 					(* FibDynamic wrapper_size(void* self) -- returns int boxed *)
 					bf "static FibDynamic _fib_imap_%s_size(void* self) {\n" prefix;
 					bf "\treturn fib_dynamic_int((int32_t)fib_%s_map_size((%s*)self));\n" prefix c_struct;
@@ -1654,10 +1698,11 @@ let gen_map_imap_vtables vtable_ctx =
 				let entry = List.find_opt (fun (_, slot) -> slot = i) imap_slots in
 				match entry with
 				| Some (mname, _) ->
-					(* Check if this method has a wrapper *)
-					let has_wrapper = match mname with
-						| _ -> true
-					in
+				(* Check if this method has a wrapper *)
+				let has_wrapper = match mname with
+					| "keyValueIterator" -> has_kv_iterator
+					| _ -> true
+				in
 					if has_wrapper then
 						bf "\t(void*)_fib_imap_%s_%s%s /* slot %d: %s */\n"
 							prefix mname (if i < max_slot then "," else "") i mname
@@ -1685,11 +1730,16 @@ let gen_map_imap_vtables vtable_ctx =
 			("remove", 1, true);
 			("keys", 0, false);
 			("iterator", 0, false);
-			("keyValueIterator", 0, false);
 			("copy", 0, false);
 			("toString", 0, false);
 			("clear", 0, false);
 		] in
+		(* Only include keyValueIterator if MapKeyValueIterator survived DCE *)
+		let map_methods = if has_kv_iterator then
+			map_methods @ [("keyValueIterator", 0, false)]
+		else
+			map_methods
+		in
 
 		List.iter (fun (prefix, c_struct, _class_var, key_unbox, _key_type, _key_box) ->
 			List.iter (fun (mname, _arg_count, _needs_key) ->
@@ -1744,15 +1794,16 @@ let gen_map_imap_vtables vtable_ctx =
 					bf "static FibDynamic _fib_md_%s_iterator_dyn(FibClosure* _c) {\n" prefix;
 					bf "\treturn _fib_md_%s_iterator(_c);\n" prefix;
 					b "}\n"
-				| "keyValueIterator" ->
-					(* keyValueIterator creates a MapKeyValueIterator, passing the map as FibDynamic *)
-					bf "static FibDynamic _fib_md_%s_keyValueIterator(FibClosure* _c) {\n" prefix;
-					b "\tFibDynamic self_dyn = _c->captures[0];\n";
-					b "\treturn (FibDynamic){.type=FIB_TYPE_OBJECT, .data.ptrVal=haxe_iterators_MapKeyValueIterator_new(self_dyn)};\n";
-					b "}\n";
-					bf "static FibDynamic _fib_md_%s_keyValueIterator_dyn(FibClosure* _c) {\n" prefix;
-					bf "\treturn _fib_md_%s_keyValueIterator(_c);\n" prefix;
-					b "}\n"
+			| "keyValueIterator" when has_kv_iterator ->
+				(* keyValueIterator creates a MapKeyValueIterator, passing the map as FibDynamic *)
+				bf "static FibDynamic _fib_md_%s_keyValueIterator(FibClosure* _c) {\n" prefix;
+				b "\tFibDynamic self_dyn = _c->captures[0];\n";
+				b "\treturn (FibDynamic){.type=FIB_TYPE_OBJECT, .data.ptrVal=haxe_iterators_MapKeyValueIterator_new(self_dyn)};\n";
+				b "}\n";
+				bf "static FibDynamic _fib_md_%s_keyValueIterator_dyn(FibClosure* _c) {\n" prefix;
+				bf "\treturn _fib_md_%s_keyValueIterator(_c);\n" prefix;
+				b "}\n"
+			| "keyValueIterator" -> () (* MapKeyValueIterator was DCE'd - skip *)
 				| "copy" ->
 					bf "static FibDynamic _fib_md_%s_copy(FibClosure* _c) {\n" prefix;
 					bf "\t%s* self = (%s*)fib_dynamic_to_object(_c->captures[0]);\n" c_struct c_struct;
@@ -1929,7 +1980,7 @@ let generate com =
 	let globals_content = gen_runtime_globals !gc_roots in
 	(* Generate IMap vtable wrappers for hash map extern classes *)
 	let map_vtable_content = match ctx.vtable_ctx with
-		| Some vctx -> gen_map_imap_vtables vctx
+		| Some vctx -> gen_map_imap_vtables vctx com
 		| None -> ""
 	in
 	let globals_file = src_dir ^ "/fiberus_globals.c" in
@@ -2171,6 +2222,93 @@ let generate com =
 	(* Check for io_uring define *)
 	let iouring_enabled = Gctx.raw_defined com "iouring" in
 
+	(* Collect @:buildXml fragments and @:sourceFile paths from all classes (including extern).
+	   These allow extern classes to inject custom build configuration. *)
+	let collected_build_xml = Buffer.create 256 in
+	let collected_source_files = ref [] in  (* absolute paths to source files *)
+	let collected_source_dirs = ref [] in   (* unique directories for -I flags *)
+	List.iter (function
+		| TClassDecl c ->
+			(* Collect @:buildXml: extract raw XML string from metadata *)
+			let rec collect_build_xml meta = match meta with
+				| [] -> ()
+				| (m, [EConst (String(xml_str,_)),_], _) :: rest when m = Meta.BuildXml ->
+					Buffer.add_string collected_build_xml xml_str;
+					Buffer.add_char collected_build_xml '\n';
+					collect_build_xml rest
+				| _ :: rest -> collect_build_xml rest
+			in
+			collect_build_xml c.cl_meta;
+			(* Also check abstract impl if this is a KAbstractImpl *)
+			(match c.cl_kind with
+			| KAbstractImpl a ->
+				let rec collect_build_xml_a meta = match meta with
+					| [] -> ()
+					| (m, [EConst (String(xml_str,_)),_], _) :: rest when m = Meta.BuildXml ->
+						Buffer.add_string collected_build_xml xml_str;
+						Buffer.add_char collected_build_xml '\n';
+						collect_build_xml_a rest
+					| _ :: rest -> collect_build_xml_a rest
+				in
+				collect_build_xml_a a.a_meta
+			| _ -> ());
+			(* Collect @:sourceFile: resolve paths relative to the .hx source file.
+			   This follows the hxcpp convention where @:sourceFile paths are relative
+			   to the Haxe source file that declares the extern class.
+			   A class may have multiple @:sourceFile entries (e.g. Yoga has 19). *)
+			let hx_dir = Filename.dirname c.cl_pos.pfile in
+			let class_source_dirs = ref [] in
+			let rec collect_source_files meta = match meta with
+				| [] -> ()
+				| (m, [EConst (String(rel_path,_)),_], _) :: rest when m = Meta.SourceFile ->
+					let abs_path =
+						if Filename.is_relative rel_path then
+							let combined = Filename.concat hx_dir rel_path in
+							(try Unix.realpath combined with _ -> combined)
+						else
+							rel_path
+					in
+					if not (List.mem abs_path !collected_source_files) then begin
+						collected_source_files := abs_path :: !collected_source_files;
+						let src_dir = Filename.dirname abs_path in
+						class_source_dirs := src_dir :: !class_source_dirs;
+						if not (List.mem src_dir !collected_source_dirs) then
+							collected_source_dirs := src_dir :: !collected_source_dirs
+					end;
+					collect_source_files rest
+				| _ :: rest -> collect_source_files rest
+			in
+			collect_source_files c.cl_meta;
+			(* Compute common ancestor of all source dirs for this class, and also
+			   add its parent. This handles @:include paths with subdirectory components,
+			   e.g. @:include("yoga/Yoga.h") needs -I for the parent of "yoga/".
+			   By adding both the common ancestor and its parent, we cover both cases:
+			   - #include "Yoga.h" (resolved from common ancestor dir)
+			   - #include "yoga/Yoga.h" (resolved from parent of common ancestor) *)
+			let dirs = !class_source_dirs in
+			if dirs <> [] then begin
+				let common_prefix d1 d2 =
+					let parts1 = String.split_on_char '/' d1 in
+					let parts2 = String.split_on_char '/' d2 in
+					let rec common acc p1 p2 = match p1, p2 with
+						| x :: r1, y :: r2 when x = y -> common (x :: acc) r1 r2
+						| _ -> List.rev acc
+					in
+					String.concat "/" (common [] parts1 parts2)
+				in
+				let ancestor = List.fold_left common_prefix (List.hd dirs) (List.tl dirs) in
+				if ancestor <> "" && not (List.mem ancestor !collected_source_dirs) then
+					collected_source_dirs := ancestor :: !collected_source_dirs;
+				(* Also add parent of common ancestor for subdirectory includes *)
+				let parent = Filename.dirname ancestor in
+				if parent <> "" && parent <> ancestor && parent <> "." && not (List.mem parent !collected_source_dirs) then
+					collected_source_dirs := parent :: !collected_source_dirs
+			end
+		| _ -> ()
+	) com.types;
+	let collected_source_files = List.rev !collected_source_files in
+	let collected_source_dirs = List.rev !collected_source_dirs in
+
 	(* Generate Build.xml *)
 	let build_xml = Buffer.create 1024 in
 	Buffer.add_string build_xml "<xml>\n";
@@ -2185,17 +2323,61 @@ let generate com =
 	if iouring_enabled then
 		Buffer.add_string build_xml "<set name=\"iouring\" value=\"1\" />\n";
 	Buffer.add_string build_xml "<include name=\"${FIBERUS}/build-tool/BuildCommon.xml\"/>\n\n";
+
+	(* Inject @:buildXml fragments from extern classes *)
+	let build_xml_extra = Buffer.contents collected_build_xml in
+	if build_xml_extra <> "" then begin
+		Buffer.add_string build_xml "<!-- Extern library build configuration (from @:buildXml metadata) -->\n";
+		Buffer.add_string build_xml build_xml_extra;
+		Buffer.add_string build_xml "\n"
+	end;
+
 	Buffer.add_string build_xml "<!-- Generated Haxe code -->\n";
 	Buffer.add_string build_xml "<files id=\"haxe\" dir=\"src\" tags=\"fiberus\">\n";
 	(* Add Options.txt as a dependency for proper cache invalidation *)
 	Buffer.add_string build_xml "  <options name=\"Options.txt\"/>\n";
+	(* Add -I flags for extern library directories so that #include directives
+	   from @:include metadata in fiberus_generated.h resolve correctly *)
+	List.iter (fun dir ->
+		Buffer.add_string build_xml (Printf.sprintf "  <compilerflag value=\"-I%s\"/>\n" dir)
+	) collected_source_dirs;
 	List.iter (fun filename ->
 		Buffer.add_string build_xml (Printf.sprintf "  <file name=\"%s\"/>\n" filename)
 	) (List.rev !generated_files);
 	Buffer.add_string build_xml "</files>\n\n";
+
+	(* Emit @:sourceFile entries as a separate files group.
+	   Source files use absolute paths (resolved from @:sourceFile relative to .hx file).
+	   Include directories are auto-derived from source file locations so that
+	   #include directives in the extern C files resolve correctly. *)
+	if collected_source_files <> [] then begin
+		Buffer.add_string build_xml "<!-- Extern library source files (from @:sourceFile metadata) -->\n";
+		Buffer.add_string build_xml "<files id=\"__externs__\" tags=\"fiberus\">\n";
+		(* Add -I flags for each unique source directory so headers can be found *)
+		List.iter (fun dir ->
+			Buffer.add_string build_xml (Printf.sprintf "  <compilerflag value=\"-I%s\"/>\n" dir)
+		) collected_source_dirs;
+		List.iter (fun path ->
+			Buffer.add_string build_xml (Printf.sprintf "  <file name=\"%s\"/>\n" path)
+		) collected_source_files;
+		Buffer.add_string build_xml "</files>\n\n"
+	end;
+
 	Buffer.add_string build_xml "<!-- Append generated code to fiberus target and build as executable -->\n";
 	Buffer.add_string build_xml "<target id=\"fiberus\" output=\"Main\" toolid=\"exe\">\n";
 	Buffer.add_string build_xml "  <files id=\"haxe\"/>\n";
+	if collected_source_files <> [] then
+		Buffer.add_string build_xml "  <files id=\"__externs__\"/>\n";
+	(* Inject <lib> tags from collected @:buildXml metadata into the linker target.
+	   We extract lines matching <lib ...> from the build_xml_extra buffer. *)
+	if build_xml_extra <> "" then begin
+		let lines = String.split_on_char '\n' build_xml_extra in
+		List.iter (fun line ->
+			let trimmed = String.trim line in
+			if String.length trimmed > 4 && String.sub trimmed 0 4 = "<lib" then
+				Buffer.add_string build_xml (Printf.sprintf "  %s\n" trimmed)
+		) lines
+	end;
 	Buffer.add_string build_xml "  <outdir name=\"./\"/>\n";
 	Buffer.add_string build_xml "</target>\n\n";
 	Buffer.add_string build_xml "</xml>\n";
