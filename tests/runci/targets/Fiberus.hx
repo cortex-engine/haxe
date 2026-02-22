@@ -24,7 +24,7 @@ class Fiberus {
 			final path = getHaxelibPath("fiberus");
 			infoMsg('fiberus has already been installed in $path.');
 		} catch(e:Dynamic) {
-			haxelibInstallGit("mib", "fiberus", true);
+			haxelibInstallGit("fiberus-hx", "fiberus", true);
 			final oldDir = Sys.getCwd();
 			changeDirectory(getHaxelibPath("fiberus") + "tools/fiberus/");
 			runCommand("haxe", ["-D", "source-header=''", "compile.hxml"]);
