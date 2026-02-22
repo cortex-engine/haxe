@@ -52,6 +52,7 @@ typedef GCStats = {
 	var writeBarriersTriggered:Int;
 }
 
+
 /**
  * Garbage collector control and statistics.
  *
