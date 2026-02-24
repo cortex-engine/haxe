@@ -3092,12 +3092,15 @@ and convert_field_assign ctx e1 e2 pos =
         rhs, []
       in
       (* Check if write barrier needed - object pointers need barriers.
-         When the effective storage type is FibDynamic (e.g. generic field), skip the
-         barrier: FibDynamic is a value type copied into the field, and the GC traces
-         it by scanning object memory rather than relying on write barriers. *)
-      let needs_barrier = is_instance_field && needs_write_barrier_tc rhs_tc
+         Two cases:
+         1. Direct pointer field: use FIBRIX_WRITE_BARRIER(obj, ptr)
+         2. FibDynamic field: use FIBRIX_WRITE_BARRIER_DYNAMIC(obj, boxed_val)
+            The dynamic variant extracts the pointer from the tagged union at runtime. *)
+      let needs_ptr_barrier = is_instance_field && needs_write_barrier_tc rhs_tc
         && effective_lhs_tc <> TCFibDynamic in
-      if needs_barrier then begin
+      let needs_dyn_barrier = is_instance_field && needs_write_barrier_tc rhs_tc
+        && effective_lhs_tc = TCFibDynamic in
+      if needs_ptr_barrier then begin
         (* Emit: (FIBRIX_WRITE_BARRIER(obj, rhs), obj->field = rhs)
          * For expressions with side effects (calls, allocations), extract rhs
          * into a temp variable first to avoid double-evaluation. *)
@@ -3115,6 +3118,24 @@ and convert_field_assign ctx e1 e2 pos =
         let assign = mk_expr (TCEAssign (lhs_expr, rhs)) effective_lhs_tc in
         let result = mk_expr_pos (TCEComma [barrier; assign]) effective_lhs_tc pos in
         (* Propagate pending_stmts from all sub-expressions *)
+        { result with 
+          pending_stmts = obj_expr.pending_stmts @ lhs_expr.pending_stmts @ rhs.pending_stmts @ seq_stmts @ result.pending_stmts;
+          gc_roots = obj_expr.gc_roots + lhs_expr.gc_roots + rhs.gc_roots }
+      end else if needs_dyn_barrier then begin
+        (* FibDynamic field: rhs is already boxed (via box_if_needed above).
+         * Emit: (FIBRIX_WRITE_BARRIER_DYNAMIC(obj, _wb_N), obj->field = _wb_N)
+         * Always extract rhs into a temp to prevent double-evaluation:
+         * the barrier evaluates rhs (for pointer extraction) and the assignment
+         * evaluates it again, so any side effects (e.g. x++) would fire twice. *)
+        let tmp_name = Printf.sprintf "_wb_%d" ctx.temp_counter in
+        ctx.temp_counter <- ctx.temp_counter + 1;
+        let tmp_var = TCSVar { vd_name = tmp_name; vd_type = rhs.ctype; vd_init = Some rhs;
+          vd_static = false; vd_const = false; vd_volatile = false } in
+        let rhs = mk_expr (TCELocal tmp_name) rhs.ctype in
+        let seq_stmts = seq_stmts @ [tmp_var] in
+        let barrier = mk_expr (TCECall (TCTMacro "FIBRIX_WRITE_BARRIER_DYNAMIC", [obj_expr; rhs])) TCVoid in
+        let assign = mk_expr (TCEAssign (lhs_expr, rhs)) effective_lhs_tc in
+        let result = mk_expr_pos (TCEComma [barrier; assign]) effective_lhs_tc pos in
         { result with 
           pending_stmts = obj_expr.pending_stmts @ lhs_expr.pending_stmts @ rhs.pending_stmts @ seq_stmts @ result.pending_stmts;
           gc_roots = obj_expr.gc_roots + lhs_expr.gc_roots + rhs.gc_roots }
@@ -5075,6 +5096,10 @@ and convert_fiber_spawn_many ctx count_expr body_arg args_expr pos =
       let args_name = Printf.sprintf "_args%d" spawn_id in
       let ret_name = Printf.sprintf "_ret%d" spawn_id in
       
+      (* Box args_expr to FibDynamic if not already dynamic *)
+      let boxed_args = if args_expr.ctype = TCFibDynamic then args_expr
+        else mk_expr (TCEBox (args_expr, box_kind_of_type args_expr.ctype)) TCFibDynamic in
+      
       let pending = [
         (* int _cntN = count_expr; *)
         TCSVar {
@@ -5087,7 +5112,7 @@ and convert_fiber_spawn_many ctx count_expr body_arg args_expr pos =
         TCSVar {
           vd_name = args_name;
           vd_type = TCFibDynamic;
-          vd_init = Some args_expr;
+          vd_init = Some boxed_args;
           vd_static = false; vd_const = false; vd_volatile = false;
         };
         (* gc_mature_alloc_begin(); *)
