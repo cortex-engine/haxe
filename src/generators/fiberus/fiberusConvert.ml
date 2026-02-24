@@ -7250,22 +7250,28 @@ let convert_constructor ctx (c : tclass) =
         fd_body = !init_prologue @ dyn_init_stmts @ !init_epilogue;
         fd_static = false; fd_inline = false; fd_attrs = [];
       } in
-      let alloc_stmt = TCSVar {
-        vd_name = "this"; vd_type = this_tc;
-        vd_init = Some (mk_expr (TCERaw (Printf.sprintf
-          "gc_alloc_object_with_class(sizeof(%s), &%s_class)" class_name class_name)) this_tc);
-        vd_static = false; vd_const = false; vd_volatile = false;
-      } in
+      (* _new must root 'this' in a GCFrame so nursery evacuation
+         during _init does not leave the local pointer stale. *)
+      let gc_this_expr = mk_expr (TCEDot (mk_expr (TCELocal "_gc") TCVoid, "this")) this_tc in
+      let alloc_stmt = TCSGCFrameAssign ("_gc", "this",
+        mk_expr (TCERaw (Printf.sprintf
+          "gc_alloc_object_with_class(sizeof(%s), &%s_class)" class_name class_name)) this_tc) in
       let init_call = TCSExpr (mk_expr (TCECall (
         TCTFunc (Printf.sprintf "%s_init" class_name),
-        [mk_expr (TCELocal "this") this_tc]
+        [gc_this_expr]
       )) TCVoid) in
-      let return_this = TCSReturn (Some (mk_expr (TCELocal "this") this_tc)) in
+      let return_this = TCSReturn (Some gc_this_expr) in
+      let new_frame_info = {
+        gfi_name = "_gc";
+        gfi_slots = [{ gfs_name = "this"; gfs_type = this_tc; gfs_init = None }];
+      } in
       let new_func = {
         fd_name = Printf.sprintf "%s_new" class_name;
         fd_ret = this_tc;
         fd_args = [];
-        fd_body = [alloc_stmt; init_call; return_this];
+        fd_body = [TCSGCCtx; TCSGCFrameDecl new_frame_info;
+                   alloc_stmt; init_call;
+                   TCSGCFramePop "_gc"; return_this];
         fd_static = false; fd_inline = false; fd_attrs = [];
       } in
       Some (init_func, new_func)
@@ -7376,66 +7382,65 @@ let convert_constructor ctx (c : tclass) =
               fd_inline = false;
               fd_attrs = [];
             } in
-            (* === _new function (GCFrame-based) === *)
+            (* === _new function (GCFrame-based) ===
+               Always create a GCFrame that includes 'this' so the pointer
+               stays valid if GC evacuates the object during _init.
+               _init pushes its own frame and updates its copy of 'this',
+               but without rooting 'this' here the _new local would go
+               stale after nursery evacuation. *)
             let gc_param_args = List.filter (fun (v, _) ->
               needs_gc_root (tc_type_of v.v_type)
             ) filtered_args in
-            let has_gc_params = gc_param_args <> [] in
             (* Allocate 'this' — mature or nursery depending on fiber capture analysis *)
             let alloc_func = if escape_result.this_needs_mature then
               "gc_alloc_mature_object_with_class"
             else
               "gc_alloc_object_with_class"
             in
-            let alloc_stmt = TCSVar {
-              vd_name = "this"; vd_type = TCFibClass class_name;
-              vd_init = Some (mk_expr (TCERaw (Printf.sprintf "%s(sizeof(%s), &%s_class)"
-                alloc_func class_name class_name)) (TCFibClass class_name));
-              vd_static = false; vd_const = false; vd_volatile = false;
-            } in
+            (* Allocate into _gc.this so the GCFrame tracks the pointer *)
+            let alloc_stmt = TCSGCFrameAssign ("_gc", "this",
+              mk_expr (TCERaw (Printf.sprintf "%s(sizeof(%s), &%s_class)"
+                alloc_func class_name class_name)) (TCFibClass class_name)) in
+            let this_tc = TCFibClass class_name in
+            let gc_this_expr = mk_expr (TCEDot (mk_expr (TCELocal "_gc") TCVoid, "this")) this_tc in
             let arg_names = List.map (fun (v, _) ->
               let tc = tc_type_of v.v_type in
               let vname = ident v.v_name in
-              if has_gc_params && needs_gc_root tc then
+              if needs_gc_root tc then
                 mk_expr (TCEDot (mk_expr (TCELocal "_gc") TCVoid, vname)) tc
               else
                 mk_expr (TCELocal vname) tc
             ) filtered_args in
             let init_call = TCSExpr (mk_expr (TCECall (
               TCTFunc (Printf.sprintf "%s_init" class_name),
-              mk_expr (TCELocal "this") (TCFibClass class_name) :: arg_names
+              gc_this_expr :: arg_names
             )) TCVoid) in
-            let new_prologue = ref [] in
-            let new_epilogue = ref [] in
-            if has_gc_params then begin
-              (* _new function uses a small GCFrame to protect params during alloc *)
-              new_prologue := [TCSGCCtx];
-              let new_frame_rooted = Hashtbl.create 8 in
-              let new_frame_slots = ref [] in
-              let new_param_inits = ref [] in
-              List.iter (fun (v, _) ->
-                let tc = tc_type_of v.v_type in
-                let vname = ident v.v_name in
-                new_frame_slots := (vname, tc) :: !new_frame_slots;
-                Hashtbl.replace new_frame_rooted vname ();
-                new_param_inits := (vname, mk_expr (TCELocal vname) tc) :: !new_param_inits
-              ) gc_param_args;
-              let new_frame_info = {
-                gfi_name = "_gc";
-                gfi_slots = List.rev_map (fun (name, typ) ->
-                  let init = try Some (List.assoc name !new_param_inits) with Not_found -> None in
-                  { gfs_name = name; gfs_type = typ; gfs_init = init }
-                ) !new_frame_slots;
-              } in
-              new_prologue := !new_prologue @ [TCSGCFrameDecl new_frame_info];
-              new_epilogue := [TCSGCFramePop "_gc"]
-            end;
-            let return_this = TCSReturn (Some (mk_expr (TCELocal "this") (TCFibClass class_name))) in
+            (* Build GCFrame slots: always 'this' + any GC-typed params *)
+            let new_frame_slots = ref [] in
+            let new_param_inits = ref [] in
+            (* 'this' slot — initialized to NULL, assigned after alloc *)
+            new_frame_slots := ("this", this_tc) :: !new_frame_slots;
+            List.iter (fun (v, _) ->
+              let tc = tc_type_of v.v_type in
+              let vname = ident v.v_name in
+              new_frame_slots := (vname, tc) :: !new_frame_slots;
+              new_param_inits := (vname, mk_expr (TCELocal vname) tc) :: !new_param_inits
+            ) gc_param_args;
+            let new_frame_info = {
+              gfi_name = "_gc";
+              gfi_slots = List.rev_map (fun (name, typ) ->
+                let init = try Some (List.assoc name !new_param_inits) with Not_found -> None in
+                { gfs_name = name; gfs_type = typ; gfs_init = init }
+              ) !new_frame_slots;
+            } in
+            let new_prologue = [TCSGCCtx; TCSGCFrameDecl new_frame_info] in
+            let new_epilogue = [TCSGCFramePop "_gc"] in
+            let return_this = TCSReturn (Some gc_this_expr) in
             let new_func = {
               fd_name = Printf.sprintf "%s_new" class_name;
               fd_ret = TCFibClass class_name;
               fd_args = (if tc_args = [] then [] else tc_args);
-              fd_body = !new_prologue @ [alloc_stmt; init_call] @ !new_epilogue @ [return_this];
+              fd_body = new_prologue @ [alloc_stmt; init_call] @ new_epilogue @ [return_this];
               fd_static = false;
               fd_inline = false;
               fd_attrs = [];
