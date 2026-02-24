@@ -5065,6 +5065,89 @@ and convert_fiber_spawn_with_stack ctx size_expr arg pos =
       let arg_expr = convert_expr ctx arg in
       mk_expr_pos (TCECall (TCTFunc "Fiber_spawnWithStack", [size_expr; arg_expr])) TCFiber pos
 
+(* Convert Fiber.spawnMany(count, body, args) *)
+and convert_fiber_spawn_many ctx count_expr body_arg args_expr pos =
+  match extract_fiber_closure ctx body_arg with
+  | Some (closure_name, impl_name, captures, _arg_count) ->
+      (* Generate unique variable names to avoid redefinition errors *)
+      let (fc_name, _fib_name, spawn_id) = fresh_spawn_vars ctx in
+      let cnt_name = Printf.sprintf "_cnt%d" spawn_id in
+      let args_name = Printf.sprintf "_args%d" spawn_id in
+      let ret_name = Printf.sprintf "_ret%d" spawn_id in
+      
+      let pending = [
+        (* int _cntN = count_expr; *)
+        TCSVar {
+          vd_name = cnt_name;
+          vd_type = TCInt32;
+          vd_init = Some count_expr;
+          vd_static = false; vd_const = false; vd_volatile = false;
+        };
+        (* FibDynamic _argsN = args_expr; *)
+        TCSVar {
+          vd_name = args_name;
+          vd_type = TCFibDynamic;
+          vd_init = Some args_expr;
+          vd_static = false; vd_const = false; vd_volatile = false;
+        };
+        (* gc_mature_alloc_begin(); *)
+        TCSExpr (mk_expr (TCECall (TCTFunc "gc_mature_alloc_begin", [])) TCVoid);
+      ] in
+      
+      let closure_expr = mk_expr (TCEClosureCreate {
+        cc_name = closure_name;
+        cc_impl_name = impl_name;
+        cc_captures = captures;
+        cc_arg_count = 0;
+        cc_for_fiber = true;
+      }) TCFibClosure in
+      
+      let fc_var = TCSVar {
+        vd_name = fc_name;
+        vd_type = TCFibClosure;
+        vd_init = Some closure_expr;
+        vd_static = false; vd_const = false; vd_volatile = false;
+      } in
+      
+      (* Root protection for _fcN during spawn *)
+      let root_push, root_pop = if ctx.in_gc_frame then begin
+        gc_frame_add_slot ctx fc_name TCFibClosure;
+        let assign = TCSGCFrameAssign (ctx.gc_frame_name, fc_name, mk_expr (TCELocal fc_name) TCFibClosure) in
+        ([assign], [])
+      end else begin
+        let push = TCSExpr (mk_expr (TCECall (TCTFunc "gc_push_temp_root", 
+          [mk_expr (TCECast (TCPointer (TCPointer TCVoid), mk_expr (TCEAddrOf (mk_expr (TCELocal fc_name) TCFibClosure)) (TCPointer TCFibClosure))) (TCPointer (TCPointer TCVoid))]
+        )) TCVoid) in
+        let pop = TCSExpr (mk_expr (TCECall (TCTFunc "gc_pop_temp_roots", [mk_int 1l])) TCVoid) in
+        ([push], [pop])
+      end in
+      
+      (* int _retN = Fiber_spawnMany(count, closure, args) *)
+      let spawn_call = mk_expr (TCECall (TCTFunc "Fiber_spawnMany", [
+        mk_expr (TCELocal cnt_name) TCInt32;
+        mk_expr (TCELocal fc_name) TCFibClosure;
+        mk_expr (TCELocal args_name) TCFibDynamic;
+      ])) TCInt32 in
+      
+      let ret_var = TCSVar {
+        vd_name = ret_name;
+        vd_type = TCInt32;
+        vd_init = Some spawn_call;
+        vd_static = false; vd_const = false; vd_volatile = false;
+      } in
+      
+      let alloc_end = TCSExpr (mk_expr (TCECall (TCTFunc "gc_mature_alloc_end", [])) TCVoid) in
+      
+      let result = mk_expr (TCELocal ret_name) TCInt32 in
+      let all_pending = pending @ [fc_var] @ root_push @ [ret_var; alloc_end] @ root_pop in
+      
+      with_pending all_pending result
+      
+  | None ->
+      (* No closure literal - fall back to runtime Fiber_spawnMany *)
+      let body_expr = convert_expr ctx body_arg in
+      mk_expr_pos (TCECall (TCTFunc "Fiber_spawnMany", [count_expr; body_expr; args_expr])) TCInt32 pos
+
 and convert_call ctx callee args result_tc pos =
   (* Heap-allocate any anonymous objects in call arguments to prevent dangling
      stack pointers if the callee stores them (e.g. PosInfos in exceptions). *)
@@ -5292,6 +5375,15 @@ and convert_call ctx callee args result_tc pos =
           let size_expr = convert_expr ctx stack_size in
           convert_fiber_spawn_with_stack ctx size_expr closure_arg pos
       | _ -> mk_expr_pos (TCERaw "/* Fiber.spawnWithStack: wrong args */") TCFiber pos)
+  
+  (* Fiber.spawnMany - spawn multiple fibers with round-robin distribution *)
+  | Some FiberusBuiltins.IFiberSpawnMany ->
+      (match args with
+      | [count_arg; body_arg; args_arg] ->
+          let count_expr = convert_expr ctx count_arg in
+          let args_expr = convert_expr ctx args_arg in
+          convert_fiber_spawn_many ctx count_expr body_arg args_expr pos
+      | _ -> mk_expr_pos (TCERaw "/* Fiber.spawnMany: wrong args */") TCInt32 pos)
   
   (* trace(msg, infos) -> haxe_Log_trace(boxed_msg, infos) *)
   | Some FiberusBuiltins.ITrace ->
