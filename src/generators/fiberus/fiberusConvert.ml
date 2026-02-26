@@ -3105,7 +3105,8 @@ and convert_field_assign ctx e1 e2 pos =
       let needs_dyn_barrier = is_instance_field && needs_write_barrier_tc rhs_tc
         && effective_lhs_tc = TCFibDynamic in
       if needs_ptr_barrier then begin
-        (* Emit: (FIBRIX_WRITE_BARRIER(obj, rhs), obj->field = rhs)
+        (* Emit: (FIBRIX_SATB_LOG(obj->field), FIBRIX_WRITE_BARRIER(obj, rhs), obj->field = rhs)
+         * SATB deletion barrier: log old value before overwrite for concurrent marking.
          * For expressions with side effects (calls, allocations), extract rhs
          * into a temp variable first to avoid double-evaluation. *)
         let rhs, seq_stmts =
@@ -3118,16 +3119,18 @@ and convert_field_assign ctx e1 e2 pos =
           end else
             rhs, seq_stmts
         in
+        let satb_log = mk_expr (TCECall (TCTMacro "FIBRIX_SATB_LOG", [lhs_expr])) TCVoid in
         let barrier = mk_expr (TCECall (TCTMacro "FIBRIX_WRITE_BARRIER", [obj_expr; rhs])) TCVoid in
         let assign = mk_expr (TCEAssign (lhs_expr, rhs)) effective_lhs_tc in
-        let result = mk_expr_pos (TCEComma [barrier; assign]) effective_lhs_tc pos in
+        let result = mk_expr_pos (TCEComma [satb_log; barrier; assign]) effective_lhs_tc pos in
         (* Propagate pending_stmts from all sub-expressions *)
         { result with 
           pending_stmts = obj_expr.pending_stmts @ lhs_expr.pending_stmts @ rhs.pending_stmts @ seq_stmts @ result.pending_stmts;
           gc_roots = obj_expr.gc_roots + lhs_expr.gc_roots + rhs.gc_roots }
       end else if needs_dyn_barrier then begin
         (* FibDynamic field: rhs is already boxed (via box_if_needed above).
-         * Emit: (FIBRIX_WRITE_BARRIER_DYNAMIC(obj, _wb_N), obj->field = _wb_N)
+         * Emit: (FIBRIX_SATB_LOG_DYNAMIC(obj->field), FIBRIX_WRITE_BARRIER_DYNAMIC(obj, _wb_N), obj->field = _wb_N)
+         * SATB deletion barrier: log old FibDynamic value before overwrite.
          * Always extract rhs into a temp to prevent double-evaluation:
          * the barrier evaluates rhs (for pointer extraction) and the assignment
          * evaluates it again, so any side effects (e.g. x++) would fire twice. *)
@@ -3137,9 +3140,10 @@ and convert_field_assign ctx e1 e2 pos =
           vd_static = false; vd_const = false; vd_volatile = false } in
         let rhs = mk_expr (TCELocal tmp_name) rhs.ctype in
         let seq_stmts = seq_stmts @ [tmp_var] in
+        let satb_log = mk_expr (TCECall (TCTMacro "FIBRIX_SATB_LOG_DYNAMIC", [lhs_expr])) TCVoid in
         let barrier = mk_expr (TCECall (TCTMacro "FIBRIX_WRITE_BARRIER_DYNAMIC", [obj_expr; rhs])) TCVoid in
         let assign = mk_expr (TCEAssign (lhs_expr, rhs)) effective_lhs_tc in
-        let result = mk_expr_pos (TCEComma [barrier; assign]) effective_lhs_tc pos in
+        let result = mk_expr_pos (TCEComma [satb_log; barrier; assign]) effective_lhs_tc pos in
         { result with 
           pending_stmts = obj_expr.pending_stmts @ lhs_expr.pending_stmts @ rhs.pending_stmts @ seq_stmts @ result.pending_stmts;
           gc_roots = obj_expr.gc_roots + lhs_expr.gc_roots + rhs.gc_roots }
