@@ -896,21 +896,10 @@ and write_stmt (w : writer) (s : tc_stmt) : unit =
       newline w
   
   (* GC integration *)
-  | TCSGCPush e ->
-      write w "gc_push_temp_root_ctx(FIB_CTX, (void**)&";
-      write_expr w e;
-      (* FibDynamic is a 16-byte struct {type, data}; pushing &dyn treats the
-         .type field as a pointer. We must push &dyn.data.ptrVal so the GC
-         reads the actual object pointer inside the dynamic value. *)
-      if is_fib_dynamic e.ctype then
-        write w ".data.ptrVal";
-      write w ");";
-      newline w
-  | TCSGCPop n when n > 0 ->
-      writef w "gc_pop_temp_roots_ctx(FIB_CTX, %d);" n;
-      newline w
+  | TCSGCPush _ ->
+      () (* Legacy temp root push — no longer emitted. All roots tracked via GCFrame. *)
   | TCSGCPop _ ->
-      () (* n=0, emit nothing *)
+      () (* Legacy temp root pop — no longer emitted. *)
   | TCSGCCtx ->
       write w "FIB_GC_CTX;";
       newline w;
@@ -919,23 +908,8 @@ and write_stmt (w : writer) (s : tc_stmt) : unit =
   | TCSGCSafePoint ->
       write w "GC_SAFE_POINT();";
       newline w
-  | TCSGCRootCheck expected ->
-      (* Debug assertion for GC root count verification.
-       * Only emitted under FIBERUS_DEBUG to catch push/pop imbalances.
-       * Note: _fib_gc_ctx is FiberGCContext*, uses tempRootCount (not mTempRootCount) *)
-      write w "#ifdef FIBERUS_DEBUG";
-      newline w;
-      writef w "if (_fib_gc_ctx && _fib_gc_ctx->tempRootCount != _gc_base_count + %d) {" expected;
-      newline w;
-      write w "  fprintf(stderr, \"[GC ROOT MISMATCH] expected %%zu got %%zu\\n\", ";
-      writef w "(size_t)(_gc_base_count + %d), (size_t)_fib_gc_ctx->tempRootCount);" expected;
-      newline w;
-      write w "  __builtin_trap();";
-      newline w;
-      write w "}";
-      newline w;
-      write w "#endif";
-      newline w
+  | TCSGCRootCheck _ ->
+      () (* Legacy temp root count check — no longer emitted. All roots tracked via GCFrame. *)
   
   (* GCFrame-based shadow stack *)
   | TCSGCFrameDecl info ->

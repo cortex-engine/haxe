@@ -117,6 +117,7 @@ let make_conv_ctx ctx =
     FiberusConvert.gc_frame_slots = [];
     FiberusConvert.gc_frame_rooted_vars = Hashtbl.create 0;
     FiberusConvert.in_gc_frame = false;
+    FiberusConvert.gc_frame_depth = 0;
     FiberusConvert.closure_counter = ctx.closure_counter;
     FiberusConvert.closures = [];
     FiberusConvert.in_fiber_spawn = ctx.in_fiber_spawn;

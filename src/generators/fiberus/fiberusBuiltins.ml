@@ -154,6 +154,7 @@ type map_kind =
   | MapString    (* StringMap *)
   | MapInt64     (* Int64Map *)
   | MapObject    (* ObjectMap *)
+  | MapWeak      (* WeakMap *)
 
 type map_method =
   | MapSet | MapGet | MapExists | MapRemove
@@ -179,6 +180,7 @@ let map_kind_prefix (kind : map_kind) : string =
   | MapString -> "fib_string_map_"
   | MapInt64 -> "fib_int64_map_"
   | MapObject -> "fib_object_map_"
+  | MapWeak -> "fib_weak_map_"
 
 let map_method_func (kind : map_kind) (method_ : map_method) : string =
   let prefix = map_kind_prefix kind in
@@ -214,6 +216,7 @@ let map_kind_of_type (t : Type.t) : map_kind option =
   | TInst ({ cl_path = (["haxe"; "ds"], "StringMap") }, _) -> Some MapString
   | TInst ({ cl_path = (["haxe"; "ds"], "Int64Map") }, _) -> Some MapInt64
   | TInst ({ cl_path = (["haxe"; "ds"], "ObjectMap") }, _) -> Some MapObject
+  | TInst ({ cl_path = (["haxe"; "ds"], "WeakMap") }, _) -> Some MapWeak
   | _ -> None
 
 (* Get map kind from a class (for FInstance where etype may be abstract Map) *)
@@ -223,6 +226,7 @@ let map_kind_of_class (c : tclass) : map_kind option =
   | (["haxe"; "ds"], "StringMap") -> Some MapString
   | (["haxe"; "ds"], "Int64Map") -> Some MapInt64
   | (["haxe"; "ds"], "ObjectMap") -> Some MapObject
+  | (["haxe"; "ds"], "WeakMap") -> Some MapWeak
   | _ -> None
 
 (* ============================================================================

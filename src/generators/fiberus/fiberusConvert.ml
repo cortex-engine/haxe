@@ -39,6 +39,7 @@ type conv_ctx = {
   mutable gc_frame_slots: (string * tc_type) list;  (* Accumulated (name, type) pairs for frame slots - in reverse order *)
   mutable gc_frame_rooted_vars: (string, unit) Hashtbl.t;  (* Set of variable names that are in the GC frame *)
   mutable in_gc_frame: bool;          (* True when inside a GCFrame-managed function *)
+  mutable gc_frame_depth: int;        (* TBlock nesting depth within GCFrame; 1=function body, >1=inner blocks *)
   (* Closure support *)
   mutable closure_counter: int;       (* Counter for unique closure names *)
   mutable closures: tc_closure list;  (* Closures created during conversion *)
@@ -74,6 +75,7 @@ let empty_ctx = {
   gc_frame_slots = [];
   gc_frame_rooted_vars = Hashtbl.create 0;
   in_gc_frame = false;
+  gc_frame_depth = 0;
   closure_counter = 0;
   closures = [];
   in_fiber_spawn = false;
@@ -421,7 +423,7 @@ let coerce_to_type expr target_tc =
 	  | TCFibClass src_name, TCFibClass tgt_name when src_name <> tgt_name ->
 		(* Class/interface pointer cast (e.g., concrete class to interface) *)
 		mk_expr (TCECast (target_tc, expr)) target_tc
-	  | (TCFibIntMap | TCFibStringMap | TCFibInt64Map | TCFibObjectMap), TCFibClass _ ->
+	  | (TCFibIntMap | TCFibStringMap | TCFibInt64Map | TCFibObjectMap | TCFibWeakMap), TCFibClass _ ->
 		(* Map object to interface/class pointer cast (e.g., IntMap to IMap) *)
 		mk_expr (TCECast (target_tc, expr)) target_tc
 	  | TCFibArray src_kind, TCFibArray tgt_kind when src_kind <> tgt_kind ->
@@ -1476,6 +1478,8 @@ let rec convert_expr (ctx : conv_ctx) (e : texpr) : tc_expr =
         mk_expr_pos (TCECall (TCTFunc "fib_int64_map_new", [])) TCFibInt64Map pos
       else if c.cl_path = (["haxe"; "ds"], "ObjectMap") then
         mk_expr_pos (TCECall (TCTFunc "fib_object_map_new", [])) TCFibObjectMap pos
+      else if c.cl_path = (["haxe"; "ds"], "WeakMap") then
+        mk_expr_pos (TCECall (TCTFunc "fib_weak_map_new", [])) TCFibWeakMap pos
       (* new String(s) is identity — String is immutable in fiberus *)
       else if c.cl_path = ([], "String") then begin
         match args with
@@ -4137,6 +4141,7 @@ and convert_field_access ctx obj fa result_tc pos =
         | (["haxe";"ds"], "StringMap") -> Some FiberusBuiltins.MapString
         | (["haxe";"ds"], "Int64Map") -> Some FiberusBuiltins.MapInt64
         | (["haxe";"ds"], "ObjectMap") -> Some FiberusBuiltins.MapObject
+        | (["haxe";"ds"], "WeakMap") -> Some FiberusBuiltins.MapWeak
         | _ -> None
       in
       let c_func, this_expr, ret_type =
@@ -4181,18 +4186,21 @@ and convert_field_access ctx obj fa result_tc pos =
             | FiberusBuiltins.MapString -> "FibStringMap"
             | FiberusBuiltins.MapInt64 -> "FibInt64Map"
             | FiberusBuiltins.MapObject -> "FibObjectMap"
+            | FiberusBuiltins.MapWeak -> "FibWeakMap"
           in
 			let override_ret = match method_name with
 				| "keys" -> Some (match kind with
-					| FiberusBuiltins.MapInt -> TCRaw "FibIntMapKeyIterator*"
+				| FiberusBuiltins.MapInt -> TCRaw "FibIntMapKeyIterator*"
 					| FiberusBuiltins.MapString -> TCRaw "FibStringMapKeyIterator*"
 					| FiberusBuiltins.MapInt64 -> TCRaw "FibInt64MapKeyIterator*"
-					| FiberusBuiltins.MapObject -> TCRaw "FibObjectMapKeyIterator*")
+					| FiberusBuiltins.MapObject -> TCRaw "FibObjectMapKeyIterator*"
+					| FiberusBuiltins.MapWeak -> TCRaw "FibWeakMapKeyIterator*")
 				| "iterator" -> Some (match kind with
 					| FiberusBuiltins.MapInt -> TCRaw "FibIntMapValueIterator*"
 					| FiberusBuiltins.MapString -> TCRaw "FibStringMapValueIterator*"
 					| FiberusBuiltins.MapInt64 -> TCRaw "FibInt64MapValueIterator*"
-					| FiberusBuiltins.MapObject -> TCRaw "FibObjectMapValueIterator*")
+					| FiberusBuiltins.MapObject -> TCRaw "FibObjectMapValueIterator*"
+					| FiberusBuiltins.MapWeak -> TCRaw "FibWeakMapValueIterator*")
 				| "keyValueIterator" -> Some (TCFibClass "haxe_iterators_MapKeyValueIterator")
 				| _ -> None
 			in
@@ -4607,7 +4615,7 @@ and convert_map_call ctx map_expr args arg_exprs kind method_name value_type res
      When key is FibDynamic (e.g. from Dynamic-typed code), unbox via fib_dynamic_to_object
      instead of C pointer cast, since FibDynamic is a struct, not a pointer. *)
   let cast_key key_expr =
-    if kind = FiberusBuiltins.MapObject then begin
+    if kind = FiberusBuiltins.MapObject || kind = FiberusBuiltins.MapWeak then begin
       if key_expr.ctype = TCFibDynamic then
         mk_expr (TCEUnbox (key_expr, TCFibObject)) TCFibObject
       else
@@ -4685,6 +4693,7 @@ and convert_map_call ctx map_expr args arg_exprs kind method_name value_type res
         | FiberusBuiltins.MapString -> TCRaw "FibStringMapKeyIterator*"
         | FiberusBuiltins.MapInt64 -> TCRaw "FibInt64MapKeyIterator*"
         | FiberusBuiltins.MapObject -> TCRaw "FibObjectMapKeyIterator*"
+        | FiberusBuiltins.MapWeak -> TCRaw "FibWeakMapKeyIterator*"
       in
       mk_expr_pos (TCECall (TCTFunc (prefix ^ "keys"), [map_expr])) iter_type pos
   
@@ -4694,6 +4703,7 @@ and convert_map_call ctx map_expr args arg_exprs kind method_name value_type res
 			| FiberusBuiltins.MapString -> TCRaw "FibStringMapValueIterator*"
 			| FiberusBuiltins.MapInt64 -> TCRaw "FibInt64MapValueIterator*"
 			| FiberusBuiltins.MapObject -> TCRaw "FibObjectMapValueIterator*"
+			| FiberusBuiltins.MapWeak -> TCRaw "FibWeakMapValueIterator*"
 		in
 		mk_expr_pos (TCECall (TCTFunc (prefix ^ "iterator"), [map_expr])) iter_type pos
 
@@ -4722,13 +4732,14 @@ and convert_map_call ctx map_expr args arg_exprs kind method_name value_type res
         | FiberusBuiltins.MapString -> "StringMap"
         | FiberusBuiltins.MapInt64 -> "Int64Map"
         | FiberusBuiltins.MapObject -> "ObjectMap"
+        | FiberusBuiltins.MapWeak -> "WeakMap"
       in
       mk_expr_pos (TCECall (TCTMethod (map_name, ident method_name), map_expr :: arg_exprs)) result_tc pos
 
 (* Get map value type from type parameters *)
 and get_map_value_type map_type kind =
   match Type.follow map_type with
-  | Type.TInst (_, [_; t]) when kind = FiberusBuiltins.MapObject -> tc_type_of t
+  | Type.TInst (_, [_; t]) when kind = FiberusBuiltins.MapObject || kind = FiberusBuiltins.MapWeak -> tc_type_of t
   | Type.TInst (_, [t]) -> tc_type_of t
   | _ -> TCFibDynamic
 
@@ -5282,7 +5293,7 @@ and convert_call ctx callee args result_tc pos =
                          { result with pending_stmts = val_expr.pending_stmts @ result.pending_stmts }
                        else
                          mk_expr_pos (TCEBool true) TCBool pos
-                 | (["haxe";"ds"], ("IntMap" | "StringMap" | "ObjectMap" | "Int64Map")) ->
+                 | (["haxe";"ds"], ("IntMap" | "StringMap" | "ObjectMap" | "Int64Map" | "WeakMap")) ->
                        (* Extern Map classes: generate instanceof check against sentinel class *)
                        let target_class = flat_path c.cl_path in
                        if val_expr.ctype = TCFibDynamic then
@@ -5925,6 +5936,7 @@ and convert_call ctx callee args result_tc pos =
         | FiberusBuiltins.MapString -> TCFibStringMap
         | FiberusBuiltins.MapInt64 -> TCFibInt64Map
         | FiberusBuiltins.MapObject -> TCFibObjectMap
+        | FiberusBuiltins.MapWeak -> TCFibWeakMap
       in
       (* Coerce to correct map type (e.g. FibDynamic -> FibIntMap* when receiver is Null<Map<Int,T>>) *)
       let map_expr = coerce_to_type map_expr_raw expected_tc in
@@ -6202,6 +6214,8 @@ and convert_call ctx callee args result_tc pos =
         | TCRaw "FibInt64MapValueIterator*" -> Some ("fib_int64_map_value_iterator_", TCFibDynamic)
         | TCRaw "FibObjectMapKeyIterator*" -> Some ("fib_object_map_key_iterator_", TCFibObject)
         | TCRaw "FibObjectMapValueIterator*" -> Some ("fib_object_map_value_iterator_", TCFibDynamic)
+        | TCRaw "FibWeakMapKeyIterator*" -> Some ("fib_weak_map_key_iterator_", TCFibObject)
+        | TCRaw "FibWeakMapValueIterator*" -> Some ("fib_weak_map_value_iterator_", TCFibDynamic)
         | _ -> None
       in
       (match map_iter_info, cf.cf_name with
@@ -6404,6 +6418,8 @@ and convert_tvar_stmt (ctx : conv_ctx) (v : tvar) (init_opt : texpr option) : tc
           | Some FiberusBuiltins.MapInt64, "iterator" -> Some (TCRaw "FibInt64MapValueIterator*")
           | Some FiberusBuiltins.MapObject, "keys" -> Some (TCRaw "FibObjectMapKeyIterator*")
           | Some FiberusBuiltins.MapObject, "iterator" -> Some (TCRaw "FibObjectMapValueIterator*")
+          | Some FiberusBuiltins.MapWeak, "keys" -> Some (TCRaw "FibWeakMapKeyIterator*")
+          | Some FiberusBuiltins.MapWeak, "iterator" -> Some (TCRaw "FibWeakMapValueIterator*")
           | _ -> None
         in
         (match init_e.eexpr with
@@ -6608,10 +6624,49 @@ and convert_stmt (ctx : conv_ctx) (e : texpr) : tc_stmt list =
   (* Block of statements - flatten into parent scope to preserve variable lifetimes.
    * We don't wrap in TCSBlock here because that creates C { } scopes which end
    * variable lifetimes while GC roots still reference them. The caller (TWhile body,
-   * TIf branch, etc.) wraps in TCSBlock if scoping is needed. *)
+   * TIf branch, etc.) wraps in TCSBlock if scoping is needed.
+   *
+   * GCFrame scope cleanup: When in GCFrame mode, we track TBlock nesting depth via
+   * gc_frame_depth. Depth 1 = function body (cleaned up by GC_FRAME_POP, no nulling
+   * needed). Depth > 1 = inner blocks (unrolled loop iterations, if-branches, etc.)
+   * where we snapshot the frame slots, and after processing, null out any NEW slots
+   * so the GC doesn't retain dead objects. This is critical for unrolled loops where
+   * duplicate_tvars creates fresh variables per iteration — without nulling, all
+   * iterations' objects stay rooted for the entire function lifetime. *)
   | TBlock exprs ->
-      let stmts = List.concat_map (convert_stmt ctx) exprs in
-      mark_volatile_for_try stmts
+      if ctx.in_gc_frame then begin
+        ctx.gc_frame_depth <- ctx.gc_frame_depth + 1;
+        let saved_slot_count = List.length ctx.gc_frame_slots in
+        let stmts = List.concat_map (convert_stmt ctx) exprs in
+        ctx.gc_frame_depth <- ctx.gc_frame_depth - 1;
+        (* Only null at inner blocks (depth > 0 after decrement, i.e. was > 1).
+         * The function body (depth was 1, now 0) is cleaned up by GC_FRAME_POP. *)
+        if ctx.gc_frame_depth > 0 then begin
+          let new_slot_count = List.length ctx.gc_frame_slots in
+          let new_slots_added = new_slot_count - saved_slot_count in
+          if new_slots_added > 0 then begin
+            (* Extract the new slots (they are prepended in reverse order).
+             * Take the first new_slots_added items from gc_frame_slots. *)
+            let rec take n lst acc =
+              if n = 0 then acc
+              else match lst with
+                | [] -> acc
+                | x :: rest -> take (n - 1) rest (x :: acc)
+            in
+            let new_slots = take new_slots_added ctx.gc_frame_slots [] in
+            (* Emit null assignments for each new slot to release GC references *)
+            let null_stmts = List.map (fun (slot_name, slot_type) ->
+              TCSGCFrameAssign (ctx.gc_frame_name, slot_name, mk_null slot_type)
+            ) new_slots in
+            mark_volatile_for_try (stmts @ null_stmts)
+          end else
+            mark_volatile_for_try stmts
+        end else
+          mark_volatile_for_try stmts
+      end else begin
+        let stmts = List.concat_map (convert_stmt ctx) exprs in
+        mark_volatile_for_try stmts
+      end
   
   (* If statement - save/restore GC roots around each branch to prevent
    * roots from branch-scoped variables leaking into the enclosing scope.

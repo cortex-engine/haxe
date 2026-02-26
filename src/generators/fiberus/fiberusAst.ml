@@ -55,6 +55,7 @@ type tc_type =
   | TCFibStringMap                          (* FibStringMap* *)
   | TCFibInt64Map                           (* FibInt64Map* *)
   | TCFibObjectMap                          (* FibObjectMap* *)
+  | TCFibWeakMap                            (* FibWeakMap* *)
   | TCFibBytesData                          (* FibBytesData* *)
   
   (* Aggregate types *)
@@ -672,13 +673,14 @@ let mk_do_while body cond =
 let is_pointer_type = function
   | TCPointer _ | TCConstPointer _ | TCFibString | TCFibClosure
   | TCFibObject | TCFiber | TCFibClass _ | TCFibArray _ 
-  | TCFibIntMap | TCFibStringMap | TCFibInt64Map | TCFibObjectMap
+  | TCFibIntMap | TCFibStringMap | TCFibInt64Map | TCFibObjectMap | TCFibWeakMap
   | TCFibBytesData -> true
   (* Map iterator types are pointers *)
   | TCRaw "FibIntMapKeyIterator*" | TCRaw "FibIntMapValueIterator*"
   | TCRaw "FibStringMapKeyIterator*" | TCRaw "FibStringMapValueIterator*"
   | TCRaw "FibInt64MapKeyIterator*" | TCRaw "FibInt64MapValueIterator*"
-  | TCRaw "FibObjectMapKeyIterator*" | TCRaw "FibObjectMapValueIterator*" -> true
+  | TCRaw "FibObjectMapKeyIterator*" | TCRaw "FibObjectMapValueIterator*"
+  | TCRaw "FibWeakMapKeyIterator*" | TCRaw "FibWeakMapValueIterator*" -> true
   | _ -> false
 
 (* Check if type is a primitive type *)
@@ -693,12 +695,13 @@ let is_primitive_type = function
 let rec needs_gc_tracking = function
   | TCFibString | TCFibClosure | TCFibObject | TCFiber | TCFibClass _
   | TCFibArray _ | TCFibDynamic
-  | TCFibIntMap | TCFibStringMap | TCFibInt64Map | TCFibObjectMap
+  | TCFibIntMap | TCFibStringMap | TCFibInt64Map | TCFibObjectMap | TCFibWeakMap
   | TCFibBytesData -> true
   | TCPointer inner -> needs_gc_tracking inner
   (* Map iterator types are GC-allocated and need tracking *)
   | TCRaw "FibIntMapKeyIterator*" | TCRaw "FibIntMapValueIterator*"
   | TCRaw "FibStringMapKeyIterator*" | TCRaw "FibStringMapValueIterator*"
   | TCRaw "FibInt64MapKeyIterator*" | TCRaw "FibInt64MapValueIterator*"
-  | TCRaw "FibObjectMapKeyIterator*" | TCRaw "FibObjectMapValueIterator*" -> true
+  | TCRaw "FibObjectMapKeyIterator*" | TCRaw "FibObjectMapValueIterator*"
+  | TCRaw "FibWeakMapKeyIterator*" | TCRaw "FibWeakMapValueIterator*" -> true
   | _ -> false

@@ -66,6 +66,7 @@ let rec tc_type_of t =
   | TInst ({ cl_path = (["haxe"; "ds"], "StringMap") }, _) -> TCFibStringMap
   | TInst ({ cl_path = (["haxe"; "ds"], "Int64Map") }, _) -> TCFibInt64Map
   | TInst ({ cl_path = (["haxe"; "ds"], "ObjectMap") }, _) -> TCFibObjectMap
+  | TInst ({ cl_path = (["haxe"; "ds"], "WeakMap") }, _) -> TCFibWeakMap
   | TInst ({ cl_kind = KTypeParameter _ }, _) ->
       (* Type parameter T, K, V etc -> generic value *)
       TCFibDynamic
@@ -164,6 +165,7 @@ let rec tc_type_to_string = function
   | TCFibStringMap -> "FibStringMap*"
   | TCFibInt64Map -> "FibInt64Map*"
   | TCFibObjectMap -> "FibObjectMap*"
+  | TCFibWeakMap -> "FibWeakMap*"
   | TCFibBytesData -> "FibBytesData*"
   | TCStruct name -> "struct " ^ name
   | TCUnion name -> "union " ^ name
@@ -210,7 +212,7 @@ let is_pointer = function
   | TCPointer _ | TCConstPointer _
   | TCFibString | TCFibClosure | TCFibObject | TCFiber | TCFibClass _
   | TCFibArray _ | TCFibIntMap | TCFibStringMap | TCFibInt64Map | TCFibObjectMap
-  | TCFibBytesData -> true
+  | TCFibWeakMap | TCFibBytesData -> true
   | _ -> false
 
 (* Check if type is a class pointer *)
@@ -233,7 +235,7 @@ let rec needs_gc_root = function
   | TCFibString | TCFibClosure | TCFibObject | TCFiber | TCFibClass _
   | TCFibArray _ | TCFibDynamic
   | TCFibIntMap | TCFibStringMap | TCFibInt64Map | TCFibObjectMap
-  | TCFibBytesData -> true
+  | TCFibWeakMap | TCFibBytesData -> true
   | TCPointer inner -> needs_gc_root inner
   | _ -> false
 
@@ -241,7 +243,7 @@ let rec needs_gc_root = function
 let needs_write_barrier_tc = function
   | TCFibString | TCFibArray _ | TCFibClass _ | TCFibClosure 
   | TCFibObject | TCFibIntMap | TCFibStringMap 
-  | TCFibInt64Map | TCFibObjectMap | TCFibBytesData -> true
+  | TCFibInt64Map | TCFibObjectMap | TCFibWeakMap | TCFibBytesData -> true
   | TCPointer _ -> true
   | _ -> false
 
@@ -369,7 +371,7 @@ let box_kind_of_type = function
   | TCFibObject | TCFibClass _ -> TCBoxObject
   | TCFibClosure -> TCBoxClosure
   | TCFibEnum name -> TCBoxEnum name
-  | TCFibIntMap | TCFibStringMap | TCFibInt64Map | TCFibObjectMap -> TCBoxObject
+  | TCFibIntMap | TCFibStringMap | TCFibInt64Map | TCFibObjectMap | TCFibWeakMap -> TCBoxObject
   | TCFibDynamic -> TCBoxDynamic
   (* Map iterator types have a FibClass as first member, enabling boxing
      as FIB_TYPE_OBJECT via fib_dynamic_object. Dynamic dispatch through
@@ -414,7 +416,7 @@ let unbox_func_name = function
   | TCFibString -> "fib_dynamic_coerce_string"
   | TCFibArray _ -> "fib_dynamic_to_array"
   | TCFibObject | TCFibClass _ | TCFibClosure -> "fib_dynamic_to_object"
-  | TCFibIntMap | TCFibStringMap | TCFibInt64Map | TCFibObjectMap -> "fib_dynamic_to_object"
+  | TCFibIntMap | TCFibStringMap | TCFibInt64Map | TCFibObjectMap | TCFibWeakMap -> "fib_dynamic_to_object"
   | TCFibEnum _ -> "fib_dynamic_to_ptr"  (* Returns void*, needs cast and deref *)
   | _ -> ""
 
@@ -474,6 +476,7 @@ let tc_type_of_string s =
   | "FibStringMap*" -> TCFibStringMap
   | "FibInt64Map*" -> TCFibInt64Map
   | "FibObjectMap*" -> TCFibObjectMap
+  | "FibWeakMap*" -> TCFibWeakMap
   | "FibBytesData*" -> TCFibBytesData
   | s when String.length s > 0 && s.[String.length s - 1] = '*' ->
       TCFibClass (String.sub s 0 (String.length s - 1))
