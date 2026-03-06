@@ -58,6 +58,9 @@ type conv_ctx = {
   debug_level: int;                   (* 0=none, 1=function, 2=line *)
   mutable last_line: int;             (* Last emitted FIBLINE number (for dedup) *)
   has_stack_frame: bool;              (* True if function has FIB_STACKFRAME — FIBLINE requires it *)
+  (* Phase 7: TypeDis static disentanglement — barrier elision *)
+  in_constructor_init: bool;          (* True inside _init function body (this is freshly allocated at current depth) *)
+  constructor_has_spawn: bool;        (* True if constructor body contains Fiber.spawn — disables ctor barrier elision *)
 }
 
 (* Create an empty conversion context *)
@@ -88,6 +91,8 @@ let empty_ctx = {
   debug_level = 0;
   last_line = 0;
   has_stack_frame = false;
+  in_constructor_init = false;
+  constructor_has_spawn = false;
 }
 
 (* Create context with current class *)
@@ -112,6 +117,11 @@ let exc_pop_stmts n =
 let global_closure_counter = ref 0
 let global_spawn_counter = ref 0
 let global_cb_arg_counter = ref 0
+
+(* Phase 7 (TypeDis): Barrier elision statistics *)
+let barriers_elided_stack = ref 0      (* Elided: container is stack-allocated *)
+let barriers_elided_ctor = ref 0       (* Elided: constructor init of 'this' *)
+let barriers_emitted = ref 0           (* Total barriers emitted (not elided) *)
 
 (* ============================================================================
  * Callback Trampoline Generation
@@ -3095,16 +3105,58 @@ and convert_field_assign ctx e1 e2 pos =
       end else
         rhs, []
       in
+      (* Phase 7 (TypeDis): Static disentanglement — determine if write barrier
+         can be elided because the store is provably safe.
+         
+         Three elision cases:
+         1. Stack-allocated container: stack objects are roots by definition,
+            never move, never cross fiber boundaries. No barrier needed.
+         2. Constructor init (this): in _init, 'this' was just allocated at the
+            current HH depth. All values assigned to its fields are at the same
+            depth or shallower (parent scope), satisfying the up-pointer invariant.
+            Safe only when: no Fiber.spawn in body AND this is not mature-allocated
+            (which would mean cross-fiber access).
+         3. (Future) @:fiberLocal / @:immutable metadata annotations. *)
+      let barrier_elided =
+        if not (is_instance_field && needs_write_barrier_tc rhs_tc) then
+          false  (* No barrier would be emitted anyway — don't count as elision *)
+        else
+        (* Case 1: Container is stack-allocated *)
+        let is_stack = match obj.Type.eexpr with
+          | Type.TLocal v -> Hashtbl.mem ctx.stack_alloc_vars v.v_id
+          | _ -> false
+        in
+        (* Case 2: Constructor body assigning to 'this' *)
+        let is_ctor_this =
+          ctx.in_constructor_init && not ctx.constructor_has_spawn &&
+          (match obj.Type.eexpr with
+           | Type.TConst Type.TThis -> true
+           | Type.TLocal v -> v.v_name = "_gthis"
+           | _ -> false)
+        in
+        if is_stack then (incr barriers_elided_stack; true)
+        (* Constructor init elision disabled: while the write barrier is a
+         * no-op for same-depth stores, the barrier path also extracts
+         * allocating RHS into GCFrame-rooted temps. Without this, a GC
+         * triggered by the RHS allocation can relocate 'this' while the
+         * LHS still holds the pre-GC pointer. Fixing this correctly
+         * requires ensuring all RHS temps are GC-rooted, not just
+         * sequenced as bare locals. Revisit in Phase 7b. *)
+        (* else if is_ctor_this then (incr barriers_elided_ctor; true) *)
+        else (ignore is_ctor_this; false)
+      in
       (* Check if write barrier needed - object pointers need barriers.
          Two cases:
          1. Direct pointer field: use FIBRIX_WRITE_BARRIER(obj, ptr)
          2. FibDynamic field: use FIBRIX_WRITE_BARRIER_DYNAMIC(obj, boxed_val)
-            The dynamic variant extracts the pointer from the tagged union at runtime. *)
+            The dynamic variant extracts the pointer from the tagged union at runtime.
+         Phase 7: Skip barrier entirely if statically proven disentangled. *)
       let needs_ptr_barrier = is_instance_field && needs_write_barrier_tc rhs_tc
-        && effective_lhs_tc <> TCFibDynamic in
+        && effective_lhs_tc <> TCFibDynamic && not barrier_elided in
       let needs_dyn_barrier = is_instance_field && needs_write_barrier_tc rhs_tc
-        && effective_lhs_tc = TCFibDynamic in
+        && effective_lhs_tc = TCFibDynamic && not barrier_elided in
       if needs_ptr_barrier then begin
+        incr barriers_emitted;
         (* Emit: (FIBRIX_WRITE_BARRIER(obj, rhs), obj->field = rhs)
          * The write barrier handles depth-based down-pointer detection and
          * remembered set recording for the hierarchical heap GC.
@@ -3128,6 +3180,7 @@ and convert_field_assign ctx e1 e2 pos =
           pending_stmts = obj_expr.pending_stmts @ lhs_expr.pending_stmts @ rhs.pending_stmts @ seq_stmts @ result.pending_stmts;
           gc_roots = obj_expr.gc_roots + lhs_expr.gc_roots + rhs.gc_roots }
       end else if needs_dyn_barrier then begin
+        incr barriers_emitted;
         (* FibDynamic field: rhs is already boxed (via box_if_needed above).
          * Emit: (FIBRIX_WRITE_BARRIER_DYNAMIC(obj, _wb_N), obj->field = _wb_N)
          * Always extract rhs into a temp to prevent double-evaluation:
@@ -3146,6 +3199,23 @@ and convert_field_assign ctx e1 e2 pos =
           pending_stmts = obj_expr.pending_stmts @ lhs_expr.pending_stmts @ rhs.pending_stmts @ seq_stmts @ result.pending_stmts;
           gc_roots = obj_expr.gc_roots + lhs_expr.gc_roots + rhs.gc_roots }
       end else begin
+        (* Phase 7: When barrier was elided but RHS is an allocating expression,
+         * we MUST still extract it to a temp variable. Otherwise:
+         *   obj->field = alloc()  where alloc() triggers GC
+         * The LHS (obj->field) may evaluate obj BEFORE the RHS runs,
+         * capturing a pre-GC pointer. If GC copies obj during alloc(),
+         * the LHS writes to the old (freed) location → dangling pointer.
+         * With the barrier, the temp extraction handles this naturally. *)
+        let rhs, seq_stmts =
+          if barrier_elided && is_allocating_expr rhs then begin
+            let tmp_name = Printf.sprintf "_wb_%d" ctx.temp_counter in
+            ctx.temp_counter <- ctx.temp_counter + 1;
+            let tmp_var = TCSVar { vd_name = tmp_name; vd_type = rhs.ctype; vd_init = Some rhs;
+              vd_static = false; vd_const = false; vd_volatile = false } in
+            mk_expr (TCELocal tmp_name) rhs.ctype, seq_stmts @ [tmp_var]
+          end else
+            rhs, seq_stmts
+        in
         let result = mk_expr_pos (TCEAssign (lhs_expr, rhs)) effective_lhs_tc pos in
         (* Propagate pending_stmts from sub-expressions *)
         { result with 
@@ -7501,20 +7571,26 @@ let convert_constructor ctx (c : tclass) =
             initial_slots := ("this", this_tc) :: !initial_slots;
             Hashtbl.replace frame_rooted_vars "this" ();
             param_inits := ("this", mk_expr (TCELocal "this") this_tc) :: !param_inits;
-            let init_body_ctx = {
-              ctx with
-              current_ret_type = None;
-              gc_local_count = 0;
-              func_gc_root_count = 0;
-              gc_frame_name = frame_name;
-              gc_frame_slots = List.rev !initial_slots;
-              gc_frame_rooted_vars = frame_rooted_vars;
-              in_gc_frame = true;
-              fiber_mature_vars = escape_result.fiber_mature_vars;
-              stack_alloc_vars = escape_result.stack_allocatable;
-              last_line = 0;  (* Reset for fresh FIBLINE dedup per function *)
-              has_stack_frame = false;  (* _init has no FIB_STACKFRAME *)
-            } in
+             let init_body_ctx = {
+               ctx with
+               current_ret_type = None;
+               gc_local_count = 0;
+               func_gc_root_count = 0;
+               gc_frame_name = frame_name;
+               gc_frame_slots = List.rev !initial_slots;
+               gc_frame_rooted_vars = frame_rooted_vars;
+               in_gc_frame = true;
+               fiber_mature_vars = escape_result.fiber_mature_vars;
+               stack_alloc_vars = escape_result.stack_allocatable;
+               last_line = 0;  (* Reset for fresh FIBLINE dedup per function *)
+               has_stack_frame = false;  (* _init has no FIB_STACKFRAME *)
+               (* Phase 7 (TypeDis): Enable constructor barrier elision.
+                  Safe when: this is nursery-allocated (not mature/cross-fiber)
+                  AND the constructor body does not spawn fibers that could
+                  observe this object at a different HH depth. *)
+               in_constructor_init = not escape_result.this_needs_mature;
+               constructor_has_spawn = escape_result.has_spawn;
+             } in
             (* Generate MethDynamic field default closure initializations.
                Like HashLink (genhl.ml:3549), we must init dynamic function fields
                BEFORE the user constructor body runs, so that e.g. emptyOnData = onData

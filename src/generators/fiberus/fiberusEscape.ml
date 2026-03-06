@@ -293,12 +293,29 @@ let analyze_fiber_captures (f : tfunc) : (int, unit) Hashtbl.t * bool =
   scan f.tf_expr;
   (fiber_mature, !this_needs_mature)
 
+(* Check if a function body contains any Fiber.spawn call.
+ * Used by Phase 7 (TypeDis): constructor bodies with spawns cannot elide
+ * write barriers because spawned fibers may observe partially-initialized
+ * objects at different HH depths. *)
+let body_contains_spawn (f : tfunc) : bool =
+  let found = ref false in
+  let rec scan e =
+    if not !found then
+      match e.eexpr with
+      | TCall (callee, _) when is_fiber_spawn_call callee ->
+          found := true
+      | _ -> Type.iter scan e
+  in
+  scan f.tf_expr;
+  !found
+
 (* Result type for escape analysis of a function *)
 type escape_result = {
   stack_allocatable : (int, tclass) Hashtbl.t;  (* var_id -> class that can be stack allocated *)
   param_field_map : (int * string) list;        (* param_id -> field_name for constructor optimization *)
   fiber_mature_vars : (int, unit) Hashtbl.t;    (* var_id set: must allocate in mature space *)
   this_needs_mature : bool;                     (* constructor's this must be mature-allocated *)
+  has_spawn : bool;                             (* Phase 7: body contains Fiber.spawn call *)
 }
 
 (* Perform full escape analysis on a function *)
@@ -309,6 +326,7 @@ let analyze_function (f : tfunc) : escape_result =
     param_field_map = extract_param_field_mapping f;
     fiber_mature_vars = fiber_mature;
     this_needs_mature = this_mature;
+    has_spawn = body_contains_spawn f;
   }
 
 (* ============================================================================

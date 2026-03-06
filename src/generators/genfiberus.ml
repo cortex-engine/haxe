@@ -130,6 +130,8 @@ let make_conv_ctx ctx =
     FiberusConvert.last_line = 0;
     FiberusConvert.has_stack_frame = false;
     FiberusConvert.temp_counter = 0;
+    FiberusConvert.in_constructor_init = false;
+    FiberusConvert.constructor_has_spawn = false;
   }
 
 (* Sync closure state from conv_ctx back to genfiberus ctx, return collected closures *)
@@ -2432,6 +2434,15 @@ let generate com =
 	close_out och;
 
 	com.print (Printf.sprintf "Generated %d source files\n" (List.length !generated_files));
+	(* Phase 7 (TypeDis): Report write barrier elision statistics *)
+	let elided_stack = !(FiberusConvert.barriers_elided_stack) in
+	let elided_ctor = !(FiberusConvert.barriers_elided_ctor) in
+	let emitted = !(FiberusConvert.barriers_emitted) in
+	let total = emitted + elided_stack + elided_ctor in
+	if total > 0 then
+		com.print (Printf.sprintf "Write barriers: %d emitted, %d elided (%d stack-alloc, %d ctor-init) — %.1f%% elision rate\n"
+			emitted (elided_stack + elided_ctor) elided_stack elided_ctor
+			(100.0 *. (float_of_int (elided_stack + elided_ctor)) /. (float_of_int total)));
 
 	(* Run fiberus build tool unless -D no-compilation *)
 	if not (Gctx.defined com Define.NoCompilation) then begin
