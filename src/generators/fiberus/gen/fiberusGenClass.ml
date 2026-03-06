@@ -295,7 +295,10 @@ let gen_mark_function_body (c : tclass) : tc_stmt list =
            Use TCERaw for the address-of since there is no TCEAddrOf in the AST. *)
         TCSExpr (mk_expr (TCERaw (Printf.sprintf "gc_mark_dynamic(ctx, &this->%s)" sfi.sfi_name)) TCVoid)
       else
-        TCSExpr (mk_expr (TCECall (TCTFunc "gc_mark_object", [ctx_local; field_access])) TCVoid)
+        (* Use gc_mark_object_ref to pass pointer-to-field so the forwarded
+           address is written back in place.  This eliminates the need for
+           the conservative body scan on objects with markFunc. *)
+        TCSExpr (mk_expr (TCERaw (Printf.sprintf "gc_mark_object_ref(ctx, (void**)&this->%s)" sfi.sfi_name)) TCVoid)
     ) gc_fields in
     cast_stmt :: mark_stmts
 

@@ -250,8 +250,8 @@ let gen_class_impl ctx c =
 		let decls = ref [] in
 		let add d = decls := d :: !decls in
 
-		(* 1. Mark function — if there are GC pointer instance fields *)
-		let gc_fields = List.filter (fun cf ->
+		(* 1. Mark function — if there are GC pointer or FibDynamic instance fields *)
+		let gc_ptr_fields = List.filter (fun cf ->
 			match cf.cf_kind with
 			| Var _ when not (has_class_field_flag cf CfStatic) ->
 				let type_tc = tc_type_of cf.cf_type in
@@ -261,13 +261,29 @@ let gen_class_impl ctx c =
 				true
 			| _ -> false
 		) c.cl_ordered_fields in
-		let has_mark_func = gc_fields <> [] in
+		let gc_dyn_fields = List.filter (fun cf ->
+			match cf.cf_kind with
+			| Var _ when not (has_class_field_flag cf CfStatic) ->
+				let type_tc = tc_type_of cf.cf_type in
+				type_tc = TCFibDynamic
+			| _ -> false
+		) c.cl_ordered_fields in
+		let has_mark_func = gc_ptr_fields <> [] || gc_dyn_fields <> [] in
 		if has_mark_func then begin
 			let body =
 				[TCSRaw (Printf.sprintf "%s* this = (%s*)obj;" class_name class_name)]
+				(* Pointer fields: use gc_mark_object_ref to update the field in place.
+				   This is critical because the conservative body scan is skipped for
+				   objects with markFunc (to avoid corrupting non-GC pointer fields
+				   like calloc'd data buffers). *)
 				@ List.map (fun cf ->
-					TCSRaw (Printf.sprintf "gc_mark_object(ctx, this->%s);" (ident cf.cf_name))
-				) gc_fields
+					TCSRaw (Printf.sprintf "gc_mark_object_ref(ctx, (void**)&this->%s);" (ident cf.cf_name))
+				) gc_ptr_fields
+				(* FibDynamic fields: use gc_mark_dynamic which extracts the object
+				   pointer and forwards it in place. *)
+				@ List.map (fun cf ->
+					TCSRaw (Printf.sprintf "gc_mark_dynamic(ctx, &this->%s);" (ident cf.cf_name))
+				) gc_dyn_fields
 			in
 			add (TCDFunc {
 				fd_name = class_name ^ "_mark";

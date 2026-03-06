@@ -3105,8 +3105,9 @@ and convert_field_assign ctx e1 e2 pos =
       let needs_dyn_barrier = is_instance_field && needs_write_barrier_tc rhs_tc
         && effective_lhs_tc = TCFibDynamic in
       if needs_ptr_barrier then begin
-        (* Emit: (FIBRIX_SATB_LOG(obj->field), FIBRIX_WRITE_BARRIER(obj, rhs), obj->field = rhs)
-         * SATB deletion barrier: log old value before overwrite for concurrent marking.
+        (* Emit: (FIBRIX_WRITE_BARRIER(obj, rhs), obj->field = rhs)
+         * The write barrier handles depth-based down-pointer detection and
+         * remembered set recording for the hierarchical heap GC.
          * For expressions with side effects (calls, allocations), extract rhs
          * into a temp variable first to avoid double-evaluation. *)
         let rhs, seq_stmts =
@@ -3119,18 +3120,16 @@ and convert_field_assign ctx e1 e2 pos =
           end else
             rhs, seq_stmts
         in
-        let satb_log = mk_expr (TCECall (TCTMacro "FIBRIX_SATB_LOG", [lhs_expr])) TCVoid in
         let barrier = mk_expr (TCECall (TCTMacro "FIBRIX_WRITE_BARRIER", [obj_expr; rhs])) TCVoid in
         let assign = mk_expr (TCEAssign (lhs_expr, rhs)) effective_lhs_tc in
-        let result = mk_expr_pos (TCEComma [satb_log; barrier; assign]) effective_lhs_tc pos in
+        let result = mk_expr_pos (TCEComma [barrier; assign]) effective_lhs_tc pos in
         (* Propagate pending_stmts from all sub-expressions *)
         { result with 
           pending_stmts = obj_expr.pending_stmts @ lhs_expr.pending_stmts @ rhs.pending_stmts @ seq_stmts @ result.pending_stmts;
           gc_roots = obj_expr.gc_roots + lhs_expr.gc_roots + rhs.gc_roots }
       end else if needs_dyn_barrier then begin
         (* FibDynamic field: rhs is already boxed (via box_if_needed above).
-         * Emit: (FIBRIX_SATB_LOG_DYNAMIC(obj->field), FIBRIX_WRITE_BARRIER_DYNAMIC(obj, _wb_N), obj->field = _wb_N)
-         * SATB deletion barrier: log old FibDynamic value before overwrite.
+         * Emit: (FIBRIX_WRITE_BARRIER_DYNAMIC(obj, _wb_N), obj->field = _wb_N)
          * Always extract rhs into a temp to prevent double-evaluation:
          * the barrier evaluates rhs (for pointer extraction) and the assignment
          * evaluates it again, so any side effects (e.g. x++) would fire twice. *)
@@ -3140,10 +3139,9 @@ and convert_field_assign ctx e1 e2 pos =
           vd_static = false; vd_const = false; vd_volatile = false } in
         let rhs = mk_expr (TCELocal tmp_name) rhs.ctype in
         let seq_stmts = seq_stmts @ [tmp_var] in
-        let satb_log = mk_expr (TCECall (TCTMacro "FIBRIX_SATB_LOG_DYNAMIC", [lhs_expr])) TCVoid in
         let barrier = mk_expr (TCECall (TCTMacro "FIBRIX_WRITE_BARRIER_DYNAMIC", [obj_expr; rhs])) TCVoid in
         let assign = mk_expr (TCEAssign (lhs_expr, rhs)) effective_lhs_tc in
-        let result = mk_expr_pos (TCEComma [satb_log; barrier; assign]) effective_lhs_tc pos in
+        let result = mk_expr_pos (TCEComma [barrier; assign]) effective_lhs_tc pos in
         { result with 
           pending_stmts = obj_expr.pending_stmts @ lhs_expr.pending_stmts @ rhs.pending_stmts @ seq_stmts @ result.pending_stmts;
           gc_roots = obj_expr.gc_roots + lhs_expr.gc_roots + rhs.gc_roots }
@@ -6510,19 +6508,28 @@ and convert_tvar_stmt (ctx : conv_ctx) (v : tvar) (init_opt : texpr option) : tc
       in
       let this_arg = mk_expr (TCELocal name) (TCFibClass class_name) in
       let init_call = TCSExpr (mk_expr (TCECall (TCTFunc (class_name ^ "_init"), this_arg :: init_args)) TCVoid) in
-      (* 4. Push temp roots for each GC-pointer field of the stack-allocated object.
-       * This enables eliminating conservative stack scanning in minor GC, since all
-       * GC pointers are now precisely tracked via temp roots.
-       * Note: TCSGCPush adds & automatically, so we pass the field lvalue directly. *)
-      let field_gc_pushes = List.filter_map (fun (cf : tclass_field) ->
-        match cf.cf_kind with
-        | Var _ when haxe_type_needs_gc_root cf.cf_type ->
-            ctx.gc_local_count <- ctx.gc_local_count + 1;
-            let field_tc = tc_type_of cf.cf_type in
-            Some (TCSGCPush (mk_expr (TCEArrow (mk_expr (TCELocal name) (TCFibClass class_name), ident cf.cf_name)) field_tc))
-        | _ -> None
-      ) c.cl_ordered_fields in
-      args_pending @ [struct_decl; ptr_decl; init_call] @ field_gc_pushes
+      (* 4. Register a shadow slot in the GCFrame so the GC can discover
+       * heap pointers embedded in the stack-allocated struct.
+       *
+       * We use a mangled name ("_stkref_<name>") so the original variable
+       * name is NOT in gc_frame_rooted_vars — local references to the
+       * pointer still emit plain "name" (not "_gc.name"), keeping the
+       * existing code generation unchanged.
+       *
+       * During collection hh_forward_gc_frame_roots sees _gc._stkref_p
+       * which is a stack address (not a valid HH pointer), so it calls
+       * hh_forward_stack_slot_fields which scans the struct's memory and
+       * pins any fromSpace heap objects found in its fields. *)
+      let gc_shadow_stmts =
+        if ctx.in_gc_frame then begin
+          let shadow_name = "_stkref_" ^ name in
+          gc_frame_add_slot ctx shadow_name (TCFibClass class_name);
+          [TCSGCFrameAssign (ctx.gc_frame_name, shadow_name,
+            mk_expr (TCELocal name) (TCFibClass class_name))]
+        end else
+          []
+      in
+      args_pending @ [struct_decl; ptr_decl; init_call] @ gc_shadow_stmts
     end else begin
       (* Normal heap allocation path *)
       match init_opt with
@@ -7326,8 +7333,12 @@ let convert_class_method ctx name (func : tfunc) is_static class_name =
   let has_gc_slots = frame_info.gfi_slots <> [] in
   if has_gc_slots then
     prologue := !prologue @ [TCSGCFrameDecl frame_info];
-  (* GC safe point — now that roots are in frame *)
-  prologue := !prologue @ [TCSGCSafePoint];
+  (* Yield point at function entry for cooperative scheduling.
+   * In the hierarchical heap GC, collection is triggered by the allocation
+   * slow path (hh_alloc_slow -> hh_desired_collection_scope), so we don't
+   * need gc_maybe_collect() here. We only need the scheduler yield check
+   * to support cooperative preemption. *)
+  prologue := !prologue @ [TCSYieldPoint];
   (* Stack frame for source mapping *)
   if ctx.debug_level > 0 then begin
     let file = strip_file func.tf_expr.epos.pfile in
