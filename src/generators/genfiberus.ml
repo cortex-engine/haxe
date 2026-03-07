@@ -1268,7 +1268,6 @@ let gen_header ctx com =
 	spr ctx "#include \"resource.h\"\n";
 	spr ctx "#include \"ssl.h\"\n";
 	spr ctx "#include \"thread.h\"\n";
-	spr ctx "#include \"sqlite_fib.h\"\n";
 	spr ctx "#include \"simdutf_c.h\"\n";
 	spr ctx "#include \"extern.h\"\n";
 	spr ctx "#include \"callback.h\"\n";
